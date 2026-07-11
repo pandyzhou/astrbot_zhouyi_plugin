@@ -1,637 +1,483 @@
+from __future__ import annotations
+
+import asyncio
 import json
 import os
-import asyncio
-from pathlib import Path
-import aiofiles
-from typing import Dict, Any, Optional, Tuple, List
 import time
+from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import aiofiles
 from astrbot.api import logger
 
-# 统一使用 AstrBot 提供的日志系统
-
-# 配置版本常量
 CURRENT_VERSION = "2.3"
 DEFAULT_CONFIG = {
     "version": CURRENT_VERSION,
     "next_id": 1,
     "servers": {},
     "last_cleanup": None,
-    # 多服务器柱状图/趋势数据：{"<server_id>": {"history": [{"ts": int, "count": int}]}}
-    "trends": {}
+    "trends": {},
 }
-
-# 自动清理与历史保留配置
-AUTO_CLEANUP_DAYS = 10  # 10天未查询成功自动删除
-# 为了支持 /mcdata 自定义小时数（上限 168），此处将历史保留条数提升到 168
+AUTO_CLEANUP_DAYS = 10
 MAX_HISTORY_POINTS = 168
 
+_PATH_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def default_config() -> Dict[str, Any]:
+    """返回互不共享可变对象的默认配置。"""
+    return deepcopy(DEFAULT_CONFIG)
+
+
+def _lock_key(path: str | os.PathLike[str]) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
+@asynccontextmanager
+async def _locked_path(path: str | os.PathLike[str]):
+    key = _lock_key(path)
+    lock = _PATH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PATH_LOCKS[key] = lock
+    await lock.acquire()
+    try:
+        yield Path(key)
+    finally:
+        lock.release()
+
+
+async def _acquire_path_lock(path: str) -> asyncio.Lock:
+    """兼容旧调用方；新代码优先使用 _locked_path。"""
+    key = _lock_key(path)
+    lock = _PATH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PATH_LOCKS[key] = lock
+    await lock.acquire()
+    return lock
+
+
 def is_old_format(data: Dict[str, Any]) -> bool:
-    """
-    检查是否为旧版格式（直接以服务器名称为键）
-    
-    Args:
-        data: 要检查的数据
-        
-    Returns:
-        bool: 是否为旧版格式
-    """
-    if not data:
+    if not data or "version" in data:
         return False
-    
-    # 检查是否有version字段
-    if "version" in data:
-        return False
-    
-    # 检查是否直接以服务器名称为键
-    for key, value in data.items():
-        if isinstance(value, dict) and "name" in value and "host" in value:
-            return True
-    
-    return False
+    return any(
+        isinstance(value, dict) and "name" in value and "host" in value
+        for value in data.values()
+    )
+
 
 def migrate_old_format(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    将旧版格式迁移到新版格式
-    
-    Args:
-        data: 旧版格式的数据
-        
-    Returns:
-        Dict[str, Any]: 新版格式的数据
-    """
     logger.info("检测到旧版配置格式，开始自动迁移...")
-    
-    new_data = DEFAULT_CONFIG.copy()
+    new_data = default_config()
     next_id = 1
-    
-    for name, server_info in data.items():
+    for server_info in data.values():
         if isinstance(server_info, dict) and "name" in server_info and "host" in server_info:
             new_data["servers"][str(next_id)] = {
                 "id": next_id,
                 "name": server_info["name"],
-                "host": server_info["host"]
+                "host": server_info["host"],
             }
             next_id += 1
-    
     new_data["next_id"] = next_id
-    logger.info(f"迁移完成，共迁移 {len(data)} 个服务器配置")
+    logger.info(f"迁移完成，共迁移 {next_id - 1} 个服务器配置")
     return new_data
 
-async def write_json(json_path: str, new_data: Dict[str, Any]) -> None:
-    """
-    异步写入JSON数据到文件
 
-    Args:
-        json_path: JSON文件路径
-        new_data: 要写入的数据字典
+def _normalize_data(raw: Any) -> tuple[Dict[str, Any], bool]:
+    changed = False
+    if not isinstance(raw, dict):
+        return default_config(), True
+    data = raw
+    if is_old_format(data):
+        data = migrate_old_format(data)
+        changed = True
 
-    Raises:
-        IOError: 当文件写入失败时抛出
-    """
-    lock = await _acquire_path_lock(json_path)
-    try:
-        # 确保目录存在
-        dest = Path(json_path)
-        dest.parent.mkdir(parents=True, exist_ok=True)
+    defaults = default_config()
+    for key, value in defaults.items():
+        if key not in data:
+            data[key] = value
+            changed = True
+    if not isinstance(data.get("servers"), dict):
+        data["servers"] = {}
+        changed = True
+    if not isinstance(data.get("trends"), dict):
+        data["trends"] = {}
+        changed = True
+    if data.get("version") != CURRENT_VERSION:
+        data["version"] = CURRENT_VERSION
+        changed = True
 
-        # 使用临时文件 + 原子替换，避免 0KB 截断
-        tmp_path = dest.with_suffix(dest.suffix + ".tmp")
-        payload = json.dumps(new_data, indent=4, ensure_ascii=False)
-
-        async with aiofiles.open(tmp_path, 'w', encoding='utf-8') as f:
-            await f.write(payload)
+    legacy_trend = data.get("trend")
+    if isinstance(legacy_trend, dict) and legacy_trend.get("server_id"):
+        sid = str(legacy_trend["server_id"])
+        target = data["trends"].setdefault(sid, {}).setdefault("history", [])
+        merged: Dict[int, int] = {}
+        for item in [*target, *(legacy_trend.get("history", []) or [])]:
+            if not isinstance(item, dict):
+                continue
             try:
-                await f.flush()  # type: ignore[attr-defined]
-            except Exception:
-                pass
+                merged[int(item.get("ts", 0))] = int(item.get("count", 0))
+            except (TypeError, ValueError):
+                continue
+        data["trends"][sid]["history"] = [
+            {"ts": ts, "count": count}
+            for ts, count in sorted(merged.items())[-MAX_HISTORY_POINTS:]
+            if ts > 0
+        ]
+        data.pop("trend", None)
+        changed = True
+    return data, changed
 
-        # 原子替换
-        os.replace(str(tmp_path), str(dest))
-        logger.info(f"成功写入JSON文件(原子替换): {json_path}")
-    except Exception as e:
-        logger.error(f"写入JSON文件失败: {e}")
-        raise IOError(f"写入JSON文件失败: {e}")
+
+async def _write_json_unlocked(path: Path, new_data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    task = asyncio.current_task()
+    task_id = id(task) if task else 0
+    tmp_path = path.with_name(
+        f"{path.name}.{os.getpid()}.{task_id}.{time.time_ns()}.tmp"
+    )
+    try:
+        payload = json.dumps(new_data, indent=4, ensure_ascii=False)
+        async with aiofiles.open(tmp_path, "w", encoding="utf-8") as file:
+            await file.write(payload)
+            await file.flush()
+        os.replace(tmp_path, path)
     finally:
         try:
-            lock.release()
-        except Exception:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
             pass
+
+
+async def _backup_corrupt_file_unlocked(path: Path, suffix: str) -> None:
+    if not path.exists() or path.stat().st_size <= 0:
+        return
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.stem}.{suffix}-{stamp}-{time.time_ns()}{path.suffix}")
+    try:
+        os.replace(path, backup)
+    except PermissionError:
+        async with aiofiles.open(path, "rb") as source, aiofiles.open(backup, "wb") as target:
+            await target.write(await source.read())
+    logger.warning(f"已备份疑似损坏的 JSON 文件: {backup.name}")
+
+
+async def _read_json_unlocked(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        data = default_config()
+        await _write_json_unlocked(path, data)
+        return data
+
+    try:
+        async with aiofiles.open(path, "r", encoding="utf-8") as file:
+            content = await file.read()
+        if not content or not content.strip():
+            await _backup_corrupt_file_unlocked(path, "empty")
+            data = default_config()
+            await _write_json_unlocked(path, data)
+            return data
+        raw = json.loads(content)
+    except json.JSONDecodeError:
+        await _backup_corrupt_file_unlocked(path, "invalid")
+        data = default_config()
+        await _write_json_unlocked(path, data)
+        return data
+
+    data, changed = _normalize_data(raw)
+    if changed:
+        await _write_json_unlocked(path, data)
+    return data
+
+
+async def write_json(json_path: str, new_data: Dict[str, Any]) -> None:
+    try:
+        async with _locked_path(json_path) as path:
+            await _write_json_unlocked(path, deepcopy(new_data))
+    except Exception as exc:
+        logger.error(f"写入 JSON 文件失败: {exc}")
+        raise IOError(f"写入 JSON 文件失败: {exc}") from exc
+
 
 async def read_json(json_path: str) -> Dict[str, Any]:
-    """
-    异步读取JSON文件内容，自动处理版本迁移
-
-    Args:
-        json_path: JSON文件路径
-
-    Returns:
-        解析后的JSON数据字典
-
-    Raises:
-        IOError: 当文件读取失败时抛出
-        json.JSONDecodeError: 当JSON解析失败时抛出
-    """
     try:
-        path = Path(json_path)
-        if not path.exists():
-            logger.info(f"JSON文件不存在，创建新文件: {json_path}")
-            await write_json(json_path=json_path, new_data=DEFAULT_CONFIG)
-            return DEFAULT_CONFIG
+        async with _locked_path(json_path) as path:
+            return deepcopy(await _read_json_unlocked(path))
+    except Exception as exc:
+        logger.error(f"读取 JSON 文件失败: {exc}")
+        raise IOError(f"读取 JSON 文件失败: {exc}") from exc
 
-        # 若存在臨時檔殘留，優先忽略它，由原子替換保證最終一致
-        try:
-            if path.with_suffix(path.suffix + ".tmp").exists():
-                logger.warning(f"檢測到臨時檔殘留，將忽略並繼續讀取正式文件: {json_path}")
-        except Exception:
-            pass
-
-        async with aiofiles.open(json_path, 'r', encoding='utf-8') as f:
-            content = await f.read()
-            # 空檔/全空白 → 自愈
-            if content is None or not content.strip():
-                logger.error(f"JSON為空或僅空白，啟動自愈: {json_path}")
-                await _backup_corrupt_file(json_path, suffix="empty")
-                await write_json(json_path=json_path, new_data=DEFAULT_CONFIG)
-                return DEFAULT_CONFIG
-
-            # 避免在控制台輸出完整 JSON 內容，改為精簡日誌
-            logger.debug(f"读取到的JSON内容（{len(content)} 字节）")
-            data = json.loads(content)
-
-            # 檢查是否為舊版格式，如果是則自動遷移
-            if is_old_format(data):
-                data = migrate_old_format(data)
-                await write_json(json_path, data)
-                logger.info("旧版配置已自动迁移并保存")
-
-            # 確保資料結構鍵齊全
-            if "version" not in data:
-                data["version"] = CURRENT_VERSION
-            if "next_id" not in data:
-                data["next_id"] = 1
-            if "servers" not in data:
-                data["servers"] = {}
-            if "trends" not in data or not isinstance(data.get("trends"), dict):
-                data["trends"] = {}
-
-            # 遷移舊版單服趨勢到多服結構
-            if isinstance(data.get("trend"), dict) and data["trend"].get("server_id"):
-                sid = str(data["trend"]["server_id"])
-                hist = data["trend"].get("history", []) or []
-                if sid:
-                    data["trends"].setdefault(sid, {}).setdefault("history", [])
-                    existing = {int(h.get("ts", 0)): int(h.get("count", 0)) for h in data["trends"][sid]["history"]}
-                    for h in hist:
-                        ts = int(h.get("ts", 0))
-                        existing[ts] = int(h.get("count", 0))
-                    merged = [{"ts": ts, "count": cnt} for ts, cnt in sorted(existing.items())]
-                    if len(merged) > MAX_HISTORY_POINTS:
-                        merged = merged[-MAX_HISTORY_POINTS:]
-                    data["trends"][sid]["history"] = merged
-                data.pop("trend", None)
-
-            try:
-                servers_cnt = len(data.get("servers", {}))
-                trends_cnt = sum(len((v or {}).get("history", [])) for v in data.get("trends", {}).values())
-                logger.info(f"成功读取JSON文件: {json_path}, servers={servers_cnt}, trends_points={trends_cnt}")
-            except Exception:
-                logger.info(f"成功读取JSON文件: {json_path}")
-            return data
-    except json.JSONDecodeError as e:
-        # 解析失敗 → 備份並自愈
-        logger.error(f"JSON解析失败: {e}, 將嘗試備份並恢復默認配置，路徑: {json_path}")
-        try:
-            await _backup_corrupt_file(json_path, suffix="invalid")
-            await write_json(json_path=json_path, new_data=DEFAULT_CONFIG)
-            return DEFAULT_CONFIG
-        except Exception as ie:
-            logger.error(f"自愈失敗: {ie}")
-            raise json.JSONDecodeError(f"JSON解析失败且自愈失败: {e}", e.doc, e.pos)
-    except Exception as e:
-        logger.error(f"读取JSON文件失败: {e}, 文件路径: {json_path}")
-        raise IOError(f"读取JSON文件失败: {e}")
-
-# 簡單的進程內寫鎖：避免高併發下多任務同時寫同一路徑
-_PATH_LOCKS: Dict[str, asyncio.Lock] = {}
-
-async def _acquire_path_lock(path: str) -> asyncio.Lock:
-    lock = _PATH_LOCKS.get(path)
-    if lock is None:
-        lock = asyncio.Lock()
-        _PATH_LOCKS[path] = lock
-    await lock.acquire()
-    return lock
 
 async def _backup_corrupt_file(json_path: str, suffix: str = "corrupt") -> None:
-    try:
-        p = Path(json_path)
-        if not p.exists():
-            return
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_path = p.with_name(f"{p.stem}.{suffix}-{ts}{p.suffix}")
-        try:
-            # 僅在原始檔案非空時備份其內容，空檔直接重建
-            if p.exists() and p.stat().st_size > 0:
-                # 使用原子移動避免與寫入競爭
-                os.replace(str(p), str(backup_path))
-                logger.warning(f"已備份疑似損壞的 JSON 檔: {backup_path}")
-            else:
-                logger.warning(f"JSON 檔為空，跳過備份: {json_path}")
-        except PermissionError:
-            # 回退到複製策略
-            async with aiofiles.open(p, 'rb') as rf, aiofiles.open(backup_path, 'wb') as wf:
-                await wf.write(await rf.read())
-            logger.warning(f"已複製備份疑似損壞的 JSON 檔: {backup_path}")
-    except Exception as e:
-        logger.error(f"備份疑似損壞 JSON 檔失敗: {e}")
+    async with _locked_path(json_path) as path:
+        await _backup_corrupt_file_unlocked(path, suffix)
 
-def get_server_by_name(data: Dict[str, Any], name: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    通过服务器名称查找服务器信息
-    
-    Args:
-        data: 配置数据
-        name: 服务器名称
-        
-    Returns:
-        Optional[Tuple[str, Dict[str, Any]]]: (id, server_info) 或 None
-    """
-    servers = data.get("servers", {})
-    for server_id, server_info in servers.items():
-        if server_info.get("name") == name:
-            return server_id, server_info
+
+def get_server_by_name(
+    data: Dict[str, Any], name: str
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    for server_id, server_info in data.get("servers", {}).items():
+        if isinstance(server_info, dict) and server_info.get("name") == name:
+            return str(server_id), server_info
     return None
 
-# 已废弃的按ID直接读 helper，使用 get_server_info 统一入口
+
+def _find_server(
+    data: Dict[str, Any], identifier: str
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    servers = data.get("servers", {})
+    key = str(identifier)
+    if key in servers and isinstance(servers[key], dict):
+        return key, servers[key]
+    return get_server_by_name(data, key)
+
 
 async def add_data(json_path: str, name: str, host: str) -> bool:
-    """
-    向JSON文件添加新的服务器数据
-
-    Args:
-        json_path: JSON文件路径
-        name: 服务器名称
-        host: 服务器主机地址
-
-    Returns:
-        bool: 添加是否成功
-    """
     try:
-        data = await read_json(json_path)
-        
-        # 检查服务器名称是否已存在
-        existing_server = get_server_by_name(data, name)
-        if existing_server:
-            logger.warning(f"服务器名称已存在: {name} (ID: {existing_server[0]})")
-            return False
+        async with _locked_path(json_path) as path:
+            data = await _read_json_unlocked(path)
+            servers = data["servers"]
+            if get_server_by_name(data, name):
+                return False
+            if any(
+                isinstance(info, dict) and info.get("host") == host
+                for info in servers.values()
+            ):
+                return False
 
-        # 分配新的ID：使用 next_id 单调递增，不复用已删除的 ID
-        servers = data.get("servers", {})
-        used_ids = set()
-        for k in servers.keys():
-            try:
-                used_ids.add(int(k))
-            except Exception:
-                continue
-
-        next_id_val = int(data.get("next_id", 1) or 1)
-        max_used = max(used_ids) if used_ids else 0
-        # 确保新ID 大于当前已用最大ID
-        new_id_int = max(next_id_val, max_used + 1)
-        server_id = str(new_id_int)
-
-        # 更新 next_id 为新ID+1
-        data["next_id"] = new_id_int + 1
-        
-        # 添加新服务器
-        current_time = int(time.time())
-        data["servers"][server_id] = {
-            "id": int(server_id),
-            "name": name,
-            "host": host,
-            "created_time": current_time,
-            "last_success_time": current_time,
-            "last_failed_time": None,
-            "failed_count": 0
-        }
-        
-        await write_json(json_path, data)
-        logger.info(f"成功添加服务器数据: {name} (ID: {server_id})")
-        return True
-    except Exception as e:
-        logger.error(f"添加服务器数据失败: {e}")
+            used_ids = {
+                int(server_id)
+                for server_id in servers
+                if str(server_id).isdigit()
+            }
+            next_id = max(int(data.get("next_id", 1) or 1), max(used_ids, default=0) + 1)
+            server_id = str(next_id)
+            now = int(time.time())
+            servers[server_id] = {
+                "id": next_id,
+                "name": name,
+                "host": host,
+                "created_time": now,
+                "last_success_time": now,
+                "last_failed_time": None,
+                "failed_count": 0,
+            }
+            data["next_id"] = next_id + 1
+            await _write_json_unlocked(path, data)
+            return True
+    except Exception as exc:
+        logger.error(f"添加服务器数据失败: {exc}")
         return False
+
 
 async def del_data(json_path: str, identifier: str) -> bool:
-    """
-    从JSON文件中删除服务器数据（支持通过ID或名称删除）
-
-    Args:
-        json_path: JSON文件路径
-        identifier: 要删除的服务器ID或名称
-
-    Returns:
-        bool: 删除是否成功
-    """
     try:
-        data = await read_json(json_path)
-        servers = data.get("servers", {})
-        
-        # 首先尝试作为ID查找
-        if identifier in servers:
-            server_info = servers[identifier]
-            del servers[identifier]
-            await write_json(json_path, data)
-            logger.info(f"成功删除服务器数据: {server_info['name']} (ID: {identifier})")
-            return True
-        
-        # 如果不是ID，尝试作为名称查找
-        existing_server = get_server_by_name(data, identifier)
-        if existing_server:
-            server_id, server_info = existing_server
-            del servers[server_id]
-            await write_json(json_path, data)
-            logger.info(f"成功删除服务器数据: {server_info['name']} (ID: {server_id})")
-            return True
-        
-        logger.warning(f"服务器不存在: {identifier}")
-        return False
-    except Exception as e:
-        logger.error(f"删除服务器数据失败: {e}")
-        return False
-
-async def update_data(json_path: str, identifier: str, new_name: Optional[str] = None, new_host: Optional[str] = None) -> bool:
-    """
-    更新服务器数据（支持通过ID或名称更新）
-
-    Args:
-        json_path: JSON文件路径
-        identifier: 要更新的服务器ID或名称
-        new_name: 新的服务器名称（可选）
-        new_host: 新的服务器主机地址（可选）
-
-    Returns:
-        bool: 更新是否成功
-    """
-    try:
-        data = await read_json(json_path)
-        servers = data.get("servers", {})
-        
-        # 查找服务器
-        server_id = None
-        server_info = None
-        
-        # 首先尝试作为ID查找
-        if identifier in servers:
-            server_id = identifier
-            server_info = servers[identifier]
-        else:
-            # 如果不是ID，尝试作为名称查找
-            existing_server = get_server_by_name(data, identifier)
-            if existing_server:
-                server_id, server_info = existing_server
-        
-        if not server_info:
-            logger.warning(f"服务器不存在: {identifier}")
-            return False
-        
-        # 检查新名称是否与其他服务器冲突
-        if new_name and new_name != server_info["name"]:
-            existing_server = get_server_by_name(data, new_name)
-            if existing_server and existing_server[0] != server_id:
-                logger.warning(f"服务器名称已存在: {new_name}")
+        async with _locked_path(json_path) as path:
+            data = await _read_json_unlocked(path)
+            found = _find_server(data, str(identifier))
+            if not found:
                 return False
-        
-        # 更新数据
-        if new_name is not None:
-            server_info["name"] = new_name
-        if new_host is not None:
-            server_info["host"] = new_host
-        
-        await write_json(json_path, data)
-        logger.info(f"成功更新服务器数据: {server_info['name']} (ID: {server_id})")
-        return True
-    except Exception as e:
-        logger.error(f"更新服务器数据失败: {e}")
+            server_id, _ = found
+            data["servers"].pop(server_id, None)
+            data.get("trends", {}).pop(server_id, None)
+            await _write_json_unlocked(path, data)
+            return True
+    except Exception as exc:
+        logger.error(f"删除服务器数据失败: {exc}")
         return False
+
+
+async def update_data(
+    json_path: str,
+    identifier: str,
+    new_name: Optional[str] = None,
+    new_host: Optional[str] = None,
+) -> bool:
+    try:
+        async with _locked_path(json_path) as path:
+            data = await _read_json_unlocked(path)
+            found = _find_server(data, str(identifier))
+            if not found:
+                return False
+            server_id, server_info = found
+            if new_name is not None and new_name != server_info.get("name"):
+                duplicate = get_server_by_name(data, new_name)
+                if duplicate and duplicate[0] != server_id:
+                    return False
+            if new_host is not None and new_host != server_info.get("host"):
+                if any(
+                    str(sid) != server_id
+                    and isinstance(info, dict)
+                    and info.get("host") == new_host
+                    for sid, info in data["servers"].items()
+                ):
+                    return False
+            if new_name is not None:
+                server_info["name"] = new_name
+            if new_host is not None:
+                server_info["host"] = new_host
+            await _write_json_unlocked(path, data)
+            return True
+    except Exception as exc:
+        logger.error(f"更新服务器数据失败: {exc}")
+        return False
+
 
 async def get_all_servers(json_path: str) -> Dict[str, Dict[str, Any]]:
-    """
-    获取所有服务器信息
-
-    Args:
-        json_path: JSON文件路径
-
-    Returns:
-        Dict[str, Dict[str, Any]]: 所有服务器信息 {id: server_info}
-    """
     try:
-        data = await read_json(json_path)
-        return data.get("servers", {})
-    except Exception as e:
-        logger.error(f"获取服务器列表失败: {e}")
+        return (await read_json(json_path)).get("servers", {})
+    except Exception as exc:
+        logger.error(f"获取服务器列表失败: {exc}")
         return {}
+
 
 def _hour_bucket(ts: int) -> int:
-    """按小时对齐的时间戳（整点）。"""
     return int(ts // 3600 * 3600)
 
+
+def _append_trend_inplace(data: Dict[str, Any], server_id: str, ts: int, count: int) -> None:
+    trends = data.setdefault("trends", {})
+    history = trends.setdefault(str(server_id), {}).setdefault("history", [])
+    bucket = _hour_bucket(int(ts))
+    point = {"ts": bucket, "count": max(0, int(count))}
+    if history and isinstance(history[-1], dict) and _hour_bucket(int(history[-1].get("ts", 0) or 0)) == bucket:
+        history[-1] = point
+    else:
+        history.append(point)
+    history[:] = history[-MAX_HISTORY_POINTS:]
+
+
 async def append_trend_point(json_path: str, server_id: str, ts: int, count: int) -> bool:
-    """为指定服务器追加或更新某整点的人数，最多保留24条。"""
     try:
-        data = await read_json(json_path)
-        trends = data.get("trends", {})
-        trends.setdefault(str(server_id), {}).setdefault("history", [])
-        history = trends[str(server_id)]["history"]
-        ts_h = _hour_bucket(ts)
-        if history and isinstance(history[-1], dict) and _hour_bucket(history[-1].get("ts", 0)) == ts_h:
-            history[-1]["ts"] = ts_h
-            history[-1]["count"] = int(count)
-        else:
-            history.append({"ts": ts_h, "count": int(count)})
-        if len(history) > MAX_HISTORY_POINTS:
-            history[:] = history[-MAX_HISTORY_POINTS:]
-        trends[str(server_id)]["history"] = history
-        data["trends"] = trends
-        await write_json(json_path, data)
-        return True
-    except Exception as e:
-        logger.error(f"追加柱状图记录失败: {e}")
+        async with _locked_path(json_path) as path:
+            data = await _read_json_unlocked(path)
+            if str(server_id) not in data.get("servers", {}):
+                return False
+            _append_trend_inplace(data, str(server_id), ts, count)
+            await _write_json_unlocked(path, data)
+            return True
+    except Exception as exc:
+        logger.error(f"追加柱状图记录失败: {exc}")
         return False
 
-async def get_trend_history(json_path: str, server_id: str, hours: int = 24) -> Optional[List[Dict[str, Any]]]:
-    """获取指定服务器的柱状图历史记录（最近N小时）。"""
+
+async def get_trend_history(
+    json_path: str, server_id: str, hours: int = 24
+) -> Optional[List[Dict[str, Any]]]:
     try:
         data = await read_json(json_path)
-        trends = data.get("trends", {})
-        hist = trends.get(str(server_id), {}).get("history", [])
-        if hours > 0:
-            hist = hist[-hours:]
-        return hist
-    except Exception as e:
-        logger.error(f"获取柱状图历史失败: {e}")
+        history = data.get("trends", {}).get(str(server_id), {}).get("history", [])
+        return deepcopy(history[-hours:] if hours > 0 else history)
+    except Exception as exc:
+        logger.error(f"获取柱状图历史失败: {exc}")
         return None
 
-async def get_all_trend_histories(json_path: str, hours: int = 24) -> Dict[str, List[Dict[str, Any]]]:
-    """获取所有服务器的柱状图历史记录（最近N小时）。"""
+
+async def get_all_trend_histories(
+    json_path: str, hours: int = 24
+) -> Dict[str, List[Dict[str, Any]]]:
     try:
         data = await read_json(json_path)
-        trends = data.get("trends", {}) or {}
         result: Dict[str, List[Dict[str, Any]]] = {}
-        for sid, obj in trends.items():
-            hist = (obj or {}).get("history", [])
-            if hours > 0:
-                hist = hist[-hours:]
-            result[str(sid)] = hist
+        for server_id, trend in data.get("trends", {}).items():
+            history = (trend or {}).get("history", [])
+            result[str(server_id)] = deepcopy(history[-hours:] if hours > 0 else history)
         return result
-    except Exception as e:
-        logger.error(f"获取所有柱状图历史失败: {e}")
+    except Exception as exc:
+        logger.error(f"获取所有柱状图历史失败: {exc}")
         return {}
 
+
 async def update_server_status(json_path: str, identifier: str, success: bool) -> bool:
-    """
-    更新服务器查询状态
-
-    Args:
-        json_path: JSON文件路径
-        identifier: 服务器ID或名称
-        success: 查询是否成功
-
-    Returns:
-        bool: 更新是否成功
-    """
     try:
-        data = await read_json(json_path)
-        servers = data.get("servers", {})
-        
-        # 查找服务器
-        server_id = None
-        server_info = None
-        
-        # 首先尝试作为ID查找
-        if identifier in servers:
-            server_id = identifier
-            server_info = servers[identifier]
-        else:
-            # 如果不是ID，尝试作为名称查找
-            existing_server = get_server_by_name(data, identifier)
-            if existing_server:
-                server_id, server_info = existing_server
-        
-        if not server_info:
-            logger.warning(f"服务器不存在: {identifier}")
-            return False
-        
-        current_time = int(time.time())
-        
-        if success:
-            # 查询成功
-            server_info["last_success_time"] = current_time
-            server_info["failed_count"] = 0
-            logger.info(f"更新服务器 {server_info['name']} (ID: {server_id}) 查询成功状态")
-        else:
-            # 查询失败
-            server_info["last_failed_time"] = current_time
-            server_info["failed_count"] = server_info.get("failed_count", 0) + 1
-            logger.info(f"更新服务器 {server_info['name']} (ID: {server_id}) 查询失败状态，失败次数: {server_info['failed_count']}")
-        
-        await write_json(json_path, data)
-        return True
-    except Exception as e:
-        logger.error(f"更新服务器状态失败: {e}")
+        async with _locked_path(json_path) as path:
+            data = await _read_json_unlocked(path)
+            found = _find_server(data, str(identifier))
+            if not found:
+                return False
+            _, server_info = found
+            now = int(time.time())
+            if success:
+                server_info["last_success_time"] = now
+                server_info["failed_count"] = 0
+            else:
+                server_info["last_failed_time"] = now
+                server_info["failed_count"] = (
+                    int(server_info.get("failed_count", 0) or 0) + 1
+                )
+            await _write_json_unlocked(path, data)
+            return True
+    except Exception as exc:
+        logger.error(f"更新服务器状态失败: {exc}")
         return False
 
-async def auto_cleanup_servers(json_path: str) -> List[Dict[str, Any]]:
-    """
-    自动清理长时间未查询成功的服务器
 
-    Args:
-        json_path: JSON文件路径
+def _cleanup_candidates(data: Dict[str, Any], now: Optional[int] = None) -> List[Dict[str, Any]]:
+    current_time = int(now or time.time())
+    cutoff = current_time - AUTO_CLEANUP_DAYS * 24 * 3600
+    trends = data.get("trends", {}) or {}
+    candidates: List[Dict[str, Any]] = []
+    for server_id, server_info in data.get("servers", {}).items():
+        if not isinstance(server_info, dict):
+            continue
+        last_success = int(server_info.get("last_success_time", 0) or 0)
+        history = (trends.get(str(server_id)) or {}).get("history", [])
+        latest_trend = 0
+        if history and isinstance(history[-1], dict):
+            latest_trend = int(history[-1].get("ts", 0) or 0)
+        effective = max(last_success, latest_trend)
+        if effective < cutoff:
+            candidates.append(
+                {
+                    "id": str(server_id),
+                    "name": str(server_info.get("name", "")),
+                    "host": str(server_info.get("host", "")),
+                    "last_success_time": server_info.get("last_success_time"),
+                    "failed_count": int(server_info.get("failed_count", 0) or 0),
+                    "effective_last_success_time": effective or None,
+                }
+            )
+    return candidates
 
-    Returns:
-        List[Dict[str, Any]]: 被删除的服务器列表
-    """
+
+async def get_cleanup_candidates(json_path: str) -> List[Dict[str, Any]]:
+    """只读返回达到自动清理条件的服务器。"""
     try:
-        data = await read_json(json_path)
-        servers = data.get("servers", {})
-        
-        if not servers:
-            return []
-        
-        current_time = int(time.time())
-        cutoff_time = current_time - (AUTO_CLEANUP_DAYS * 24 * 3600)  # 10天前的时间戳
-        deleted_servers = []
-        
-        # 柱状图数据映射（用于计算最后有效成功时间）
-        trends_map = data.get("trends", {}) or {}
+        return _cleanup_candidates(await read_json(json_path))
+    except Exception as exc:
+        logger.error(f"获取自动清理候选失败: {exc}")
+        raise
 
-        # 检查每个服务器
-        servers_to_delete = []
-        for server_id, server_info in servers.items():
-            last_success_time = int(server_info.get("last_success_time", 0) or 0)
-            # 同步考虑趋势记录的最新时间戳，若存在则视作近期成功采样
-            latest_trend_ts = 0
-            try:
-                hist = (trends_map.get(str(server_id)) or {}).get("history", [])
-                if hist:
-                    latest_trend_ts = int(hist[-1].get("ts", 0) or 0)
-            except Exception:
-                latest_trend_ts = 0
 
-            effective_last_ok = max(last_success_time, latest_trend_ts)
-            # 如果“最后有效成功时间”超过10天，标记为删除
-            if effective_last_ok < cutoff_time:
-                servers_to_delete.append((server_id, server_info))
-        
-        # 删除标记的服务器
-        for server_id, server_info in servers_to_delete:
-            del servers[server_id]
-            deleted_servers.append({
-                "id": server_id,
-                "name": server_info["name"],
-                "host": server_info["host"],
-                "last_success_time": server_info.get("last_success_time"),
-                "failed_count": server_info.get("failed_count", 0)
-            })
-            logger.info(f"自动删除长时间未查询成功的服务器: {server_info['name']} (ID: {server_id})")
-        
-        if deleted_servers:
-            # 更新最后清理时间
-            data["last_cleanup"] = current_time
-            await write_json(json_path, data)
-            logger.info(f"自动清理完成，删除了 {len(deleted_servers)} 个服务器")
-        
-        return deleted_servers
-    except Exception as e:
-        logger.error(f"自动清理服务器失败: {e}")
+async def auto_cleanup_servers(json_path: str) -> List[Dict[str, Any]]:
+    try:
+        async with _locked_path(json_path) as path:
+            data = await _read_json_unlocked(path)
+            candidates = _cleanup_candidates(data)
+            if not candidates:
+                return []
+            for item in candidates:
+                server_id = item["id"]
+                data.get("servers", {}).pop(server_id, None)
+                data.get("trends", {}).pop(server_id, None)
+            data["last_cleanup"] = int(time.time())
+            await _write_json_unlocked(path, data)
+            return candidates
+    except Exception as exc:
+        logger.error(f"自动清理服务器失败: {exc}")
         return []
 
-async def get_server_info(json_path: str, identifier: str) -> Optional[Dict[str, Any]]:
-    """
-    获取指定服务器的信息（支持通过ID或名称查找）
 
-    Args:
-        json_path: JSON文件路径
-        identifier: 服务器ID或名称
-
-    Returns:
-        Optional[Dict[str, Any]]: 服务器信息或None
-    """
+async def get_server_info(
+    json_path: str, identifier: str
+) -> Optional[Dict[str, Any]]:
     try:
         data = await read_json(json_path)
-        servers = data.get("servers", {})
-        
-        # 首先尝试作为ID查找
-        if identifier in servers:
-            return servers[identifier]
-        
-        # 如果不是ID，尝试作为名称查找
-        existing_server = get_server_by_name(data, identifier)
-        if existing_server:
-            return existing_server[1]
-        
-        return None
-    except Exception as e:
-        logger.error(f"获取服务器信息失败: {e}")
+        found = _find_server(data, str(identifier))
+        return deepcopy(found[1]) if found else None
+    except Exception as exc:
+        logger.error(f"获取服务器信息失败: {exc}")
         return None
