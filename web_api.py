@@ -15,11 +15,13 @@ from astrbot.api.web import error_response, json_response, request
 from .script.get_server_info import get_server_status
 from .script.json_operate import (
     AUTO_CLEANUP_DAYS,
+    GroupStorage,
     add_data,
     append_trend_point,
     auto_cleanup_servers,
     del_data,
     get_cleanup_candidates,
+    list_group_storages,
     read_json,
     update_data,
     update_server_status,
@@ -27,7 +29,7 @@ from .script.json_operate import (
 
 PLUGIN_NAME = "astrbot_zhouyi_plugin"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
-DATA_DIR_NAME = "astrbot_mcgetter"
+DATA_DIR_NAME = "astrbot_zhouyi_plugin"
 
 _GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _HOST_RE = re.compile(r"^[A-Za-z0-9.:-]{1,255}$")
@@ -176,42 +178,24 @@ class McManagerWebApi:
                 description,
             )
 
-    def _group_files(self) -> dict[str, Path]:
-        data_dir = Path(self._data_dir_getter()).expanduser()
-        if not data_dir.exists() or not data_dir.is_dir():
-            return {}
-        base = data_dir.resolve()
-        result: dict[str, Path] = {}
-        for candidate in data_dir.iterdir():
-            if candidate.suffix != ".json" or not candidate.is_file():
-                continue
-            group_id = candidate.stem
-            if not _GROUP_ID_RE.fullmatch(group_id):
-                continue
-            try:
-                resolved = candidate.resolve()
-                resolved.relative_to(base)
-            except (OSError, ValueError):
-                continue
-            if resolved.parent != base:
-                continue
-            result[group_id] = resolved
-        return result
+    async def _group_storages(self) -> dict[str, GroupStorage]:
+        storages = await list_group_storages(self._data_dir_getter())
+        return {storage.group_id: storage for storage in storages}
 
-    def _group_path(self, value: Any) -> tuple[str, Path]:
+    async def _group_storage(self, value: Any) -> tuple[str, GroupStorage]:
         if not isinstance(value, str):
             raise ApiProblem("group_id 必须是字符串", code="INVALID_GROUP_ID")
         group_id = value.strip()
         if not _GROUP_ID_RE.fullmatch(group_id):
             raise ApiProblem("group_id 格式无效", code="INVALID_GROUP_ID")
-        path = self._group_files().get(group_id)
-        if path is None:
+        storage = (await self._group_storages()).get(group_id)
+        if storage is None:
             raise ApiProblem(
                 "群组不存在",
                 status_code=404,
                 code="GROUP_NOT_FOUND",
             )
-        return group_id, path
+        return group_id, storage
 
     @staticmethod
     def _name(value: Any) -> str:
@@ -347,7 +331,7 @@ class McManagerWebApi:
 
     @_api_handler
     async def bootstrap(self):
-        group_ids = sorted(self._group_files(), key=_group_sort_key)
+        group_ids = sorted(await self._group_storages(), key=_group_sort_key)
         groups = [{"id": group_id} for group_id in group_ids]
         return _success(
             {
@@ -358,8 +342,8 @@ class McManagerWebApi:
 
     @_api_handler
     async def list_servers(self):
-        group_id, path = self._group_path(request.query.get("group_id"))
-        data = await read_json(str(path))
+        group_id, storage = await self._group_storage(request.query.get("group_id"))
+        data = await read_json(storage)
         return _success(
             {
                 "group_id": group_id,
@@ -373,7 +357,7 @@ class McManagerWebApi:
             allowed={"group_id", "name", "host", "force"},
             required={"group_id", "name", "host"},
         )
-        group_id, path = self._group_path(payload["group_id"])
+        group_id, storage = await self._group_storage(payload["group_id"])
         name = self._name(payload["name"])
         host = self._host(payload["host"])
         force = (
@@ -382,7 +366,7 @@ class McManagerWebApi:
             else False
         )
 
-        data = await read_json(str(path))
+        data = await read_json(storage)
         self._check_duplicate(data, name=name, host=host)
         if not force and await self._probe(host) is None:
             raise ApiProblem(
@@ -390,14 +374,14 @@ class McManagerWebApi:
                 status_code=502,
                 code="PROBE_FAILED",
             )
-        if not await add_data(str(path), name, host):
+        if not await add_data(storage, name, host):
             raise ApiProblem(
                 "服务器名称或地址已存在",
                 status_code=409,
                 code="SERVER_CONFLICT",
             )
 
-        updated = await read_json(str(path))
+        updated = await read_json(storage)
         found = next(
             (
                 deepcopy(server_info)
@@ -426,9 +410,9 @@ class McManagerWebApi:
                 "至少提供 name 或 host 之一",
                 code="MISSING_UPDATE_FIELDS",
             )
-        group_id, path = self._group_path(payload["group_id"])
+        group_id, storage = await self._group_storage(payload["group_id"])
         identifier = self._identifier(payload["identifier"])
-        data = await read_json(str(path))
+        data = await read_json(storage)
         server_id, current = self._server_or_404(data, identifier)
         name = self._name(payload["name"]) if "name" in payload else str(current.get("name", ""))
         host = self._host(payload["host"]) if "host" in payload else str(current.get("host", ""))
@@ -439,12 +423,12 @@ class McManagerWebApi:
             exclude_id=server_id,
         )
         if not await update_data(
-            str(path),
+            storage,
             server_id,
             name if "name" in payload else None,
             host if "host" in payload else None,
         ):
-            latest = await read_json(str(path))
+            latest = await read_json(storage)
             if _find_server_entry(latest, server_id) is None:
                 raise ApiProblem(
                     "服务器不存在",
@@ -456,7 +440,7 @@ class McManagerWebApi:
                 status_code=409,
                 code="SERVER_CONFLICT",
             )
-        updated = await read_json(str(path))
+        updated = await read_json(storage)
         _, server = self._server_or_404(updated, server_id)
         return _success(
             {"group_id": group_id, "server": deepcopy(server)}
@@ -474,12 +458,12 @@ class McManagerWebApi:
                 "删除服务器必须显式设置 confirm=true",
                 code="CONFIRM_REQUIRED",
             )
-        group_id, path = self._group_path(payload["group_id"])
+        group_id, storage = await self._group_storage(payload["group_id"])
         identifier = self._identifier(payload["identifier"])
-        data = await read_json(str(path))
+        data = await read_json(storage)
         server_id, server = self._server_or_404(data, identifier)
         trend_existed = server_id in (data.get("trends", {}) or {})
-        if not await del_data(str(path), server_id):
+        if not await del_data(storage, server_id):
             raise RuntimeError("删除服务器失败")
         return _success(
             {
@@ -497,8 +481,8 @@ class McManagerWebApi:
             allowed={"group_id", "identifier"},
             required={"group_id"},
         )
-        group_id, path = self._group_path(payload["group_id"])
-        data = await read_json(str(path))
+        group_id, storage = await self._group_storage(payload["group_id"])
+        data = await read_json(storage)
         servers = data.get("servers", {})
         if not isinstance(servers, dict):
             servers = {}
@@ -523,14 +507,14 @@ class McManagerWebApi:
         response_servers: list[dict[str, Any]] = []
         for (server_id, server), status in zip(selected, probe_results):
             success = status is not None
-            if not await update_server_status(str(path), server_id, success):
+            if not await update_server_status(storage, server_id, success):
                 raise RuntimeError(f"更新服务器状态失败: {server_id}")
 
             if success:
                 online_count = status.get("plays_online")
                 if _is_int(online_count):
                     if not await append_trend_point(
-                        str(path),
+                        storage,
                         server_id,
                         queried_at,
                         online_count,
@@ -585,9 +569,9 @@ class McManagerWebApi:
 
     @_api_handler
     async def get_trends(self):
-        group_id, path = self._group_path(request.query.get("group_id"))
+        group_id, storage = await self._group_storage(request.query.get("group_id"))
         hours = self._hours(request.query.get("hours", "24"))
-        data = await read_json(str(path))
+        data = await read_json(storage)
         servers = data.get("servers", {})
         if not isinstance(servers, dict):
             servers = {}
@@ -648,8 +632,8 @@ class McManagerWebApi:
 
     @_api_handler
     async def preview_cleanup(self):
-        group_id, path = self._group_path(request.query.get("group_id"))
-        candidates = await get_cleanup_candidates(str(path))
+        group_id, storage = await self._group_storage(request.query.get("group_id"))
+        candidates = await get_cleanup_candidates(storage)
         return _success(
             {
                 "group_id": group_id,
@@ -670,8 +654,8 @@ class McManagerWebApi:
                 "执行清理必须显式设置 confirm=true",
                 code="CONFIRM_REQUIRED",
             )
-        group_id, path = self._group_path(payload["group_id"])
-        deleted = await auto_cleanup_servers(str(path))
+        group_id, storage = await self._group_storage(payload["group_id"])
+        deleted = await auto_cleanup_servers(storage)
         return _success(
             {
                 "group_id": group_id,

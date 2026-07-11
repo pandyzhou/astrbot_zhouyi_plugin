@@ -18,10 +18,14 @@ from starlette.requests import Request
 
 from data.plugins.astrbot_zhouyi_plugin.script.json_operate import (
     AUTO_CLEANUP_DAYS,
+    GroupStorage,
     default_config,
+    get_group_storage,
     read_json,
+    write_json,
 )
 from data.plugins.astrbot_zhouyi_plugin.web_api import (
+    DATA_DIR_NAME,
     PAGE_API_PREFIX,
     McManagerWebApi,
 )
@@ -60,11 +64,15 @@ def _server(server_id: int, name: str, host: str, **overrides):
 
 
 class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_data_dir_name_uses_current_plugin_name(self):
+        self.assertEqual(DATA_DIR_NAME, "astrbot_zhouyi_plugin")
+        self.assertNotIn(DATA_DIR_NAME, {"astrbot_mcgetter", "astrbot_mcgetter_enhanced"})
+
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.data_dir = Path(self.temp_dir.name)
         self.group_id = "12345"
-        self.group_path = self.data_dir / f"{self.group_id}.json"
+        self.storage = get_group_storage(self.data_dir, self.group_id)
         self.now = int(time.time())
         self.statuses = {}
         self.probe_calls = []
@@ -83,7 +91,7 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
             status_fetcher=fake_status,
             clock=lambda: self.now,
         )
-        self._write_group(
+        await self._write_group(
             {
                 "1": _server(1, "Alpha", "alpha.example:25565"),
             }
@@ -92,16 +100,16 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def _write_group(self, servers, *, trends=None, group_id=None) -> Path:
+    async def _write_group(self, servers, *, trends=None, group_id=None) -> GroupStorage:
         target_group = group_id or self.group_id
-        path = self.data_dir / f"{target_group}.json"
+        storage = get_group_storage(self.data_dir, target_group)
         data = default_config()
         data["servers"] = deepcopy(servers)
         numeric_ids = [int(item) for item in servers if str(item).isdigit()]
         data["next_id"] = max(numeric_ids, default=0) + 1
         data["trends"] = deepcopy(trends or {})
-        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        return path
+        await write_json(storage, data)
+        return storage
 
     async def _call(self, handler, *, method="GET", query=None, body=None):
         query_string = urlencode(query or {}).encode("utf-8")
@@ -190,18 +198,6 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_group_whitelist_bootstrap_and_server_list(self):
-        (self.data_dir / "bad.name.json").write_text("{}", encoding="utf-8")
-        (self.data_dir / ".hidden.json").write_text("{}", encoding="utf-8")
-        temp_root = Path(self.temp_dir.name)
-        outside = temp_root.parent / f"{temp_root.name}-outside-mc-group.json"
-        outside.write_text("{}", encoding="utf-8")
-        symlink = self.data_dir / "escaped.json"
-        try:
-            symlink.symlink_to(outside)
-        except OSError:
-            pass
-        self.addCleanup(lambda: outside.unlink(missing_ok=True))
-
         status, payload = await self._call(self.api.bootstrap)
         self.assertEqual(status, 200)
         self.assertEqual(payload["status"], "ok")
@@ -215,7 +211,7 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             payload["data"]["servers"]["1"],
-            json.loads(self.group_path.read_text(encoding="utf-8"))["servers"]["1"],
+            (await read_json(self.storage))["servers"]["1"],
         )
 
         status, payload = await self._call(
@@ -248,7 +244,7 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 502)
         self.assertEqual(payload["data"]["code"], "PROBE_FAILED")
-        self.assertEqual(len((await read_json(str(self.group_path)))["servers"]), 1)
+        self.assertEqual(len((await read_json(self.storage))["servers"]), 1)
 
         status, payload = await self._call(
             self.api.add_server,
@@ -305,9 +301,9 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["data"]["code"], "DUPLICATE_HOST")
 
     async def test_update_only_name_and_host(self):
-        data = await read_json(str(self.group_path))
+        data = await read_json(self.storage)
         data["servers"]["2"] = _server(2, "Beta", "beta.example:25565")
-        self.group_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        await write_json(self.storage, data)
 
         status, payload = await self._call(
             self.api.update_server,
@@ -350,9 +346,9 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["data"]["code"], "DUPLICATE_NAME")
 
     async def test_delete_requires_confirm_and_cascades_trends(self):
-        data = await read_json(str(self.group_path))
+        data = await read_json(self.storage)
         data["trends"] = {"1": {"history": [{"ts": self.now, "count": 3}]}}
-        self.group_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        await write_json(self.storage, data)
 
         status, payload = await self._call(
             self.api.delete_server,
@@ -379,12 +375,12 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["data"]["deleted"])
         self.assertTrue(payload["data"]["trend_cascade_deleted"])
         self.assertTrue(payload["data"]["trend_existed"])
-        persisted = await read_json(str(self.group_path))
+        persisted = await read_json(self.storage)
         self.assertNotIn("1", persisted["servers"])
         self.assertNotIn("1", persisted["trends"])
 
     async def test_status_success_failure_and_trend_write(self):
-        self._write_group(
+        await self._write_group(
             {
                 "1": _server(
                     1,
@@ -423,7 +419,7 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["icon_base64"], "aWNvbg==")
         self.assertIsNone(results[1]["players_online"])
 
-        persisted = await read_json(str(self.group_path))
+        persisted = await read_json(self.storage)
         self.assertEqual(persisted["servers"]["1"]["failed_count"], 0)
         self.assertGreater(persisted["servers"]["1"]["last_success_time"], 0)
         self.assertEqual(persisted["servers"]["2"]["failed_count"], 1)
@@ -446,7 +442,7 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_trend_hours_boundaries_and_per_server_statistics(self):
         bucket = self.now // 3600 * 3600
-        self._write_group(
+        await self._write_group(
             {
                 "1": _server(1, "Alpha", "alpha.example:25565"),
                 "2": _server(2, "Beta", "beta.example:25565"),
@@ -510,7 +506,7 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_cleanup_preview_and_confirm(self):
         old = self.now - (AUTO_CLEANUP_DAYS + 1) * 24 * 3600
         recent = self.now - 3600
-        self._write_group(
+        await self._write_group(
             {
                 "1": _server(
                     1,
@@ -556,7 +552,7 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"]["deleted_count"], 1)
         self.assertEqual(payload["data"]["deleted"][0]["id"], "1")
-        persisted = await read_json(str(self.group_path))
+        persisted = await read_json(self.storage)
         self.assertNotIn("1", persisted["servers"])
         self.assertNotIn("1", persisted["trends"])
         self.assertIn("2", persisted["servers"])
