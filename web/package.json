@@ -1,0 +1,15 @@
+{
+  "name": "astrbot-zhouyi-web",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @pandyzhou/astrbot-mc-ui && npm run build -w @pandyzhou/astrbot-mc-app",
+    "typecheck": "npm run typecheck -w @pandyzhou/astrbot-mc-ui && npm run typecheck -w @pandyzhou/astrbot-mc-app",
+    "dev": "npm run dev -w @pandyzhou/astrbot-mc-app"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  }
+}

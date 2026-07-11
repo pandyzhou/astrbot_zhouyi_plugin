@@ -1,3 +1,4 @@
 mcstatus
 aiohttp
 pillow
+aiofiles

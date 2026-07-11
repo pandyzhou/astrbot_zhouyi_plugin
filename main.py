@@ -13,11 +13,15 @@ from .script.json_operate import (
     update_server_status, auto_cleanup_servers,
     append_trend_point, get_trend_history, get_all_trend_histories
 )
+from .web_api import McManagerWebApi
+from .standalone_web import StandaloneWebService
 import asyncio
 import re
 from datetime import datetime, timedelta
 
 # 常量定义
+_GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
 HELP_INFO = """
 mchelp 
 --查看帮助
@@ -60,7 +64,13 @@ class MyPlugin(Star):
             context: 插件上下文
         """
         super().__init__(context)
+        self._page_api = McManagerWebApi(self)
+        self._page_api.register_routes()
         logger.info("MyPlugin 初始化完成")
+        self._standalone_service = StandaloneWebService()
+        self._standalone_task: Optional[asyncio.Task] = asyncio.create_task(
+            self._run_standalone_web()
+        )
         # 启动每小时柱状图数据采样后台任务（单例，默认对所有已配置服务器启用）
         self._trend_task: Optional[asyncio.Task] = None
         if getattr(self, "_trend_task", None) is None:
@@ -504,22 +514,38 @@ class MyPlugin(Star):
         Returns:
             JSON文件的Path对象
         """
-        data_path = StarTools.get_data_dir("astrbot_mcgetter")
-        json_path = data_path / f'{group_id}.json'
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.info(f"群号 {group_id} 的 JSON 文件路径: {json_path}")
+        normalized_group_id = str(group_id)
+        if not _GROUP_ID_RE.fullmatch(normalized_group_id):
+            raise ValueError("群组 ID 格式不正确")
+        data_path = Path(StarTools.get_data_dir("astrbot_mcgetter")).expanduser()
+        data_path.mkdir(parents=True, exist_ok=True)
+        resolved_data_path = data_path.resolve()
+        json_path = (resolved_data_path / f"{normalized_group_id}.json").resolve()
+        if json_path.parent != resolved_data_path:
+            raise ValueError("群组数据路径不安全")
+        logger.info(f"群号 {normalized_group_id} 的 JSON 文件路径: {json_path}")
         return json_path
 
     async def _bar_data_loop(self):
         """每小时扫描所有群配置，按 host 去重采样一次并写回所有群，保证跨群一致。"""
         while True:
             try:
-                data_dir = StarTools.get_data_dir("astrbot_mcgetter")
+                data_dir = Path(StarTools.get_data_dir("astrbot_mcgetter")).expanduser()
                 host_map: Dict[str, list] = {}
                 if data_dir.exists():
+                    resolved_data_dir = data_dir.resolve()
                     # 先构建 host → [(json_path, sid), ...] 的映射
-                    for p in data_dir.glob("*.json"):
+                    for candidate in resolved_data_dir.glob("*.json"):
                         try:
+                            if (
+                                candidate.is_symlink()
+                                or not candidate.is_file()
+                                or not _GROUP_ID_RE.fullmatch(candidate.stem)
+                            ):
+                                continue
+                            p = candidate.resolve()
+                            if p.parent != resolved_data_dir:
+                                continue
                             data = await read_json(str(p))
                             servers = data.get("servers", {})
                             for sid, sinfo in servers.items():
@@ -528,7 +554,9 @@ class MyPlugin(Star):
                                     continue
                                 host_map.setdefault(str(host), []).append((str(p), str(sid)))
                         except Exception as e:
-                            logger.warning(f"数据采样预处理失败: {p.name}: {e}")
+                            logger.warning(
+                                f"数据采样预处理失败: {candidate.name}: {e}"
+                            )
 
                 # 逐 host 采样一次，并写回所有关联群文件
                 now_ts = int(datetime.now().timestamp())
@@ -553,3 +581,26 @@ class MyPlugin(Star):
             except Exception as e:
                 logger.error(f"数据采样循环异常: {e}")
                 await asyncio.sleep(300)
+
+    async def _run_standalone_web(self):
+        try:
+            await self._standalone_service.run()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Minecraft Manager 独立页面启动失败", exc_info=True)
+
+    async def terminate(self):
+        """插件重载或停用时停止独立页面和每小时趋势采样任务。"""
+        await self._standalone_service.stop()
+
+        standalone_task = self._standalone_task
+        self._standalone_task = None
+        if standalone_task:
+            await asyncio.gather(standalone_task, return_exceptions=True)
+
+        trend_task = self._trend_task
+        self._trend_task = None
+        if trend_task and not trend_task.done():
+            trend_task.cancel()
+            await asyncio.gather(trend_task, return_exceptions=True)
