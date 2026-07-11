@@ -1,219 +1,493 @@
-from PIL import Image, ImageDraw, ImageFont
-import asyncio
-import io
-from pathlib import Path
-import base64
-from typing import Optional
-from astrbot.api import logger
+from __future__ import annotations
 
-async def load_font(font_size):
-    # 尝试多路径加载
+import asyncio
+import base64
+from datetime import datetime
+import io
+import random
+import time
+from pathlib import Path
+from typing import Optional, Sequence
+import warnings
+
+import aiohttp
+from astrbot.api import logger
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, UnidentifiedImageError
+
+
+CANVAS_SIZE = (800, 440)
+BACKGROUND_URLS = (
+    "https://t.alcy.cc/pc",
+    "https://t.alcy.cc/moe",
+    "https://t.alcy.cc/fj",
+    "https://t.alcy.cc/ys",
+)
+BACKGROUND_MAX_BYTES = 8 * 1024 * 1024
+BACKGROUND_CACHE_TTL = 60.0
+_ALLOWED_BACKGROUND_FORMATS = {"JPEG", "PNG", "WEBP"}
+_BACKGROUND_TIMEOUT = aiohttp.ClientTimeout(total=6.0)
+
+_background_cache: Optional[Image.Image] = None
+_background_cache_at = 0.0
+_background_lock: Optional[asyncio.Lock] = None
+_background_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _reset_background_cache_for_tests() -> None:
+    """重置模块缓存，供跨事件循环测试隔离使用。"""
+    global _background_cache, _background_cache_at, _background_lock, _background_lock_loop
+    _background_cache = None
+    _background_cache_at = 0.0
+    _background_lock = None
+    _background_lock_loop = None
+
+
+def _get_background_lock() -> asyncio.Lock:
+    global _background_lock, _background_lock_loop
+    loop = asyncio.get_running_loop()
+    if _background_lock is None or _background_lock_loop is not loop:
+        _background_lock = asyncio.Lock()
+        _background_lock_loop = loop
+    return _background_lock
+
+
+async def load_font(font_size: int) -> ImageFont.ImageFont:
     font_paths = [
-        Path(__file__).resolve().parent.parent / 'resource' / 'LXGWWenKai-Regular.ttf',
-        Path(__file__).resolve().parent.parent / 'resource' / 'msyh.ttf',
-        'msyh.ttf',  # 当前目录
-        '/usr/share/fonts/zh_CN/msyh.ttf',  # Linux常见路径
-        'C:/Windows/Fonts/msyh.ttc',  # Windows路径
-        '/System/Library/Fonts/Supplemental/Songti.ttc'  # macOS路径
+        Path(__file__).resolve().parent.parent / "resource" / "LXGWWenKai-Regular.ttf",
+        Path(__file__).resolve().parent.parent / "resource" / "msyh.ttf",
+        "msyh.ttf",
+        "/usr/share/fonts/zh_CN/msyh.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
     ]
-    
     for path in font_paths:
         try:
-            return ImageFont.truetype(path, font_size)
+            return ImageFont.truetype(str(path), font_size)
         except OSError:
             continue
-    
-    # 全部失败时使用默认字体（添加中文支持）
     try:
-        # 尝试加载PIL的默认中文字体
         return ImageFont.load_default().font_variant(size=font_size)
-    except:
+    except Exception:
         return ImageFont.load_default()
 
 
+def _measure_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+) -> float:
+    try:
+        return float(draw.textlength(text, font=font))
+    except Exception:
+        box = draw.textbbox((0, 0), text, font=font)
+        return float(max(0, box[2] - box[0]))
+
+
+def _ellipsize_text(
+    draw: ImageDraw.ImageDraw,
+    text: object,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> str:
+    value = str(text or "")
+    if max_width <= 0:
+        return ""
+    if _measure_text(draw, value, font) <= max_width:
+        return value
+    suffix = "…"
+    if _measure_text(draw, suffix, font) > max_width:
+        return ""
+    low, high = 0, len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _measure_text(draw, value[:middle] + suffix, font) <= max_width:
+            low = middle
+        else:
+            high = middle - 1
+    return value[:low] + suffix
+
+
+def _wrap_text_lines(
+    draw: ImageDraw.ImageDraw,
+    text: object,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    max_lines: int,
+) -> list[str]:
+    value = str(text or "")
+    if not value or max_lines <= 0:
+        return []
+    lines: list[str] = []
+    current = ""
+    consumed = 0
+    for index, char in enumerate(value):
+        candidate = current + char
+        if current and _measure_text(draw, candidate, font) > max_width:
+            lines.append(current)
+            current = char
+            if len(lines) == max_lines:
+                consumed = index
+                break
+        else:
+            current = candidate
+    else:
+        consumed = len(value)
+        if current:
+            lines.append(current)
+
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    if consumed < len(value) and lines:
+        remainder = lines[-1] + value[consumed:]
+        lines[-1] = _ellipsize_text(draw, remainder, font, max_width)
+    return lines
+
+
+def _layout_player_capsules(
+    draw: ImageDraw.ImageDraw,
+    players: Sequence[object],
+    font: ImageFont.ImageFont,
+    bounds: tuple[int, int, int, int],
+    *,
+    total_online: Optional[int] = None,
+    horizontal_gap: int = 8,
+    vertical_gap: int = 7,
+    padding_x: int = 12,
+    height: int = 27,
+) -> tuple[list[tuple[str, tuple[int, int, int, int], bool]], int]:
+    """计算玩家胶囊，保证汇总胶囊和所有矩形都落在 bounds 内。"""
+    left, top, right, bottom = bounds
+    max_inner_width = max(1, right - left - padding_x * 2)
+    normalized = [
+        _ellipsize_text(draw, player, font, max_inner_width)
+        for player in players
+        if str(player or "").strip()
+    ]
+    online_count = len(normalized) if total_online is None else max(0, int(total_online))
+
+    def place(texts: Sequence[tuple[str, bool]]):
+        items: list[tuple[str, tuple[int, int, int, int], bool]] = []
+        x, y = left, top
+        for text, is_summary in texts:
+            width = min(
+                right - left,
+                max(height, int(_measure_text(draw, text, font)) + padding_x * 2),
+            )
+            if x + width > right and x > left:
+                x = left
+                y += height + vertical_gap
+            if y + height > bottom:
+                return items, False
+            items.append((text, (x, y, x + width, y + height), is_summary))
+            x += width + horizontal_gap
+        return items, True
+
+    plain = [(name, False) for name in normalized]
+    visible_count = len(normalized)
+    while visible_count >= 0:
+        hidden = max(online_count - visible_count, len(normalized) - visible_count, 0)
+        candidate_items = plain[:visible_count]
+        if hidden > 0:
+            candidate_items.append((f"还有 {hidden} 位玩家", True))
+        candidate, fit = place(candidate_items)
+        if fit:
+            return candidate, hidden
+        visible_count -= 1
+    return [], max(online_count, len(normalized), 0)
+
+
+def _open_verified_image(
+    data: bytes,
+    *,
+    allowed_formats: Optional[set[str]] = None,
+    output_mode: str = "RGB",
+) -> Image.Image:
+    if not data:
+        raise ValueError("图片数据为空")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as probe:
+                image_format = (probe.format or "").upper()
+                if allowed_formats is not None and image_format not in allowed_formats:
+                    raise ValueError(f"不支持的图片格式: {image_format or '未知'}")
+                probe.verify()
+            with Image.open(io.BytesIO(data)) as reopened:
+                reopened.load()
+                image = ImageOps.exif_transpose(reopened)
+                return image.convert(output_mode)
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise ValueError("图片尺寸异常，疑似解压炸弹") from None
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("图片内容损坏或无法识别") from exc
+
+
+def _decode_background_image(data: bytes) -> Image.Image:
+    return _open_verified_image(
+        data,
+        allowed_formats=_ALLOWED_BACKGROUND_FORMATS,
+        output_mode="RGB",
+    )
+
+
+def _cover_image(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+    source = image.convert("RGB")
+    return ImageOps.fit(source, size, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+
+
+def _prepare_background(image: Image.Image, size: tuple[int, int] = CANVAS_SIZE) -> Image.Image:
+    """横图 cover；竖图和方图使用模糊铺底并清晰 contain 居中。"""
+    source = image.convert("RGB")
+    if source.width > source.height:
+        return _cover_image(source, size)
+
+    backdrop = _cover_image(source, size).filter(ImageFilter.GaussianBlur(radius=18))
+    shade = Image.new("RGBA", size, (18, 24, 36, 58))
+    backdrop = Image.alpha_composite(backdrop.convert("RGBA"), shade).convert("RGB")
+    foreground = ImageOps.contain(source, size, method=Image.Resampling.LANCZOS)
+    x = (size[0] - foreground.width) // 2
+    y = (size[1] - foreground.height) // 2
+    backdrop.paste(foreground, (x, y))
+    return backdrop
+
+
+def _make_gradient_background(size: tuple[int, int] = CANVAS_SIZE) -> Image.Image:
+    width, height = size
+    image = Image.new("RGB", size)
+    pixels = image.load()
+    for y in range(height):
+        vertical = y / max(1, height - 1)
+        for x in range(width):
+            horizontal = x / max(1, width - 1)
+            pixels[x, y] = (
+                int(31 + 35 * horizontal),
+                int(42 + 37 * (1 - vertical)),
+                int(72 + 48 * vertical + 18 * horizontal),
+            )
+    return image
+
+
+async def _download_background_bytes(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> bytes:
+    async with session.get(url, allow_redirects=True) as response:
+        if response.status < 200 or response.status >= 300:
+            raise ValueError(f"背景接口返回 HTTP {response.status}")
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError as exc:
+                raise ValueError("背景 Content-Length 无效") from exc
+            if declared_size < 0 or declared_size > BACKGROUND_MAX_BYTES:
+                raise ValueError("背景 Content-Length 超过 8MB")
+
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            received += len(chunk)
+            if received > BACKGROUND_MAX_BYTES:
+                raise ValueError("背景实际下载大小超过 8MB")
+            chunks.append(chunk)
+        if received == 0:
+            raise ValueError("背景接口返回空内容")
+        return b"".join(chunks)
+
+
+async def _fetch_background() -> Image.Image:
+    url = random.choice(BACKGROUND_URLS)
+    async with aiohttp.ClientSession(timeout=_BACKGROUND_TIMEOUT) as session:
+        data = await _download_background_bytes(session, url)
+    return _prepare_background(_decode_background_image(data))
+
+
+async def _get_cached_background() -> Image.Image:
+    global _background_cache, _background_cache_at
+    now = time.monotonic()
+    if _background_cache is not None and now - _background_cache_at < BACKGROUND_CACHE_TTL:
+        return _background_cache.copy()
+
+    async with _get_background_lock():
+        now = time.monotonic()
+        if _background_cache is not None and now - _background_cache_at < BACKGROUND_CACHE_TTL:
+            return _background_cache.copy()
+        try:
+            refreshed = await _fetch_background()
+        except Exception as exc:
+            logger.warning(f"刷新服务器卡片背景失败，使用本地回退: {exc}")
+            if _background_cache is not None:
+                return _background_cache.copy()
+            return _make_gradient_background()
+        _background_cache = refreshed.convert("RGB").resize(CANVAS_SIZE)
+        _background_cache_at = time.monotonic()
+        return _background_cache.copy()
+
 
 async def fetch_icon(icon_base64: Optional[str] = None) -> Optional[Image.Image]:
-    """处理Base64编码的服务器图标"""
-    if not icon_base64:
-        return None
-    
+    """安全解码服务器图标，缺失或损坏时回退到本地默认图标。"""
+    if icon_base64:
+        try:
+            encoded = icon_base64.split(",", 1)[1] if "," in icon_base64 else icon_base64
+            encoded = "".join(encoded.split())
+            icon_data = base64.b64decode(encoded, validate=True)
+            return _open_verified_image(icon_data, output_mode="RGBA")
+        except Exception as exc:
+            logger.warning(f"Base64 图标解码失败，使用默认图标: {exc}")
+
     try:
-        # 去除可能的Base64前缀
-        if "," in icon_base64:
-            icon_base64 = icon_base64.split(",", 1)[1]
-        icon_data = base64.b64decode(icon_base64)
-        return Image.open(io.BytesIO(icon_data)).convert("RGBA")
-    except Exception as e:
-        logger.warning(f"Base64 图标解码失败: {e}")
+        default_path = Path(__file__).resolve().parent.parent / "resource" / "default_icon.png"
+        return _open_verified_image(default_path.read_bytes(), output_mode="RGBA")
+    except Exception as exc:
+        logger.warning(f"默认服务器图标读取失败: {exc}")
         return None
+
+
+def _rounded_panel(
+    layer: Image.Image,
+    bounds: tuple[int, int, int, int],
+    *,
+    radius: int,
+    fill: tuple[int, int, int, int],
+    outline: Optional[tuple[int, int, int, int]] = None,
+    width: int = 1,
+) -> None:
+    draw = ImageDraw.Draw(layer)
+    draw.rounded_rectangle(bounds, radius=radius, fill=fill, outline=outline, width=width)
+
+
+def _paste_icon(canvas: Image.Image, icon: Optional[Image.Image]) -> None:
+    icon_bounds = (690, 38, 756, 104)
+    size = (icon_bounds[2] - icon_bounds[0], icon_bounds[3] - icon_bounds[1])
+    if icon is None:
+        return
+
+    fitted = ImageOps.contain(icon.convert("RGBA"), size, method=Image.Resampling.LANCZOS)
+    plate = Image.new("RGBA", size, (245, 248, 255, 235))
+    plate.alpha_composite(
+        fitted,
+        ((size[0] - fitted.width) // 2, (size[1] - fitted.height) // 2),
+    )
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size[0] - 1, size[1] - 1), radius=16, fill=255)
+    framed = Image.new("RGBA", size, (0, 0, 0, 0))
+    framed.paste(plate, (0, 0), mask)
+    ImageDraw.Draw(framed).rounded_rectangle(
+        (0, 0, size[0] - 1, size[1] - 1),
+        radius=16,
+        outline=(255, 255, 255, 220),
+        width=2,
+    )
+    canvas.alpha_composite(framed, (icon_bounds[0], icon_bounds[1]))
+
 
 async def generate_server_info_image(
     players_list: list,
-    latency: int,
+    latency: Optional[int],
     server_name: str,
     plays_max: int,
     plays_online: int,
     server_version: str,
     icon_base64: Optional[str] = None,
-    host_address: Optional[str] = None
+    host_address: Optional[str] = None,
+    *,
+    is_online: bool = True,
+    generated_at: Optional[datetime] = None,
 ) -> str:
-    """生成服务器信息图片并返回base64编码"""
-    
-    def measure(draw_ctx: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
-        try:
-            # PIL>=8 提供 textlength，较为准确
-            return int(draw_ctx.textlength(text, font=font))
-        except Exception:
-            # 退化方案
-            bbox = draw_ctx.textbbox((0, 0), text, font=font)
-            return bbox[2] - bbox[0]
-
-    def wrap_text(draw_ctx: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
-        if not text:
-            return []
-        lines = []
-        current = ""
-        for ch in text:
-            trial = current + ch
-            if measure(draw_ctx, trial, font) <= max_width:
-                current = trial
-            else:
-                if current:
-                    lines.append(current)
-                current = ch
-        if current:
-            lines.append(current)
-        return lines
-
-    def wrap_players(draw_ctx: ImageDraw.ImageDraw, players: list[str], font: ImageFont.ImageFont, max_width: int) -> list[str]:
-        if not players:
-            return []
-        lines = []
-        current = ""
-        sep = " • "
-        for name in players:
-            part = name if not current else current + sep + name
-            if measure(draw_ctx, part, font) <= max_width:
-                current = part
-            else:
-                if current:
-                    lines.append(current)
-                # 如果单个名字已经超过宽度，强制按字符折行
-                if measure(draw_ctx, name, font) > max_width:
-                    for chunk in wrap_text(draw_ctx, name, font, max_width):
-                        lines.append(chunk)
-                    current = ""
-                else:
-                    current = name
-        if current:
-            lines.append(current)
-        return lines
-
-    # 异步获取图标
-    server_icon = await fetch_icon(icon_base64)
-    
-    # 配置参数
-    BG_COLOR = (34, 34, 34)
-    TEXT_COLOR = (255, 255, 255)
-    ACCENT_COLOR = (85, 255, 85)
-    WARNING_COLOR = (255, 170, 0)
-    ERROR_COLOR = (255, 85, 85)
-    
-    # 字体配置
+    """生成固定 800×440 的 D「相框贴纸卡」，返回 Base64 PNG。"""
     try:
-        title_font = await load_font(30)
-        text_font = await load_font(20)
-        small_font = await load_font(18)
-    except IOError:
-        title_font = ImageFont.load_default(30)
-        text_font = ImageFont.load_default(20)
-        small_font = ImageFont.load_default(18)
-    
-    # 计算布局参数
-    icon_size = 64 if server_icon else 0
-    base_y = 20
-    text_x = 20 + icon_size + 20
-    img_width = 600
-    right_margin = 20
-    left_margin = 20
+        background = await _get_cached_background()
+    except Exception as exc:
+        logger.warning(f"读取卡片背景失败，使用本地渐变: {exc}")
+        background = _make_gradient_background()
 
-    # 预先创建测量画布
-    tmp_img = Image.new("RGB", (img_width, 10), color=BG_COLOR)
-    tmp_draw = ImageDraw.Draw(tmp_img)
+    canvas = background.convert("RGBA")
+    overlay = Image.new("RGBA", CANVAS_SIZE, (0, 0, 0, 0))
+    _rounded_panel(
+        overlay,
+        (12, 12, 788, 428),
+        radius=25,
+        fill=(7, 13, 25, 52),
+        outline=(255, 255, 255, 185),
+        width=2,
+    )
+    _rounded_panel(overlay, (24, 22, 776, 148), radius=20, fill=(12, 20, 35, 190))
+    _rounded_panel(overlay, (24, 164, 776, 414), radius=20, fill=(12, 20, 35, 204))
+    canvas = Image.alpha_composite(canvas, overlay)
 
-    # 顶部名称行高度（和原先一致）
-    name_line_height = 40
+    draw = ImageDraw.Draw(canvas)
+    title_font = await load_font(28)
+    address_font = await load_font(18)
+    label_font = await load_font(16)
+    value_font = await load_font(23)
+    capsule_font = await load_font(16)
+    time_font = await load_font(14)
 
-    # 版本 + 地址 文本，左侧与延迟共享一行；左侧需要根据延迟文本宽度折行
-    version_text = f"版本: {server_version}"
-    addr_text = f"  地址: {host_address}" if host_address else ""
-    version_addr_text = version_text + addr_text
+    title_color = (250, 252, 255, 255)
+    soft_color = (216, 226, 241, 255)
+    muted_color = (174, 190, 211, 255)
+    online_color = (119, 238, 177, 255)
+    offline_color = (255, 145, 145, 255)
+    accent = online_color if is_online else offline_color
 
-    latency_color = ACCENT_COLOR if latency < 100 else WARNING_COLOR if latency < 200 else ERROR_COLOR
-    latency_text = f"延迟: {latency}ms"
+    title_lines = _wrap_text_lines(draw, server_name, title_font, 620, 2) or ["未命名服务器"]
+    title_y = 38 if len(title_lines) == 1 else 31
+    for line in title_lines:
+        draw.text((42, title_y), line, font=title_font, fill=title_color)
+        title_y += 34
 
-    # 左侧可用宽度：延迟不与本行共享，给版本+地址留出全部空间
-    allowed_left_width = max(60, img_width - right_margin - text_x)
-    version_addr_lines = wrap_text(tmp_draw, version_addr_text, text_font, allowed_left_width)
+    address = _ellipsize_text(draw, host_address or "地址未知", address_font, 620)
+    draw.text((42, 116), address, font=address_font, fill=soft_color)
+    _paste_icon(canvas, await fetch_icon(icon_base64))
 
-    # 在线玩家标题行
-    online_title = f"在线玩家 ({plays_online}/{plays_max})"
-    online_title_height = 40
+    columns = (
+        (42, 251, "在线", f"{max(0, int(plays_online or 0))}/{max(0, int(plays_max or 0))}" if is_online else "离线"),
+        (292, 501, "延迟", f"{int(latency)} ms" if is_online and latency is not None else "--"),
+        (542, 758, "版本", str(server_version or "未知")),
+    )
+    for left, right, label, value in columns:
+        draw.text((left, 183), label, font=label_font, fill=muted_color)
+        value_text = _ellipsize_text(draw, value, value_font, right - left)
+        draw.text((left, 207), value_text, font=value_font, fill=accent if label == "在线" else title_color)
 
-    # 玩家列表折行
-    players_area_max_width = img_width - right_margin - (text_x + 20)
-    players_lines = wrap_players(tmp_draw, players_list or [], small_font, players_area_max_width)
-    line_height = 30
-
-    # 计算总高度
-    calc_y = base_y
-    calc_y += name_line_height
-    calc_y += max(len(version_addr_lines), 1) * 40
-    calc_y += online_title_height  # 延迟与在线玩家同一行
-    calc_y += max(len(players_lines), 1) * line_height
-    img_height = calc_y + 30  # 底部留白
-
-    # 创建画布
-    img = Image.new("RGB", (img_width, img_height), color=BG_COLOR)
-    draw = ImageDraw.Draw(img)
-    
-    # 绘制服务器图标
-    if server_icon:
-        icon_mask = Image.new("L", (64, 64), 0)
-        mask_draw = ImageDraw.Draw(icon_mask)
-        mask_draw.rounded_rectangle((0, 0, 64, 64), radius=10, fill=255)
-        server_icon.thumbnail((64, 64))
-        img.paste(server_icon, (20, base_y), icon_mask)
-    
-    # 服务器信息绘制（保持原有绘制逻辑不变）
-    draw.text((text_x, base_y), server_name, font=title_font, fill=ACCENT_COLOR)
-    base_y += 40
-    
-    # 绘制版本 + 地址（折行）
-    for i, line in enumerate(version_addr_lines):
-        draw.text((text_x, base_y), line, font=text_font, fill=TEXT_COLOR)
-        base_y += 40
-    
-    # 在线玩家（左） + 延迟（右对齐）同一行
-    draw.text((text_x, base_y), online_title, font=text_font, fill=ACCENT_COLOR)
-    lat_w = measure(draw, latency_text, text_font)
-    draw.text((img_width - right_margin - lat_w, base_y), latency_text, font=text_font, fill=latency_color)
-    base_y += 40
-
-    if players_lines:
-        for line in players_lines:
-            draw.text((text_x + 20, base_y), line, font=small_font, fill=TEXT_COLOR)
-            base_y += line_height
+    player_label = "在线玩家" if is_online else "玩家列表"
+    draw.text((42, 258), player_label, font=label_font, fill=muted_color)
+    player_bounds = (42, 286, 758, 354)
+    capsule_players = (players_list or []) if is_online else []
+    capsules, _ = _layout_player_capsules(
+        draw,
+        capsule_players,
+        capsule_font,
+        player_bounds,
+        total_online=max(0, int(plays_online or 0)) if is_online else 0,
+    )
+    if capsules:
+        for text, bounds, is_summary in capsules:
+            fill = (73, 112, 158, 225) if not is_summary else (134, 94, 162, 230)
+            draw.rounded_rectangle(bounds, radius=13, fill=fill, outline=(255, 255, 255, 70), width=1)
+            text_box = draw.textbbox((0, 0), text, font=capsule_font)
+            text_height = text_box[3] - text_box[1]
+            text_y = bounds[1] + (bounds[3] - bounds[1] - text_height) // 2 - text_box[1]
+            draw.text((bounds[0] + 12, text_y), text, font=capsule_font, fill=title_color)
     else:
-        draw.text((text_x + 20, base_y), "暂无玩家在线", font=small_font, fill=TEXT_COLOR)
-        base_y += line_height
-    
-    draw.rounded_rectangle([10, 10, img.width-10, img.height-10], radius=10, outline=ACCENT_COLOR, width=2)
-    
-    # 转换为base64
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        empty_text = "暂无玩家在线" if is_online else "服务器当前不可达"
+        draw.text((42, 300), empty_text, font=capsule_font, fill=soft_color)
 
-    # 返回base64 bytes
-    return img_base64
+    status_text = "在线" if is_online else "离线"
+    status_width = int(_measure_text(draw, status_text, label_font)) + 24
+    status_bounds = (42, 372, 42 + status_width, 400)
+    draw.rounded_rectangle(status_bounds, radius=14, fill=accent)
+    status_box = draw.textbbox((0, 0), status_text, font=label_font)
+    status_y = status_bounds[1] + (28 - (status_box[3] - status_box[1])) // 2 - status_box[1]
+    draw.text((status_bounds[0] + 12, status_y), status_text, font=label_font, fill=(18, 30, 40, 255))
+
+    timestamp = generated_at or datetime.now()
+    query_text = f"刚刚查询 · {timestamp.strftime('%H:%M:%S')}"
+    query_text = _ellipsize_text(draw, query_text, time_font, 300)
+    query_width = _measure_text(draw, query_text, time_font)
+    draw.text((758 - query_width, 383), query_text, font=time_font, fill=muted_color)
+
+    output = canvas.convert("RGB")
+    buffer = io.BytesIO()
+    output.save(buffer, format="PNG", optimize=True)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")

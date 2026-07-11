@@ -559,27 +559,33 @@ class MyPlugin(Star):
             图片的base64编码字符串，如果获取失败则返回None
         """
         logger.info(f"开始获取服务器 {server_name} 的图片，主机地址: {host}")
+        effective = settings
+        if effective is None and storage is not None:
+            effective = await get_effective_settings(storage)
+
+        info: Optional[dict[str, Any]] = None
         try:
-            effective = settings
-            if effective is None and storage is not None:
-                effective = await get_effective_settings(storage)
             info = (
                 await self._query_server_status(host, effective)
                 if effective is not None
                 else await get_server_status(host)
             )
-            if not info:
-                logger.error(f"无法获取服务器 {server_name} 的状态信息")
-                # 更新查询失败状态
-                if storage and server_id:
-                    await update_server_status(storage, server_id, False)
-                return None
+        except Exception as exc:
+            logger.error(f"查询服务器 {server_name} 状态时出错: {exc}")
 
-            # 更新查询成功状态
-            if storage and server_id:
-                await update_server_status(storage, server_id, True)
+        is_online = bool(info)
+        if not is_online:
+            logger.warning(f"无法获取服务器 {server_name} 的状态信息，将生成离线卡")
 
-            # 仅在有效配置启用采样时记录趋势；状态与最后成功时间始终更新。
+        if storage and server_id:
+            try:
+                await update_server_status(storage, server_id, is_online)
+            except Exception as exc:
+                logger.warning(
+                    f"更新服务器状态失败 group={storage}, sid={server_id}, online={is_online}: {exc}"
+                )
+
+        if is_online and info is not None:
             try:
                 if (
                     storage
@@ -595,32 +601,37 @@ class MyPlugin(Star):
                             effective.max_history_points if effective is not None else None
                         ),
                     )
-            except Exception as e:
-                logger.warning(f"追加柱状图数据失败 group={storage}, sid={server_id}: {e}")
+            except Exception as exc:
+                logger.warning(f"追加柱状图数据失败 group={storage}, sid={server_id}: {exc}")
 
-            info['server_name'] = server_name
-            # 如果有服务器ID，则在名称前添加ID
-            display_name = f"[{server_id}]{server_name}" if server_id else server_name
-            
+        display_name = f"[{server_id}]{server_name}" if server_id else server_name
+        render_info = info or {
+            "players_list": [],
+            "latency": None,
+            "plays_max": 0,
+            "plays_online": 0,
+            "server_version": "未知",
+            "icon_base64": None,
+            "host": host,
+        }
+        try:
             mcinfo_img = await generate_server_info_image(
-                players_list=info['players_list'],
-                latency=info['latency'],
+                players_list=render_info.get("players_list") or [],
+                latency=render_info.get("latency"),
                 server_name=display_name,
-                plays_max=info['plays_max'],
-                plays_online=info['plays_online'],
-                server_version=info['server_version'],
-                icon_base64=info['icon_base64'],
-                host_address=info.get('host', host)
+                plays_max=render_info.get("plays_max", 0),
+                plays_online=render_info.get("plays_online", 0),
+                server_version=render_info.get("server_version") or "未知",
+                icon_base64=render_info.get("icon_base64"),
+                host_address=render_info.get("host", host),
+                is_online=is_online,
             )
-            logger.info(f"成功生成服务器 {server_name} 的图片")
-            return mcinfo_img
-            
-        except Exception as e:
-            logger.error(f"获取服务器 {server_name} 的图片时出错: {e}")
-            # 更新查询失败状态
-            if storage and server_id:
-                await update_server_status(storage, server_id, False)
+        except Exception as exc:
+            logger.error(f"生成服务器 {server_name} 图片时出错: {exc}")
             return None
+
+        logger.info(f"成功生成服务器 {server_name} 的图片")
+        return mcinfo_img
 
     async def get_group_storage(self, group_id: str) -> GroupStorage:
         """校验群组 ID，并返回当前插件数据目录中的 SQLite 群存储定位。"""

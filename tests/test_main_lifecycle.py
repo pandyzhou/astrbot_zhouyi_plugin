@@ -344,6 +344,115 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         update_status.assert_awaited_once_with(storage, "1", True)
         append_point.assert_not_awaited()
 
+    async def test_get_img_none_status_updates_once_and_returns_offline_card(self):
+        plugin = object.__new__(MyPlugin)
+        storage = GroupStorage(self.data_dir / DATABASE_NAME, "12345")
+        effective = EffectiveRuntimeSettings(group_id="12345")
+
+        with (
+            patch.object(
+                MyPlugin,
+                "_query_server_status",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "data.plugins.astrbot_zhouyi_plugin.main.update_server_status",
+                AsyncMock(return_value=True),
+            ) as update_status,
+            patch(
+                "data.plugins.astrbot_zhouyi_plugin.main.append_trend_point",
+                AsyncMock(return_value=True),
+            ) as append_point,
+            patch(
+                "data.plugins.astrbot_zhouyi_plugin.main.generate_server_info_image",
+                AsyncMock(return_value="offline-image"),
+            ) as generate_image,
+        ):
+            image = await plugin.get_img(
+                "Alpha", "alpha.example:25565", "1", storage, settings=effective
+            )
+
+        self.assertEqual(image, "offline-image")
+        update_status.assert_awaited_once_with(storage, "1", False)
+        append_point.assert_not_awaited()
+        kwargs = generate_image.await_args.kwargs
+        self.assertFalse(kwargs["is_online"])
+        self.assertEqual(kwargs["players_list"], [])
+        self.assertIsNone(kwargs["latency"])
+        self.assertEqual(kwargs["plays_online"], 0)
+        self.assertEqual(kwargs["plays_max"], 0)
+        self.assertEqual(kwargs["server_version"], "未知")
+        self.assertEqual(kwargs["host_address"], "alpha.example:25565")
+
+    async def test_get_img_query_exception_still_returns_offline_card_and_updates_once(self):
+        plugin = object.__new__(MyPlugin)
+        storage = GroupStorage(self.data_dir / DATABASE_NAME, "12345")
+        effective = EffectiveRuntimeSettings(group_id="12345")
+
+        with (
+            patch.object(
+                MyPlugin,
+                "_query_server_status",
+                AsyncMock(side_effect=RuntimeError("lookup failed")),
+            ),
+            patch(
+                "data.plugins.astrbot_zhouyi_plugin.main.update_server_status",
+                AsyncMock(return_value=True),
+            ) as update_status,
+            patch(
+                "data.plugins.astrbot_zhouyi_plugin.main.generate_server_info_image",
+                AsyncMock(return_value="offline-image"),
+            ) as generate_image,
+        ):
+            image = await plugin.get_img(
+                "Alpha", "alpha.example", "1", storage, settings=effective
+            )
+
+        self.assertEqual(image, "offline-image")
+        update_status.assert_awaited_once_with(storage, "1", False)
+        self.assertFalse(generate_image.await_args.kwargs["is_online"])
+
+    async def test_get_img_render_failure_does_not_reverse_success_status(self):
+        plugin = object.__new__(MyPlugin)
+        storage = GroupStorage(self.data_dir / DATABASE_NAME, "12345")
+        effective = EffectiveRuntimeSettings(group_id="12345")
+        status = {
+            "players_list": ["Alice"],
+            "latency": 12,
+            "plays_max": 20,
+            "plays_online": 1,
+            "server_version": "1.21.4",
+            "icon_base64": None,
+            "host": "alpha.example",
+        }
+
+        with (
+            patch.object(
+                MyPlugin,
+                "_query_server_status",
+                AsyncMock(return_value=status),
+            ),
+            patch(
+                "data.plugins.astrbot_zhouyi_plugin.main.update_server_status",
+                AsyncMock(return_value=True),
+            ) as update_status,
+            patch(
+                "data.plugins.astrbot_zhouyi_plugin.main.append_trend_point",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "data.plugins.astrbot_zhouyi_plugin.main.generate_server_info_image",
+                AsyncMock(side_effect=RuntimeError("render failed")),
+            ) as generate_image,
+        ):
+            image = await plugin.get_img(
+                "Alpha", "alpha.example", "1", storage, settings=effective
+            )
+
+        self.assertIsNone(image)
+        update_status.assert_awaited_once_with(storage, "1", True)
+        self.assertTrue(generate_image.await_args.kwargs["is_online"])
+
     async def test_manual_cleanup_uses_dynamic_days_even_when_auto_cleanup_disabled(self):
         plugin = object.__new__(MyPlugin)
         event = DummyEvent()
