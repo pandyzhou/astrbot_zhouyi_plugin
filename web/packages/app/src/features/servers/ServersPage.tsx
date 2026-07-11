@@ -23,11 +23,29 @@ export function ServersPage() {
     setData(null);
     setError('');
     setFeedback('');
+    setBusyKey('');
     setFormMode(null);
     setEditingServer(null);
     setDeleteTarget(null);
     apiClient.servers(groupId, controller.signal)
-      .then(setData)
+      .then(async (savedData) => {
+        setData(savedData);
+        if (!savedData.servers.length) return;
+
+        setBusyKey('status:all');
+        try {
+          const result = await apiClient.refreshStatus({ group_id: groupId }, controller.signal);
+          if (!controller.signal.aborted) {
+            setData((current) => current ? { ...current, servers: result.servers } : current);
+          }
+        } catch (reason) {
+          if ((reason as Error).name !== 'AbortError') {
+            setError((reason as Error).message || '自动刷新服务器状态失败');
+          }
+        } finally {
+          if (!controller.signal.aborted) setBusyKey('');
+        }
+      })
       .catch((reason: unknown) => {
         if ((reason as Error).name !== 'AbortError') setError((reason as Error).message || '读取服务器失败');
       })
@@ -160,7 +178,7 @@ export function ServersPage() {
       <WorkshopPanel title="服务器列表" description={`当前 group_id：${groupId}`}>
         {loading ? <DataState state="loading" title="正在读取服务器" /> : null}
         {!loading && !error && !data?.servers.length ? <DataState state="empty" title="尚未保存服务器" message="使用“添加服务器”录入名称与地址。" /> : null}
-        {!loading && !error && data?.servers.length ? (
+        {!loading && data?.servers.length ? (
           <div className="server-list">
             {data.servers.map((server) => (
               <article className="server-row" key={server.id}>
@@ -199,10 +217,10 @@ export function ServersPage() {
                     </div>
                   </div>
                   <div className="player-sample">
-                    <span>玩家 sample（非完整名单）</span>
+                    <span>在线玩家列表</span>
                     {server.players?.sample.length ? (
                       <ul>{server.players.sample.map((player, index) => <li key={player.id ?? `${player.name}-${index}`}>{player.name}</li>)}</ul>
-                    ) : <p>本次查询未返回玩家 sample。</p>}
+                    ) : <p>当前服务器中没有玩家</p>}
                   </div>
                 </details>
               </article>
