@@ -175,13 +175,7 @@ https://<AstrBot 主机>:35020/
 
 未配置证书和私钥时，独立 HTTPS 服务无法启动，但 AstrBot 内嵌 Plugin Page 不受影响。
 
-独立服务默认公开来源为：
-
-```text
-https://astr.zhouyihub.com:35020
-```
-
-在其他域名部署时，需要同步调整 `standalone_web.py` 中的 `DEFAULT_PUBLIC_ORIGIN`，否则 POST 请求会被同源校验拒绝。
+独立服务的公开来源由 `standalone_web.py` 中的 `DEFAULT_PUBLIC_ORIGIN` 定义。部署时需要将其设置为实际公开来源，否则 POST 请求会被同源校验拒绝。请勿在公共文档中记录生产环境的域名或完整访问地址。
 
 ## 运行配置
 
