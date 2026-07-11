@@ -393,6 +393,7 @@
 }
 
 .chart-frame {
+  position: relative;
   min-width: 0;
   min-height: 280px;
   overflow: hidden;
@@ -408,6 +409,13 @@
 .trend-chart {
   width: 100%;
   min-height: 280px;
+  cursor: crosshair;
+  touch-action: pan-y;
+}
+
+.trend-chart:focus-visible {
+  outline: 3px solid var(--wf-focus);
+  outline-offset: -5px;
 }
 
 .chart-grid line {
@@ -423,6 +431,96 @@
   stroke-linejoin: bevel;
   stroke-width: 4;
   vector-effect: non-scaling-stroke;
+}
+
+.chart-active-sample line {
+  stroke: var(--wf-focus);
+  stroke-dasharray: 5 5;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.chart-active-sample circle {
+  fill: var(--wf-raised-strong);
+  stroke: var(--wf-focus);
+  stroke-width: 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.trend-tooltip {
+  --trend-tooltip-shift-x: -50%;
+  --trend-tooltip-shift-y: calc(-100% - 14px);
+  position: absolute;
+  z-index: 2;
+  top: var(--trend-tooltip-y);
+  left: var(--trend-tooltip-x);
+  width: max-content;
+  max-width: min(250px, calc(100% - 20px));
+  padding: 12px 14px;
+  transform: translate(var(--trend-tooltip-shift-x), var(--trend-tooltip-shift-y));
+  border: 2px solid var(--wf-line);
+  border-radius: var(--wf-radius);
+  background: var(--wf-page);
+  box-shadow: var(--wf-shadow);
+  color: var(--wf-text);
+  pointer-events: none;
+}
+
+.trend-tooltip--align-left {
+  --trend-tooltip-shift-x: -12%;
+}
+
+.trend-tooltip--align-right {
+  --trend-tooltip-shift-x: -88%;
+}
+
+.trend-tooltip--below {
+  --trend-tooltip-shift-y: 14px;
+}
+
+.trend-tooltip strong,
+.trend-tooltip__server {
+  display: block;
+}
+
+.trend-tooltip strong {
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.trend-tooltip__server {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--wf-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trend-tooltip dl {
+  margin: 10px 0 0;
+  padding-top: 9px;
+  border-top: 1px solid var(--wf-line);
+}
+
+.trend-tooltip dl div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.trend-tooltip dt {
+  color: var(--wf-muted);
+  font-size: 12px;
+}
+
+.trend-tooltip dd {
+  margin: 0;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
 }
 
 .chart-y-labels,
