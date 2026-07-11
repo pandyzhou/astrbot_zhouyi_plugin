@@ -61,7 +61,7 @@ mchelp
 --输出当前群全部或指定服务器在最近N小时的在线人数柱状图，省略小时数时使用当前配置
 """
 
-@register("astrbot_zhouyi_plugin", "薄暝", "查询mc服务器信息和玩家列表,在线人数柱状图,渲染为图片(修改自QiChen的mcgetter)", "1.5.0")
+@register("astrbot_zhouyi_plugin", "薄暝", "查询mc服务器信息和玩家列表,在线人数柱状图,渲染为图片(修改自QiChen的mcgetter)", "0.1.0")
 class MyPlugin(Star):
     """Minecraft服务器信息查询插件"""
     
