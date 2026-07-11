@@ -205,7 +205,7 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
         get_img._reset_background_cache_for_tests()
 
     async def test_missing_and_broken_icon_fall_back_to_default(self):
-        default_path = Path(get_img.__file__).resolve().parents[1] / "resource" / "default_icon.png"
+        default_path = Path(get_img.__file__).resolve().parents[1] / "logo.png"
         with Image.open(default_path) as expected:
             expected_rgba = expected.convert("RGBA")
             expected_bytes = expected_rgba.tobytes()

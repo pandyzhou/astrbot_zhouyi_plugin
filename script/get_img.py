@@ -336,7 +336,7 @@ async def fetch_icon(icon_base64: Optional[str] = None) -> Optional[Image.Image]
             logger.warning(f"Base64 图标解码失败，使用默认图标: {exc}")
 
     try:
-        default_path = Path(__file__).resolve().parent.parent / "resource" / "default_icon.png"
+        default_path = Path(__file__).resolve().parent.parent / "logo.png"
         return _open_verified_image(default_path.read_bytes(), output_mode="RGBA")
     except Exception as exc:
         logger.warning(f"默认服务器图标读取失败: {exc}")

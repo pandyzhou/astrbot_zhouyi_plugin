@@ -37,11 +37,7 @@ async def get_server_status(
         if status.icon:
             icon_data = status.icon.split(",", 1)[-1]
         else:
-            image_path = (
-                Path(__file__).resolve().parent.parent
-                / "resource"
-                / "default_icon.png"
-            )
+            image_path = Path(__file__).resolve().parent.parent / "logo.png"
             with open(image_path, "rb") as image_file:
                 icon_data = base64.b64encode(image_file.read()).decode("utf-8")
 
