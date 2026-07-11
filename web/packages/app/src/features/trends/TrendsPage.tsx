@@ -14,6 +14,7 @@ export function TrendsPage() {
   const [hoursInput, setHoursInput] = useState('24');
   const [data, setData] = useState<TrendsData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [settingsReady, setSettingsReady] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -22,15 +23,30 @@ export function TrendsPage() {
     setServerId('all');
     setData(null);
     setError('');
-    apiClient.servers(groupId, controller.signal)
-      .then((result) => setServers(result.servers))
+    setSettingsReady(false);
+    setLoading(true);
+    Promise.all([
+      apiClient.servers(groupId, controller.signal),
+      apiClient.settings(groupId, controller.signal),
+    ])
+      .then(([serverResult, settings]) => {
+        const defaultHours = settings.effective.default_trend_hours;
+        setServers(serverResult.servers);
+        setHours(defaultHours);
+        setHoursInput(String(defaultHours));
+        setSettingsReady(true);
+      })
       .catch((reason: unknown) => {
-        if ((reason as Error).name !== 'AbortError') setError((reason as Error).message || '读取服务器选项失败');
+        if ((reason as Error).name !== 'AbortError') {
+          setError((reason as Error).message || '读取服务器与运行配置失败');
+          setLoading(false);
+        }
       });
     return () => controller.abort();
   }, [groupId]);
 
   useEffect(() => {
+    if (!settingsReady) return undefined;
     const controller = new AbortController();
     setLoading(true);
     setError('');
@@ -43,7 +59,7 @@ export function TrendsPage() {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [groupId, serverId, hours]);
+  }, [groupId, serverId, hours, settingsReady]);
 
   function submitHours(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

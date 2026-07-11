@@ -231,3 +231,89 @@ export interface CleanupData {
   candidates: CleanupCandidate[];
   deleted_count: number;
 }
+
+export interface RuntimeSettings {
+  max_history_points: number;
+  trend_sampling_enabled: boolean;
+  auto_cleanup_enabled: boolean;
+  auto_cleanup_days: number;
+  auto_refresh_on_page_open: boolean;
+  default_trend_hours: number;
+  mc_lookup_timeout_seconds: number;
+  mc_status_timeout_seconds: number;
+  max_concurrent_queries: number;
+}
+
+export type RuntimeSettingKey = keyof RuntimeSettings;
+export type GroupRuntimeSettingKey = Exclude<RuntimeSettingKey, 'max_concurrent_queries'>;
+export type SettingsScope = 'global' | 'group';
+
+export interface SettingConstraint {
+  min?: number;
+  max?: number;
+  step?: number;
+  unit?: string;
+}
+
+export type SettingsConstraints = Partial<Record<RuntimeSettingKey, SettingConstraint>>;
+
+export interface SettingsRevision {
+  global: number;
+  group: number;
+}
+
+export interface SettingsData {
+  group_id: string;
+  global: RuntimeSettings;
+  group_overrides: Partial<Pick<RuntimeSettings, GroupRuntimeSettingKey>>;
+  effective: RuntimeSettings;
+  revision: SettingsRevision;
+  constraints: SettingsConstraints;
+}
+
+export interface SettingsMutationInput {
+  scope: SettingsScope;
+  group_id?: string;
+  values: Partial<RuntimeSettings>;
+  reset_keys: RuntimeSettingKey[];
+  expected_revision: number;
+  preview_id?: string;
+  confirmation?: {
+    history_trim: true;
+    expected_points_to_delete: number;
+  };
+}
+
+export interface HistoryTrimImpact {
+  required: boolean;
+  current_limit: number;
+  next_limit: number;
+  affected_groups?: string[];
+  affected_servers: number;
+  points_to_delete: number;
+}
+
+export interface CleanupImpact {
+  current_candidate_count: number;
+  next_candidate_count: number;
+  new_candidate_count: number;
+}
+
+export interface SettingsPreviewData {
+  preview_id: string;
+  current_effective: RuntimeSettings;
+  next_effective: RuntimeSettings;
+  requires_confirmation: boolean;
+  history_trim: HistoryTrimImpact;
+  cleanup_impact: CleanupImpact;
+  revision: SettingsRevision;
+}
+
+export interface SettingsSaveData {
+  effective: RuntimeSettings;
+  revision: SettingsRevision;
+  history_trim: {
+    performed: boolean;
+    deleted_points: number;
+  };
+}

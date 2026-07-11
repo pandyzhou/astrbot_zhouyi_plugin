@@ -25,6 +25,9 @@ _ALLOWED_API_ROUTES = (
     ("POST", "/servers/update"),
     ("POST", "/servers/delete"),
     ("POST", "/status"),
+    ("GET", "/settings"),
+    ("POST", "/settings/preview"),
+    ("POST", "/settings"),
     ("GET", "/trends"),
     ("GET", "/cleanup"),
     ("POST", "/cleanup"),
@@ -182,7 +185,7 @@ class StandaloneWebService:
             return None
 
     async def _session_context(self, app: web.Application):
-        timeout = ClientTimeout(total=10, connect=3)
+        timeout = ClientTimeout(total=300, connect=3)
         async with ClientSession(timeout=timeout) as session:
             app[_SESSION_KEY] = session
             yield

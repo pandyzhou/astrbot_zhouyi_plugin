@@ -7,6 +7,12 @@ from astrbot.api import logger
 from .script.get_server_info import get_server_status
 from .script.get_img import generate_server_info_image
 from .script.bar_chart import generate_bar_chart_image
+from .script.query_runtime import call_status_fetcher, gather_limited
+from .script.runtime_settings import (
+    EffectiveRuntimeSettings,
+    get_effective_settings,
+    get_global_settings,
+)
 from .script.json_operate import (
     GroupStorage,
     read_json, add_data, del_data, update_data,
@@ -49,10 +55,10 @@ mchelp
 --列出所有服务器及其ID
 
 /mccleanup
---手动触发自动清理（删除10天未查询成功的服务器）
+--按当前群配置手动清理长期未查询成功的服务器
 
-/mcdata [服务器名称/ID] [小时数=24]
---输出当前群全部或指定服务器在最近N小时的在线人数柱状图
+/mcdata [服务器名称/ID] [小时数]
+--输出当前群全部或指定服务器在最近N小时的在线人数柱状图，省略小时数时使用当前配置
 """
 
 @register("astrbot_zhouyi_plugin", "薄暝", "查询mc服务器信息和玩家列表,在线人数柱状图,渲染为图片(修改自QiChen的mcgetter)", "1.5.0")
@@ -67,6 +73,7 @@ class MyPlugin(Star):
             context: 插件上下文
         """
         super().__init__(context)
+        self._settings_changed_event = asyncio.Event()
         self._page_api = McManagerWebApi(self)
         self._page_api.register_routes()
         logger.info("MyPlugin 初始化完成")
@@ -78,6 +85,26 @@ class MyPlugin(Star):
         self._trend_task: Optional[asyncio.Task] = None
         if getattr(self, "_trend_task", None) is None:
             self._trend_task = asyncio.create_task(self._bar_data_loop())
+
+    def notify_settings_changed(self) -> None:
+        """通知后台采样循环重新读取运行配置。"""
+        settings_changed = getattr(self, "_settings_changed_event", None)
+        if settings_changed is None:
+            settings_changed = asyncio.Event()
+            self._settings_changed_event = settings_changed
+        settings_changed.set()
+
+    @staticmethod
+    async def _query_server_status(
+        host: str,
+        settings: EffectiveRuntimeSettings,
+    ) -> dict[str, Any] | None:
+        return await call_status_fetcher(
+            get_server_status,
+            host,
+            lookup_timeout=settings.mc_lookup_timeout_seconds,
+            status_timeout=settings.mc_status_timeout_seconds,
+        )
 
     @filter.command("mchelp")
     async def get_help(self, event: AstrMessageEvent) -> MessageEventResult:
@@ -121,28 +148,58 @@ class MyPlugin(Star):
             
             message_chain: List[Comp.Image] = []
             servers = json_data.get("servers", {})
-            # 按 ID 升序遍历
-            for server_id, server_info in sorted(servers.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 1_000_000_000):
-                try:
-                    logger.info(f"正在处理服务器: {server_info['name']} (ID: {server_id}), 信息: {server_info}")
-                    mcinfo_img = await self.get_img(server_info['name'], server_info['host'], server_id, storage)
-                    if mcinfo_img:
-                        message_chain.append(Comp.Image.fromBase64(mcinfo_img))
-                        logger.info(f"成功添加图片到消息链，服务器名称: {server_info['name']} (ID: {server_id})")
-                    else:
-                        logger.warning(f"获取服务器 {server_info['name']} (ID: {server_id}) 的图片失败")
-                except Exception as e:
-                    logger.error(f"处理服务器 {server_info['name']} (ID: {server_id}) 时出错: {e}")
+            effective = await get_effective_settings(storage)
+            selected = sorted(
+                servers.items(),
+                key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 1_000_000_000,
+            )
+            image_results = await gather_limited(
+                (
+                    lambda server_id=server_id, server_info=server_info: self.get_img(
+                        server_info["name"],
+                        server_info["host"],
+                        server_id,
+                        storage,
+                        settings=effective,
+                    )
+                    for server_id, server_info in selected
+                ),
+                effective.max_concurrent_queries,
+            )
+            for (server_id, server_info), mcinfo_img in zip(selected, image_results):
+                if isinstance(mcinfo_img, Exception):
+                    logger.error(
+                        f"处理服务器 {server_info['name']} (ID: {server_id}) 时出错: {mcinfo_img}"
+                    )
                     continue
+                if mcinfo_img:
+                    message_chain.append(Comp.Image.fromBase64(mcinfo_img))
+                else:
+                    logger.warning(
+                        f"获取服务器 {server_info['name']} (ID: {server_id}) 的图片失败"
+                    )
 
-            # 查询更新完成后再执行自动清理，避免误删刚成功的服务器
-            deleted_servers = await auto_cleanup_servers(storage)
+            # 查询更新完成后再按当前群配置执行自动清理，避免误删刚成功的服务器。
+            deleted_servers = (
+                await auto_cleanup_servers(
+                    storage,
+                    cleanup_days=effective.auto_cleanup_days,
+                )
+                if effective.auto_cleanup_enabled
+                else []
+            )
             if deleted_servers:
-                cleanup_message = "自动清理完成，以下服务器因10天未查询成功已被删除:\n"
+                cleanup_message = (
+                    f"自动清理完成，以下服务器因 {effective.auto_cleanup_days} 天未查询成功已被删除:\n"
+                )
                 for server in deleted_servers:
-                    last_success_date = datetime.fromtimestamp(server['last_success_time']).strftime('%Y-%m-%d %H:%M:%S')
+                    last_success = server.get("last_success_time")
+                    last_success_date = (
+                        datetime.fromtimestamp(last_success).strftime("%Y-%m-%d %H:%M:%S")
+                        if last_success
+                        else "从未成功"
+                    )
                     cleanup_message += f"• {server['name']} (ID: {server['id']}) - 地址: {server['host']} - 最后成功: {last_success_date}\n"
-                # 先发送查询结果，再提示清理
                 if message_chain:
                     yield event.chain_result(message_chain)
                 yield event.plain_result(cleanup_message.strip())
@@ -180,12 +237,13 @@ class MyPlugin(Star):
             if not re.match(r'^[a-zA-Z0-9.:-]+$', host):
                 yield event.plain_result("服务器地址格式不正确，只能包含字母、数字和符号.:-")
                 return
-            elif await get_server_status(host) is None and not force:
-                yield event.plain_result("预查询失败，请检查服务器是否在线或地址是否正确，或在完整的/mcadd命令后加上True 强制添加")
-                return
-                
+
             group_id = event.get_group_id()
             storage = await self.get_group_storage(group_id)
+            effective = await get_effective_settings(storage)
+            if not force and await self._query_server_status(host, effective) is None:
+                yield event.plain_result("预查询失败，请检查服务器是否在线或地址是否正确，或在完整的/mcadd命令后加上True 强制添加")
+                return
             
             # 检查当前地址是否已存在
             try:
@@ -335,19 +393,27 @@ class MyPlugin(Star):
 
     @filter.command("mccleanup")
     async def mccleanup(self, event: AstrMessageEvent) -> MessageEventResult:
-        """
-        手动触发自动清理（删除10天未查询成功的服务器）
-        """
+        """按当前群配置手动触发清理。"""
         logger.info("开始执行 mccleanup 命令")
         try:
             group_id = event.get_group_id()
             storage = await self.get_group_storage(group_id)
-            
-            deleted_servers = await auto_cleanup_servers(storage)
+            effective = await get_effective_settings(storage)
+
+            # 手动命令始终有效，不受 auto_cleanup_enabled 开关影响。
+            deleted_servers = await auto_cleanup_servers(
+                storage,
+                cleanup_days=effective.auto_cleanup_days,
+            )
             if deleted_servers:
-                cleanup_message = "自动清理完成，以下服务器因10天未查询成功已被删除:\n"
+                cleanup_message = f"清理完成，以下服务器因 {effective.auto_cleanup_days} 天未查询成功已被删除:\n"
                 for server in deleted_servers:
-                    last_success_date = datetime.fromtimestamp(server['last_success_time']).strftime('%Y-%m-%d %H:%M:%S')
+                    last_success = server.get("last_success_time")
+                    last_success_date = (
+                        datetime.fromtimestamp(last_success).strftime("%Y-%m-%d %H:%M:%S")
+                        if last_success
+                        else "从未成功"
+                    )
                     cleanup_message += f"• {server['name']} (ID: {server['id']}) - 地址: {server['host']} - 最后成功: {last_success_date}\n"
                 yield event.plain_result(cleanup_message.strip())
             else:
@@ -358,88 +424,109 @@ class MyPlugin(Star):
             yield event.plain_result("自动清理时发生错误")
 
     @filter.command("mcdata")
-    async def mcdata(self, event: AstrMessageEvent, identifier: Optional[str] = None, hours: int = 24) -> Optional[MessageEventResult]:
-        """输出当前群全部或指定服务器最近N小时（默认24）的在线人数柱状图。"""
+    async def mcdata(
+        self,
+        event: AstrMessageEvent,
+        identifier: Optional[str] = None,
+        hours: Optional[int] = None,
+    ) -> Optional[MessageEventResult]:
+        """输出当前群全部或指定服务器最近 N 小时的在线人数柱状图。"""
         try:
             group_id = event.get_group_id()
             storage = await self.get_group_storage(group_id)
+            effective = await get_effective_settings(storage)
             servers = await get_all_servers(storage)
             if not servers:
                 yield event.plain_result("当前群无已配置服务器，请先使用 /mcadd 添加。")
                 return
 
             logger.info(f"mcdata 参数: identifier={identifier!r}, hours={hours!r}")
-
-            # 解析参数：
-            # - 单参数为纯数字且没有同ID服务器时 → 作为小时数（全部服务器）
-            # - 否则 → 作为服务器名称/ID（统一转为字符串）
             if identifier is not None:
                 ident_str = str(identifier)
-                if ident_str.isdigit():
-                    maybe = await get_server_info(storage, ident_str)
-                    if maybe is None:
-                        # 视为小时数
-                        try:
-                            hours = int(ident_str)
-                            identifier = None
-                        except Exception:
-                            identifier = ident_str
-                    else:
-                        identifier = ident_str
+                if ident_str.isdigit() and await get_server_info(storage, ident_str) is None:
+                    hours = int(ident_str)
+                    identifier = None
                 else:
                     identifier = ident_str
 
-            # 规范化 hours 范围
-            try:
-                hours = int(hours)
-            except Exception:
-                hours = 24
-            hours = max(1, min(168, hours))
-            logger.info(f"mcdata 解析后: target={'ALL' if not identifier else identifier}, hours={hours}")
+            if hours is None:
+                normalized_hours = effective.default_trend_hours
+            else:
+                try:
+                    normalized_hours = int(hours)
+                except (TypeError, ValueError):
+                    normalized_hours = effective.default_trend_hours
+            normalized_hours = max(1, min(168, normalized_hours))
+            logger.info(
+                f"mcdata 解析后: target={'ALL' if not identifier else identifier}, hours={normalized_hours}"
+            )
 
             images: List[Comp.Image] = []
             if identifier:
-                # 单服务器模式
-                try:
-                    sinfo = await get_server_info(storage, identifier)
-                    if not sinfo:
-                        yield event.plain_result(f"没有找到服务器 {identifier}")
-                        return
-                    sid = str(sinfo.get("id"))
-                    name = sinfo.get("name", f"ID:{sid}")
-                    # 与 mc 行为对齐：当前不可达则跳过
-                    host = sinfo.get("host")
-                    status_now = await get_server_status(host) if host else None
-                    if not status_now:
-                        yield event.plain_result(f"{name} 当前不可达，已跳过")
-                        return
-                    hist = await get_trend_history(storage, sid, hours=hours)
-                    img_b64 = generate_bar_chart_image(hist or [], name, hours=hours)
-                    images.append(Comp.Image.fromBase64(img_b64))
-                except Exception as ie:
-                    logger.error(f"mcdata 单服生成失败: id={identifier}, hours={hours}, err={ie}")
-                    raise
+                sinfo = await get_server_info(storage, identifier)
+                if not sinfo:
+                    yield event.plain_result(f"没有找到服务器 {identifier}")
+                    return
+                sid = str(sinfo.get("id"))
+                name = sinfo.get("name", f"ID:{sid}")
+                host = sinfo.get("host")
+                status_now = (
+                    await self._query_server_status(str(host), effective)
+                    if host
+                    else None
+                )
+                if not status_now:
+                    yield event.plain_result(f"{name} 当前不可达，已跳过")
+                    return
+                hist = await get_trend_history(
+                    storage,
+                    sid,
+                    hours=normalized_hours,
+                )
+                img_b64 = generate_bar_chart_image(
+                    hist or [],
+                    name,
+                    hours=normalized_hours,
+                )
+                images.append(Comp.Image.fromBase64(img_b64))
             else:
-                # 全部服务器模式
-                try:
-                    all_hist = await get_all_trend_histories(storage, hours=hours)
-                    for sid, sinfo in sorted(servers.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 1_000_000_000):
-                        name = sinfo.get("name", f"ID:{sid}")
-                        host = sinfo.get("host")
-                        # 与 mc 行为对齐：当前不可达则跳过该服
-                        try:
-                            status_now = await get_server_status(host) if host else None
-                        except Exception as ie:
-                            logger.debug(f"mcdata 全服检测失败: {name} host={host} err={ie}")
-                            status_now = None
-                        if not status_now:
-                            continue
-                        hist = all_hist.get(str(sid), [])
-                        img_b64 = generate_bar_chart_image(hist or [], name, hours=hours)
-                        images.append(Comp.Image.fromBase64(img_b64))
-                except Exception as ie:
-                    logger.error(f"mcdata 全服生成失败: hours={hours}, err={ie}")
-                    raise
+                all_hist = await get_all_trend_histories(
+                    storage,
+                    hours=normalized_hours,
+                )
+                selected = sorted(
+                    servers.items(),
+                    key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 1_000_000_000,
+                )
+
+                async def probe(server_info: dict[str, Any]):
+                    host = server_info.get("host")
+                    return (
+                        await self._query_server_status(str(host), effective)
+                        if host
+                        else None
+                    )
+
+                statuses = await gather_limited(
+                    (lambda sinfo=sinfo: probe(sinfo) for _, sinfo in selected),
+                    effective.max_concurrent_queries,
+                )
+                for (sid, sinfo), status_now in zip(selected, statuses):
+                    if isinstance(status_now, Exception):
+                        logger.debug(
+                            f"mcdata 全服检测失败: {sinfo.get('name')} host={sinfo.get('host')} err={status_now}"
+                        )
+                        continue
+                    if not status_now:
+                        continue
+                    name = sinfo.get("name", f"ID:{sid}")
+                    hist = all_hist.get(str(sid), [])
+                    img_b64 = generate_bar_chart_image(
+                        hist or [],
+                        name,
+                        hours=normalized_hours,
+                    )
+                    images.append(Comp.Image.fromBase64(img_b64))
 
             if images:
                 yield event.chain_result(images)
@@ -449,7 +536,15 @@ class MyPlugin(Star):
             logger.error(f"生成柱状图失败: {e}")
             yield event.plain_result("生成柱状图失败，请稍后再试。")
 
-    async def get_img(self, server_name: str, host: str, server_id: Optional[str] = None, storage: Optional[GroupStorage] = None) -> Optional[str]:
+    async def get_img(
+        self,
+        server_name: str,
+        host: str,
+        server_id: Optional[str] = None,
+        storage: Optional[GroupStorage] = None,
+        *,
+        settings: Optional[EffectiveRuntimeSettings] = None,
+    ) -> Optional[str]:
         """
         获取服务器信息图片
 
@@ -458,13 +553,21 @@ class MyPlugin(Star):
             host: 服务器地址
             server_id: 服务器ID（可选）
             storage: 群组 SQLite 存储定位（用于更新状态）
+            settings: 已读取的群组有效运行配置
 
         Returns:
             图片的base64编码字符串，如果获取失败则返回None
         """
         logger.info(f"开始获取服务器 {server_name} 的图片，主机地址: {host}")
         try:
-            info = await get_server_status(host)
+            effective = settings
+            if effective is None and storage is not None:
+                effective = await get_effective_settings(storage)
+            info = (
+                await self._query_server_status(host, effective)
+                if effective is not None
+                else await get_server_status(host)
+            )
             if not info:
                 logger.error(f"无法获取服务器 {server_name} 的状态信息")
                 # 更新查询失败状态
@@ -476,10 +579,22 @@ class MyPlugin(Star):
             if storage and server_id:
                 await update_server_status(storage, server_id, True)
 
-            # 默认对所有服务器记录小时数据：出现异常记录到日志便于排查
+            # 仅在有效配置启用采样时记录趋势；状态与最后成功时间始终更新。
             try:
-                if storage and server_id:
-                    await append_trend_point(storage, str(server_id), int(datetime.now().timestamp()), int(info['plays_online']))
+                if (
+                    storage
+                    and server_id
+                    and (effective is None or effective.trend_sampling_enabled)
+                ):
+                    await append_trend_point(
+                        storage,
+                        str(server_id),
+                        int(datetime.now().timestamp()),
+                        int(info["plays_online"]),
+                        max_history_points=(
+                            effective.max_history_points if effective is not None else None
+                        ),
+                    )
             except Exception as e:
                 logger.warning(f"追加柱状图数据失败 group={storage}, sid={server_id}: {e}")
 
@@ -524,51 +639,123 @@ class MyPlugin(Star):
         """兼容旧调用名，返回群组存储定位。"""
         return await self.get_group_storage(group_id)
 
+    async def _sample_trends_once(self, data_dir: Path, now_ts: int) -> None:
+        """按有效配置完成一轮采样，并按查询参数组合去重。"""
+        storages = await list_group_storages(data_dir)
+        if not storages:
+            return
+        global_settings = await get_global_settings(storages[0])
+        query_map: Dict[tuple[str, float, float], list[tuple[GroupStorage, str, int]]] = {}
+
+        for storage in storages:
+            try:
+                effective = await get_effective_settings(storage)
+                if not effective.trend_sampling_enabled:
+                    continue
+                servers = await get_all_servers(storage)
+                for sid, sinfo in servers.items():
+                    host = (sinfo or {}).get("host")
+                    if not host:
+                        continue
+                    key = (
+                        str(host),
+                        float(effective.mc_lookup_timeout_seconds),
+                        float(effective.mc_status_timeout_seconds),
+                    )
+                    query_map.setdefault(key, []).append(
+                        (storage, str(sid), effective.max_history_points)
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"数据采样预处理失败: group={storage.group_id}: {exc}"
+                )
+
+        query_items = list(query_map.items())
+        statuses = await gather_limited(
+            (
+                lambda key=key: call_status_fetcher(
+                    get_server_status,
+                    key[0],
+                    lookup_timeout=key[1],
+                    status_timeout=key[2],
+                )
+                for key, _ in query_items
+            ),
+            global_settings.max_concurrent_queries,
+        )
+        for ((host, _, _), targets), status in zip(query_items, statuses):
+            if isinstance(status, Exception):
+                logger.debug(f"host 采样失败 host={host}: {status}")
+                continue
+            online = status.get("plays_online") if isinstance(status, dict) else None
+            if isinstance(online, bool) or not isinstance(online, int):
+                continue
+            for storage, sid, max_history_points in targets:
+                try:
+                    written = await append_trend_point(
+                        storage,
+                        sid,
+                        now_ts,
+                        int(online),
+                        max_history_points=max_history_points,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        f"写入柱状图数据异常 host={host} group={storage.group_id} sid={sid}: {exc}"
+                    )
+                    continue
+                if not written:
+                    logger.debug(
+                        f"写入柱状图数据失败 host={host} group={storage.group_id} sid={sid}"
+                    )
+
     async def _bar_data_loop(self):
-        """每小时扫描所有群存储，按 host 去重采样一次并写回所有群，保证跨群一致。"""
+        """每小时采样一次；配置变更只唤醒重算，不重复当前整点。"""
+        settings_changed = getattr(self, "_settings_changed_event", None)
+        if settings_changed is None:
+            settings_changed = asyncio.Event()
+            self._settings_changed_event = settings_changed
+        last_sampled_bucket: Optional[int] = None
+
         while True:
             try:
-                data_dir = Path(StarTools.get_data_dir("astrbot_zhouyi_plugin")).expanduser()
-                host_map: Dict[str, list] = {}
-                for storage in await list_group_storages(data_dir):
-                    try:
-                        data = await read_json(storage)
-                        servers = data.get("servers", {})
-                        for sid, sinfo in servers.items():
-                            host = (sinfo or {}).get("host")
-                            if not host:
-                                continue
-                            host_map.setdefault(str(host), []).append((storage, str(sid)))
-                    except Exception as e:
-                        logger.warning(
-                            f"数据采样预处理失败: group={storage.group_id}: {e}"
-                        )
-
-                # 逐 host 采样一次，并写回所有关联群存储
-                now_ts = int(datetime.now().timestamp())
-                for host, targets in host_map.items():
-                    try:
-                        status = await get_server_status(host)
-                        if status and isinstance(status.get("plays_online"), int):
-                            cnt = int(status["plays_online"])
-                            for storage, sid in targets:
-                                try:
-                                    await append_trend_point(storage, sid, now_ts, cnt)
-                                except Exception as ie:
-                                    logger.debug(
-                                        f"写入柱状图数据失败 host={host} group={storage.group_id} sid={sid}: {ie}"
-                                    )
-                    except Exception as ie:
-                        logger.debug(f"host 采样失败 host={host}: {ie}")
-
-                # 计算距离下个整点的秒数
                 now = datetime.now()
-                next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-                sleep_seconds = max(10, int((next_hour - now).total_seconds()))
-                await asyncio.sleep(sleep_seconds)
-            except Exception as e:
-                logger.error(f"数据采样循环异常: {e}")
-                await asyncio.sleep(300)
+                now_ts = int(now.timestamp())
+                current_bucket = now_ts // 3600 * 3600
+                if current_bucket != last_sampled_bucket:
+                    data_dir = Path(
+                        StarTools.get_data_dir("astrbot_zhouyi_plugin")
+                    ).expanduser()
+                    await self._sample_trends_once(data_dir, now_ts)
+                    last_sampled_bucket = current_bucket
+
+                    last_sampled_bucket = current_bucket
+
+                now = datetime.now()
+                next_hour = (
+                    now.replace(minute=0, second=0, microsecond=0)
+                    + timedelta(hours=1)
+                )
+                wait_seconds = max(1.0, (next_hour - now).total_seconds())
+                try:
+                    await asyncio.wait_for(
+                        settings_changed.wait(),
+                        timeout=wait_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    settings_changed.clear()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(f"数据采样循环异常: {exc}")
+                try:
+                    await asyncio.wait_for(settings_changed.wait(), timeout=300)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    settings_changed.clear()
 
     async def _run_standalone_web(self):
         try:
@@ -589,6 +776,10 @@ class MyPlugin(Star):
 
         trend_task = self._trend_task
         self._trend_task = None
-        if trend_task and not trend_task.done():
-            trend_task.cancel()
+        settings_changed = getattr(self, "_settings_changed_event", None)
+        if settings_changed is not None:
+            settings_changed.set()
+        if trend_task:
+            if not trend_task.done():
+                trend_task.cancel()
             await asyncio.gather(trend_task, return_exceptions=True)

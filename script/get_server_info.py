@@ -15,13 +15,18 @@ MC_STATUS_TIMEOUT = 7.0
 CSU_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=5.0, connect=3.0, sock_read=4.0)
 
 
-async def get_server_status(host):
+async def get_server_status(
+    host,
+    *,
+    lookup_timeout=MC_LOOKUP_TIMEOUT,
+    status_timeout=MC_STATUS_TIMEOUT,
+):
     try:
         server = await asyncio.wait_for(
-            JavaServer.async_lookup(host), timeout=MC_LOOKUP_TIMEOUT
+            JavaServer.async_lookup(host), timeout=lookup_timeout
         )
         status = await asyncio.wait_for(
-            server.async_status(), timeout=MC_STATUS_TIMEOUT
+            server.async_status(), timeout=status_timeout
         )
         players_list = []
         latency = int(status.latency)

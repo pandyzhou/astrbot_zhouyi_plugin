@@ -3,6 +3,7 @@ import { DataState, SelectField, WorkshopShell } from '@pandyzhou/astrbot-mc-ui'
 import { HashRouter, Navigate, NavLink, Route, Routes } from 'react-router-dom';
 import { ApiClientError, apiClient } from './api/client';
 import { ServersPage } from './features/servers/ServersPage';
+import { SettingsPage } from './features/settings/SettingsPage';
 import { TrendsPage } from './features/trends/TrendsPage';
 import { initializeGroups, useWorkshopStore } from './store/workshopStore';
 
@@ -59,6 +60,7 @@ function AppContent() {
         <>
           <NavLink to="/servers">服务器工坊</NavLink>
           <NavLink to="/trends">在线趋势</NavLink>
+          <NavLink to="/settings">运行配置</NavLink>
         </>
       )}
     >
@@ -92,6 +94,7 @@ function AppContent() {
         <Routes>
           <Route path="/servers" element={<ServersPage />} />
           <Route path="/trends" element={<TrendsPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate replace to="/servers" />} />
         </Routes>
       ) : null}
