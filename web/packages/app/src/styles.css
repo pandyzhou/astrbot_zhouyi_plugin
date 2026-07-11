@@ -132,8 +132,7 @@
 
 .advanced-options,
 .server-details,
-.trend-raw-data,
-.danger-zone {
+.trend-raw-data {
   border: 2px solid var(--wf-line);
   border-radius: var(--wf-radius);
   background: var(--wf-raised);
@@ -141,8 +140,7 @@
 
 .advanced-options summary,
 .server-details summary,
-.trend-raw-data summary,
-.danger-zone > summary {
+.trend-raw-data summary {
   display: flex;
   min-height: 44px;
   align-items: center;
@@ -154,15 +152,13 @@
 
 .advanced-options summary::-webkit-details-marker,
 .server-details summary::-webkit-details-marker,
-.trend-raw-data summary::-webkit-details-marker,
-.danger-zone > summary::-webkit-details-marker {
+.trend-raw-data summary::-webkit-details-marker {
   display: none;
 }
 
 .advanced-options summary::before,
 .server-details summary::before,
-.trend-raw-data summary::before,
-.danger-zone > summary::before {
+.trend-raw-data summary::before {
   width: 8px;
   height: 8px;
   margin-right: 10px;
@@ -175,8 +171,7 @@
 
 .advanced-options[open] summary::before,
 .server-details[open] summary::before,
-.trend-raw-data[open] summary::before,
-.danger-zone[open] > summary::before {
+.trend-raw-data[open] summary::before {
   transform: rotate(45deg) translate(-2px, -2px);
 }
 
@@ -336,61 +331,6 @@
 .player-sample p {
   margin: 5px 0 0;
   color: var(--wf-muted);
-}
-
-.danger-zone {
-  border-color: var(--wf-danger);
-  background: color-mix(in srgb, var(--wf-danger) 8%, var(--wf-surface));
-  box-shadow: var(--wf-shadow);
-}
-
-.danger-zone > summary {
-  color: #ffe9e4;
-}
-
-.danger-zone-body {
-  display: grid;
-  gap: 14px;
-  padding: 16px;
-  border-top: 2px solid var(--wf-danger);
-}
-
-.danger-zone-body > p {
-  color: var(--wf-muted);
-}
-
-.danger-zone-body > .wf-button {
-  justify-self: start;
-}
-
-.cleanup-preview {
-  display: grid;
-  gap: 14px;
-}
-
-.cleanup-preview ul {
-  display: grid;
-  gap: 8px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.cleanup-preview li {
-  display: grid;
-  gap: 3px;
-  padding: 10px;
-  border: 2px solid var(--wf-line);
-  background: var(--wf-raised);
-}
-
-.cleanup-preview li span {
-  color: var(--wf-muted);
-  overflow-wrap: anywhere;
-}
-
-.cleanup-preview .wf-button {
-  justify-self: start;
 }
 
 .trend-filters {

@@ -9,7 +9,8 @@ from astrbot.api import logger
 async def load_font(font_size):
     # 尝试多路径加载
     font_paths = [
-        Path(__file__).resolve().parent.parent/'resource'/'msyh.ttf',
+        Path(__file__).resolve().parent.parent / 'resource' / 'LXGWWenKai-Regular.ttf',
+        Path(__file__).resolve().parent.parent / 'resource' / 'msyh.ttf',
         'msyh.ttf',  # 当前目录
         '/usr/share/fonts/zh_CN/msyh.ttf',  # Linux常见路径
         'C:/Windows/Fonts/msyh.ttc',  # Windows路径

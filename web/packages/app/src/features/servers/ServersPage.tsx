@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ConfirmDialog, DataState, StatusBadge, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
 import { apiClient } from '../../api/client';
-import type { CleanupCandidate, ServerRecord, ServersData } from '../../api/types';
+import type { ServerRecord, ServersData } from '../../api/types';
 import { formatTimestamp } from '../../format';
 import { useWorkshopStore } from '../../store/workshopStore';
 import { ServerForm, type ServerFormValue } from './ServerForm';
@@ -16,8 +16,6 @@ export function ServersPage() {
   const [formMode, setFormMode] = useState<'add' | 'edit' | null>(null);
   const [editingServer, setEditingServer] = useState<ServerRecord | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerRecord | null>(null);
-  const [cleanupCandidates, setCleanupCandidates] = useState<CleanupCandidate[] | null>(null);
-  const [cleanupConfirmOpen, setCleanupConfirmOpen] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -28,8 +26,6 @@ export function ServersPage() {
     setFormMode(null);
     setEditingServer(null);
     setDeleteTarget(null);
-    setCleanupCandidates(null);
-    setCleanupConfirmOpen(false);
     apiClient.servers(groupId, controller.signal)
       .then(setData)
       .catch((reason: unknown) => {
@@ -115,43 +111,6 @@ export function ServersPage() {
         : `已删除“${deletedName}”；该服务器没有已保存的趋势数据。`);
     } catch (reason) {
       setError((reason as Error).message || '删除服务器失败');
-    } finally {
-      setBusyKey('');
-    }
-  }
-
-  async function previewCleanup() {
-    if (busyKey) return;
-    setBusyKey('cleanup:preview');
-    setError('');
-    setFeedback('');
-    try {
-      const result = await apiClient.cleanup(groupId, false);
-      setCleanupCandidates(result.candidates);
-      setFeedback(result.candidates.length ? `预览发现 ${result.candidates.length} 台可清理服务器。` : '预览完成，没有可清理服务器。');
-    } catch (reason) {
-      setError((reason as Error).message || '清理预览失败');
-    } finally {
-      setBusyKey('');
-    }
-  }
-
-  async function executeCleanup() {
-    if (busyKey) return;
-    setBusyKey('cleanup:execute');
-    setError('');
-    try {
-      const result = await apiClient.cleanup(groupId, true);
-      const deletedIds = new Set(result.candidates.map((candidate) => candidate.id));
-      setData((current) => current ? {
-        ...current,
-        servers: current.servers.filter((server) => !deletedIds.has(server.id)),
-      } : current);
-      setCleanupCandidates([]);
-      setCleanupConfirmOpen(false);
-      setFeedback(`危险区清理已执行，共删除 ${result.deleted_count} 台服务器及其趋势数据。`);
-    } catch (reason) {
-      setError((reason as Error).message || '执行清理失败');
     } finally {
       setBusyKey('');
     }
@@ -252,33 +211,6 @@ export function ServersPage() {
         ) : null}
       </WorkshopPanel>
 
-      <details className="danger-zone">
-        <summary>危险区：清理长期未查询成功的服务器</summary>
-        <div className="danger-zone-body">
-          <p>先调用 cleanup preview 查看候选项；正式执行会删除候选服务器，并级联删除对应趋势数据。</p>
-          <button className="wf-button wf-button--danger" type="button" disabled={Boolean(busyKey)} onClick={() => void previewCleanup()}>
-            {busyKey === 'cleanup:preview' ? '预览中…' : '预览可清理项'}
-          </button>
-          {cleanupCandidates ? (
-            cleanupCandidates.length ? (
-              <div className="cleanup-preview">
-                <ul>
-                  {cleanupCandidates.map((candidate) => (
-                    <li key={candidate.id}>
-                      <strong>{candidate.name} #{candidate.id}</strong>
-                      <span>{candidate.host}；最后有效成功：{formatTimestamp(candidate.effective_last_success_time)}；连续失败 {candidate.failed_count} 次</span>
-                    </li>
-                  ))}
-                </ul>
-                <button className="wf-button wf-button--danger" type="button" disabled={Boolean(busyKey)} onClick={() => setCleanupConfirmOpen(true)}>
-                  确认执行清理
-                </button>
-              </div>
-            ) : <p className="wf-help">当前没有 cleanup 候选项。</p>
-          ) : null}
-        </div>
-      </details>
-
       <ConfirmDialog
         open={Boolean(deleteTarget)}
         title="删除服务器"
@@ -288,16 +220,6 @@ export function ServersPage() {
         busy={busyKey.startsWith('delete:')}
         onClose={() => { if (!busyKey) setDeleteTarget(null); }}
         onConfirm={() => void confirmDelete()}
-      />
-      <ConfirmDialog
-        open={cleanupConfirmOpen}
-        title="执行危险区清理"
-        description={`确认删除预览中的 ${cleanupCandidates?.length ?? 0} 台服务器？每台服务器的趋势数据也会被级联删除。`}
-        confirmLabel="执行清理"
-        danger
-        busy={busyKey === 'cleanup:execute'}
-        onClose={() => { if (!busyKey) setCleanupConfirmOpen(false); }}
-        onConfirm={() => void executeCleanup()}
       />
     </div>
   );
