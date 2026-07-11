@@ -10,3 +10,5 @@ export { DataState } from './components/DataState';
 export type { DataStateKind, DataStateProps } from './components/DataState';
 export { ConfirmDialog } from './components/ConfirmDialog';
 export type { ConfirmDialogProps } from './components/ConfirmDialog';
+export { SelectField } from './components/SelectField';
+export type { SelectFieldOption, SelectFieldProps } from './components/SelectField';

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { DataState, WorkshopShell } from '@pandyzhou/astrbot-mc-ui';
+import { DataState, SelectField, WorkshopShell } from '@pandyzhou/astrbot-mc-ui';
 import { HashRouter, Navigate, NavLink, Route, Routes } from 'react-router-dom';
 import { ApiClientError, apiClient } from './api/client';
 import { ServersPage } from './features/servers/ServersPage';
@@ -36,23 +36,19 @@ function AppContent() {
   const dashboardLoginUrl = `https://${window.location.hostname}:35015/#/auth/login`;
 
   const groupControl = (
-    <>
-      <label htmlFor="global-group">群组 group_id</label>
-      <select
-        className="wf-select"
-        id="global-group"
-        value={selectedGroupId}
-        disabled={loading || groups.length === 0}
-        onChange={(event) => selectGroup(event.target.value)}
-      >
-        {groups.length === 0 ? <option value="">暂无可用群组</option> : null}
-        {groups.map((group) => (
-          <option key={group.group_id} value={group.group_id}>
-            {group.label}（{group.group_id}）
-          </option>
-        ))}
-      </select>
-    </>
+    <SelectField
+      className="wf-select-field--inline"
+      id="global-group"
+      label="群组 group_id"
+      options={groups.map((group) => ({
+        value: group.group_id,
+        label: `${group.label}（${group.group_id}）`,
+      }))}
+      value={selectedGroupId}
+      placeholder="暂无可用群组"
+      disabled={loading || groups.length === 0}
+      onChange={selectGroup}
+    />
   );
 
   return (

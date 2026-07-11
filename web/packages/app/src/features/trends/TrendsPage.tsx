@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { DataState, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
+import { DataState, SelectField, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
 import { apiClient } from '../../api/client';
 import type { ServerRecord, TrendsData } from '../../api/types';
 import { formatNumber } from '../../format';
@@ -70,13 +70,17 @@ export function TrendsPage() {
 
       <WorkshopPanel title="趋势条件" description={`当前 group_id：${groupId}`}>
         <form className="trend-filters" onSubmit={submitHours}>
-          <label className="wf-label">
-            服务器范围
-            <select className="wf-select" value={serverId} disabled={loading} onChange={(event) => setServerId(event.target.value)}>
-              <option value="all">全部服务器（独立结果）</option>
-              {servers.map((server) => <option key={server.id} value={server.id}>{server.name} #{server.id}</option>)}
-            </select>
-          </label>
+          <SelectField
+            id="trend-server"
+            label="服务器范围"
+            options={[
+              { value: 'all', label: '全部服务器（独立结果）' },
+              ...servers.map((server) => ({ value: server.id, label: `${server.name} #${server.id}` })),
+            ]}
+            value={serverId}
+            disabled={loading}
+            onChange={setServerId}
+          />
           <label className="wf-label">
             小时数（1–168）
             <input className="wf-input" type="number" min="1" max="168" step="1" inputMode="numeric" value={hoursInput} onChange={(event) => setHoursInput(event.target.value)} />

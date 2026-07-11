@@ -233,6 +233,10 @@ svg {
   white-space: nowrap;
 }
 
+.wf-group-control .wf-select-field {
+  width: min(390px, 100%);
+}
+
 .wf-main {
   width: min(1500px, 100%);
   margin: 0 auto;
@@ -364,6 +368,167 @@ svg {
 .wf-help {
   color: var(--wf-muted);
   font-size: 13px;
+}
+
+.wf-select-field {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.wf-select-field__label {
+  color: var(--wf-muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.wf-select-field__control {
+  position: relative;
+  min-width: 0;
+}
+
+.wf-select-field__trigger {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 2px solid var(--wf-line);
+  border-radius: var(--wf-radius);
+  background: var(--wf-raised);
+  box-shadow: 3px 3px 0 #101711;
+  color: var(--wf-text);
+  text-align: left;
+  transition: border-color var(--wf-motion-fast) ease-out, background var(--wf-motion-fast) ease-out, transform var(--wf-motion-fast) ease-out;
+}
+
+.wf-select-field__trigger:hover:not(:disabled),
+.wf-select-field__trigger[aria-expanded="true"] {
+  border-color: color-mix(in srgb, var(--wf-accent) 72%, var(--wf-line));
+  background: var(--wf-raised-strong);
+}
+
+.wf-select-field__trigger:active:not(:disabled) {
+  transform: translate(1px, 1px);
+}
+
+.wf-select-field__value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wf-select-field__value--placeholder {
+  color: var(--wf-faint);
+}
+
+.wf-select-field__arrow {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  margin: 0 3px 4px 0;
+  border-right: 2px solid var(--wf-accent);
+  border-bottom: 2px solid var(--wf-accent);
+  transform: rotate(45deg);
+  transition: transform var(--wf-motion-base) ease-out;
+}
+
+.wf-select-field__trigger[aria-expanded="true"] .wf-select-field__arrow {
+  transform: translateY(4px) rotate(225deg);
+}
+
+.wf-select-field__listbox {
+  position: absolute;
+  z-index: 60;
+  top: calc(100% + 6px);
+  left: 0;
+  width: 100%;
+  max-height: min(320px, 48vh);
+  margin: 0;
+  padding: 5px;
+  overflow-y: auto;
+  border: 2px solid var(--wf-line);
+  border-radius: var(--wf-radius);
+  background: var(--wf-surface);
+  box-shadow: 5px 5px 0 #101711;
+  list-style: none;
+  transform-origin: top center;
+}
+
+.wf-select-field__listbox[data-state="open"] {
+  animation: wf-select-field-open 150ms ease-out both;
+}
+
+.wf-select-field__listbox[data-state="closed"] {
+  pointer-events: none;
+  animation: wf-select-field-close var(--wf-motion-base) ease-in both;
+}
+
+@keyframes wf-select-field-open {
+  from { opacity: 0; transform: translateY(-5px) scaleY(0.96); }
+  to { opacity: 1; transform: translateY(0) scaleY(1); }
+}
+
+@keyframes wf-select-field-close {
+  from { opacity: 1; transform: translateY(0) scaleY(1); }
+  to { opacity: 0; transform: translateY(-5px) scaleY(0.96); }
+}
+
+.wf-select-field__option {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 2px solid transparent;
+  border-radius: 2px;
+  color: var(--wf-text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.wf-select-field__option:hover:not([aria-disabled="true"]),
+.wf-select-field__option[data-active="true"] {
+  border-color: var(--wf-line);
+  background: var(--wf-raised-strong);
+}
+
+.wf-select-field__option[data-active="true"] {
+  border-color: var(--wf-accent);
+}
+
+.wf-select-field__option[aria-disabled="true"] {
+  color: var(--wf-faint);
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.wf-select-field__marker {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  border: 2px solid var(--wf-line);
+  background: transparent;
+  box-shadow: 2px 2px 0 #101711;
+}
+
+.wf-select-field__option[aria-selected="true"] .wf-select-field__marker {
+  border-color: var(--wf-accent);
+  background: var(--wf-accent);
+}
+
+.wf-select-field--inline {
+  grid-template-columns: auto minmax(160px, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.wf-select-field--inline .wf-select-field__label {
+  white-space: nowrap;
 }
 
 .wf-status {
@@ -502,8 +667,11 @@ svg {
   }
 
   .wf-group-control {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
+    display: block;
+  }
+
+  .wf-group-control .wf-select-field {
+    width: 100%;
   }
 }
 
@@ -518,7 +686,7 @@ svg {
     justify-content: center;
   }
 
-  .wf-group-control {
+  .wf-select-field--inline {
     grid-template-columns: 1fr;
   }
 
