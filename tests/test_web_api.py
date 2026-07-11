@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
@@ -23,6 +24,9 @@ from data.plugins.astrbot_zhouyi_plugin.script.json_operate import (
     get_group_storage,
     read_json,
     write_json,
+)
+from data.plugins.astrbot_zhouyi_plugin.script.runtime_settings import (
+    apply_settings_update,
 )
 from data.plugins.astrbot_zhouyi_plugin.web_api import (
     DATA_DIR_NAME,
@@ -69,7 +73,9 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(DATA_DIR_NAME, {"astrbot_mcgetter", "astrbot_mcgetter_enhanced"})
 
     async def asyncSetUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
+        temp_root = Path(__file__).resolve().parents[1] / "temp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = tempfile.TemporaryDirectory(dir=temp_root)
         self.data_dir = Path(self.temp_dir.name)
         self.group_id = "12345"
         self.storage = get_group_storage(self.data_dir, self.group_id)
@@ -180,7 +186,7 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_route_registration_contract(self):
         self.api.register_routes()
         self.api.register_routes()
-        self.assertEqual(len(self.plugin.context.routes), 9)
+        self.assertEqual(len(self.plugin.context.routes), 12)
         registered = {(route, tuple(methods)) for route, _, methods, _ in self.plugin.context.routes}
         self.assertEqual(
             registered,
@@ -191,6 +197,9 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
                 (f"{PAGE_API_PREFIX}/servers/update", ("POST",)),
                 (f"{PAGE_API_PREFIX}/servers/delete", ("POST",)),
                 (f"{PAGE_API_PREFIX}/status", ("POST",)),
+                (f"{PAGE_API_PREFIX}/settings", ("GET",)),
+                (f"{PAGE_API_PREFIX}/settings/preview", ("POST",)),
+                (f"{PAGE_API_PREFIX}/settings", ("POST",)),
                 (f"{PAGE_API_PREFIX}/trends", ("GET",)),
                 (f"{PAGE_API_PREFIX}/cleanup", ("GET",)),
                 (f"{PAGE_API_PREFIX}/cleanup", ("POST",)),
@@ -227,6 +236,222 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 404)
         self.assertEqual(payload["data"]["code"], "GROUP_NOT_FOUND")
+
+    async def test_settings_get_preview_save_and_errors(self):
+        bucket = self.now // 3600 * 3600
+        await self._write_group(
+            {"1": _server(1, "Alpha", "alpha.example:25565")},
+            trends={
+                "1": {
+                    "history": [
+                        {"ts": bucket - (199 - index) * 3600, "count": index}
+                        for index in range(200)
+                    ]
+                }
+            },
+        )
+
+        status, payload = await self._call(
+            self.api.get_settings,
+            query={"group_id": self.group_id},
+        )
+        self.assertEqual(status, 200)
+        data = payload["data"]
+        self.assertEqual(data["group_id"], self.group_id)
+        self.assertEqual(data["revision"], {"global": 1, "group": 0})
+        self.assertEqual(data["group_overrides"], {})
+        self.assertEqual(data["effective"]["default_trend_hours"], 24)
+        for field in ("global", "effective"):
+            self.assertNotIn("revision", data[field])
+            self.assertNotIn("updated_at", data[field])
+
+        status, preview_payload = await self._call(
+            self.api.preview_settings,
+            method="POST",
+            body={
+                "scope": "group",
+                "group_id": self.group_id,
+                "values": {"max_history_points": 168},
+                "reset_keys": [],
+                "expected_revision": 0,
+            },
+        )
+        self.assertEqual(status, 200)
+        preview = preview_payload["data"]
+        self.assertTrue(preview["requires_confirmation"])
+        self.assertEqual(preview["history_trim"]["points_to_delete"], 32)
+        self.assertEqual(preview["history_trim"]["next_limit"], 168)
+
+        status, confirmation_required = await self._call(
+            self.api.save_settings,
+            method="POST",
+            body={
+                "scope": "group",
+                "group_id": self.group_id,
+                "values": {"max_history_points": 168},
+                "reset_keys": [],
+                "expected_revision": 0,
+                "preview_id": preview["preview_id"],
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(
+            confirmation_required["data"]["code"],
+            "HISTORY_TRIM_CONFIRM_REQUIRED",
+        )
+
+        status, saved_payload = await self._call(
+            self.api.save_settings,
+            method="POST",
+            body={
+                "scope": "group",
+                "group_id": self.group_id,
+                "values": {"max_history_points": 168},
+                "reset_keys": [],
+                "expected_revision": 0,
+                "preview_id": preview["preview_id"],
+                "confirmation": {
+                    "history_trim": True,
+                    "expected_points_to_delete": 32,
+                },
+            },
+        )
+        self.assertEqual(status, 200)
+        saved = saved_payload["data"]
+        self.assertEqual(saved["effective"]["max_history_points"], 168)
+        self.assertEqual(saved["revision"], {"global": 1, "group": 1})
+        self.assertEqual(
+            saved["history_trim"],
+            {"performed": True, "deleted_points": 32},
+        )
+
+        status, conflict = await self._call(
+            self.api.preview_settings,
+            method="POST",
+            body={
+                "scope": "group",
+                "group_id": self.group_id,
+                "values": {"default_trend_hours": 48},
+                "reset_keys": [],
+                "expected_revision": 0,
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(conflict["data"]["code"], "SETTINGS_REVISION_CONFLICT")
+
+        status, invalid = await self._call(
+            self.api.save_settings,
+            method="POST",
+            body={
+                "scope": "group",
+                "group_id": self.group_id,
+                "values": {"auto_cleanup_days": True},
+                "reset_keys": [],
+                "expected_revision": 1,
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["data"]["code"], "SETTINGS_VALIDATION_ERROR")
+
+    async def test_zero_delete_limit_preview_saves_across_api_instances(self):
+        status, preview_payload = await self._call(
+            self.api.preview_settings,
+            method="POST",
+            body={
+                "scope": "group",
+                "group_id": self.group_id,
+                "values": {"max_history_points": 168},
+                "reset_keys": [],
+                "expected_revision": 0,
+            },
+        )
+        self.assertEqual(status, 200)
+        preview = preview_payload["data"]
+        self.assertFalse(preview["requires_confirmation"])
+        self.assertEqual(preview["history_trim"]["points_to_delete"], 0)
+
+        fresh_api = McManagerWebApi(
+            self.plugin,
+            data_dir_getter=lambda: self.data_dir,
+            status_fetcher=self.api._status_fetcher,
+            clock=lambda: self.now,
+        )
+        status, saved_payload = await self._call(
+            fresh_api.save_settings,
+            method="POST",
+            body={
+                "scope": "group",
+                "group_id": self.group_id,
+                "values": {"max_history_points": 168},
+                "reset_keys": [],
+                "expected_revision": 0,
+                "preview_id": preview["preview_id"],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(saved_payload["data"]["effective"]["max_history_points"], 168)
+        self.assertEqual(
+            saved_payload["data"]["history_trim"],
+            {"performed": False, "deleted_points": 0},
+        )
+
+    async def test_group_preview_is_stale_after_global_revision_changes(self):
+        status, preview_payload = await self._call(
+            self.api.preview_settings,
+            method="POST",
+            body={
+                "scope": "group",
+                "group_id": self.group_id,
+                "values": {"default_trend_hours": 48},
+                "reset_keys": [],
+                "expected_revision": 0,
+            },
+        )
+        self.assertEqual(status, 200)
+        preview_id = preview_payload["data"]["preview_id"]
+        await apply_settings_update(
+            self.storage,
+            {"max_concurrent_queries": 6},
+            expected_revision=1,
+            scope="global",
+        )
+
+        fresh_api = McManagerWebApi(
+            self.plugin,
+            data_dir_getter=lambda: self.data_dir,
+            status_fetcher=self.api._status_fetcher,
+            clock=lambda: self.now,
+        )
+        status, payload = await self._call(
+            fresh_api.save_settings,
+            method="POST",
+            body={
+                "scope": "group",
+                "group_id": self.group_id,
+                "values": {"default_trend_hours": 48},
+                "reset_keys": [],
+                "expected_revision": 0,
+                "preview_id": preview_id,
+            },
+        )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["data"]["code"], "SETTINGS_PREVIEW_STALE")
+
+    async def test_global_settings_without_group_id_uses_existing_storage(self):
+        status, payload = await self._call(
+            self.api.preview_settings,
+            method="POST",
+            body={
+                "scope": "global",
+                "values": {"max_concurrent_queries": 2},
+                "reset_keys": [],
+                "expected_revision": 1,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["next_effective"]["max_concurrent_queries"], 2)
 
     async def test_add_force_and_probe_failure(self):
         host = "offline.example:25565"
@@ -440,6 +665,84 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(payload["data"]["servers"]), 1)
         self.assertEqual(self.probe_calls, ["alpha.example:25565"])
 
+    async def test_status_uses_runtime_timeouts_limited_concurrency_and_isolates_failures(self):
+        await self._write_group(
+            {
+                str(index): _server(
+                    index,
+                    f"Server-{index}",
+                    f"server-{index}.example:25565",
+                )
+                for index in range(1, 6)
+            }
+        )
+        await apply_settings_update(
+            self.storage,
+            {"max_concurrent_queries": 2},
+            expected_revision=1,
+            scope="global",
+        )
+        await apply_settings_update(
+            self.storage,
+            {
+                "mc_lookup_timeout_seconds": 1.5,
+                "mc_status_timeout_seconds": 4.5,
+            },
+            expected_revision=0,
+        )
+
+        active = 0
+        max_active = 0
+        calls: list[tuple[str, float, float]] = []
+
+        async def runtime_fetcher(
+            host: str,
+            *,
+            lookup_timeout: float,
+            status_timeout: float,
+        ):
+            nonlocal active, max_active
+            calls.append((host, lookup_timeout, status_timeout))
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.01)
+                if host.startswith("server-3"):
+                    raise RuntimeError("isolated failure")
+                return {
+                    "players_list": [],
+                    "latency": 10,
+                    "plays_max": 20,
+                    "plays_online": 1,
+                    "server_version": "1.21",
+                    "icon_base64": None,
+                }
+            finally:
+                active -= 1
+
+        api = McManagerWebApi(
+            self.plugin,
+            data_dir_getter=lambda: self.data_dir,
+            status_fetcher=runtime_fetcher,
+            clock=lambda: self.now,
+        )
+        status, payload = await self._call(
+            api.refresh_status,
+            method="POST",
+            body={"group_id": self.group_id},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(max_active, 2)
+        self.assertEqual(
+            [item[0] for item in calls],
+            [f"server-{index}.example:25565" for index in range(1, 6)],
+        )
+        self.assertTrue(all(item[1:] == (1.5, 4.5) for item in calls))
+        self.assertEqual(
+            [item["state"] for item in payload["data"]["servers"]],
+            ["online", "online", "unreachable", "online", "online"],
+        )
+
     async def test_trend_hours_boundaries_and_per_server_statistics(self):
         bucket = self.now // 3600 * 3600
         await self._write_group(
@@ -502,6 +805,75 @@ class McManagerWebApiContractTests(unittest.IsolatedAsyncioTestCase):
             query={"group_id": self.group_id, "hours": "1"},
         )
         self.assertEqual(status, 200)
+
+    async def test_trends_uses_dynamic_default_hours(self):
+        bucket = self.now // 3600 * 3600
+        await self._write_group(
+            {"1": _server(1, "Alpha", "alpha.example:25565")},
+            trends={
+                "1": {
+                    "history": [
+                        {"ts": bucket - 3 * 3600, "count": 1},
+                        {"ts": bucket - 2 * 3600, "count": 2},
+                        {"ts": bucket, "count": 4},
+                    ]
+                }
+            },
+        )
+        await apply_settings_update(
+            self.storage,
+            {"default_trend_hours": 3},
+            expected_revision=0,
+        )
+
+        status, payload = await self._call(
+            self.api.get_trends,
+            query={"group_id": self.group_id},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["hours"], 3)
+        self.assertEqual(
+            payload["data"]["servers"][0]["points"],
+            [
+                {"ts": bucket - 2 * 3600, "count": 2},
+                {"ts": bucket, "count": 4},
+            ],
+        )
+
+    async def test_cleanup_uses_dynamic_effective_days(self):
+        old = self.now - 6 * 24 * 3600
+        await self._write_group(
+            {
+                "1": _server(
+                    1,
+                    "Old",
+                    "old.example:25565",
+                    last_success_time=old,
+                )
+            }
+        )
+        await apply_settings_update(
+            self.storage,
+            {"auto_cleanup_days": 5},
+            expected_revision=0,
+        )
+
+        status, payload = await self._call(
+            self.api.preview_cleanup,
+            query={"group_id": self.group_id},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["cleanup_days"], 5)
+        self.assertEqual([item["id"] for item in payload["data"]["candidates"]], ["1"])
+
+        status, payload = await self._call(
+            self.api.execute_cleanup,
+            method="POST",
+            body={"group_id": self.group_id, "confirm": True},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["cleanup_days"], 5)
+        self.assertEqual(payload["data"]["deleted_count"], 1)
 
     async def test_cleanup_preview_and_confirm(self):
         old = self.now - (AUTO_CLEANUP_DAYS + 1) * 24 * 3600

@@ -14,6 +14,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from astrbot.api import logger
 
+from .runtime_settings import (
+    SCHEMA_VERSION,
+    get_effective_settings_sync,
+    migrate_schema_v1_to_v2,
+)
+
 CURRENT_VERSION = "2.3"
 DATABASE_NAME = "mc_manager.sqlite3"
 DEFAULT_CONFIG = {
@@ -29,7 +35,6 @@ MAX_HISTORY_POINTS = 10000
 _GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _DB_LOCKS: Dict[str, threading.RLock] = {}
 _DB_LOCKS_GUARD = threading.Lock()
-_INITIALIZED_DBS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -91,63 +96,87 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 
 def _create_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS storage_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS groups (
-            group_id TEXT PRIMARY KEY,
-            next_id INTEGER NOT NULL DEFAULT 1,
-            last_cleanup INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS servers (
-            group_id TEXT NOT NULL,
-            server_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            host TEXT NOT NULL,
-            created_time INTEGER,
-            last_success_time INTEGER,
-            last_failed_time INTEGER,
-            failed_count INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (group_id, server_id),
-            UNIQUE (group_id, name),
-            UNIQUE (group_id, host),
-            FOREIGN KEY (group_id) REFERENCES groups(group_id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS trend_points (
-            group_id TEXT NOT NULL,
-            server_id TEXT NOT NULL,
-            ts INTEGER NOT NULL,
-            count INTEGER NOT NULL,
-            PRIMARY KEY (group_id, server_id, ts),
-            FOREIGN KEY (group_id, server_id)
-                REFERENCES servers(group_id, server_id) ON DELETE CASCADE
-        ) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS legacy_json_migrations (
-            group_id TEXT PRIMARY KEY,
-            source_path TEXT NOT NULL,
-            status TEXT NOT NULL,
-            migrated_at INTEGER NOT NULL,
-            message TEXT
-        );
-        """
-    )
     conn.execute(
-        "INSERT OR REPLACE INTO storage_meta(key, value) VALUES('schema_version', '1')"
+        "CREATE TABLE IF NOT EXISTS storage_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
+    row = conn.execute(
+        "SELECT value FROM storage_meta WHERE key='schema_version'"
+    ).fetchone()
+    if row is not None:
+        try:
+            version = int(row["value"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("无效的 SQLite schema_version") from exc
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"数据库 schema_version={version} 高于当前支持版本 {SCHEMA_VERSION}"
+            )
+    else:
+        version = 0
+
+    if version == 0:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS groups (
+                group_id TEXT PRIMARY KEY,
+                next_id INTEGER NOT NULL DEFAULT 1,
+                last_cleanup INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS servers (
+                group_id TEXT NOT NULL,
+                server_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                host TEXT NOT NULL,
+                created_time INTEGER,
+                last_success_time INTEGER,
+                last_failed_time INTEGER,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (group_id, server_id),
+                UNIQUE (group_id, name),
+                UNIQUE (group_id, host),
+                FOREIGN KEY (group_id) REFERENCES groups(group_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS trend_points (
+                group_id TEXT NOT NULL,
+                server_id TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY (group_id, server_id, ts),
+                FOREIGN KEY (group_id, server_id)
+                    REFERENCES servers(group_id, server_id) ON DELETE CASCADE
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS legacy_json_migrations (
+                group_id TEXT PRIMARY KEY,
+                source_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                migrated_at INTEGER NOT NULL,
+                message TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO storage_meta(key, value) VALUES('schema_version', '1')"
+        )
+        version = 1
+
+    if version == 1:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            migrate_schema_v1_to_v2(conn)
+            conn.execute(
+                "UPDATE storage_meta SET value='2' WHERE key='schema_version'"
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _ensure_schema_sync(db_path: Path) -> None:
-    key = str(db_path)
     with _db_lock(db_path):
-        if key in _INITIALIZED_DBS and db_path.exists():
-            return
         conn = _connect(db_path)
         try:
             _create_schema(conn)
-            _INITIALIZED_DBS.add(key)
         finally:
             conn.close()
 
@@ -657,10 +686,23 @@ def _hour_bucket(ts: int) -> int:
     return int(ts // 3600 * 3600)
 
 
-def _append_trend_sync(storage: GroupStorage, server_id: str, ts: int, count: int) -> bool:
+def _append_trend_sync(
+    storage: GroupStorage,
+    server_id: str,
+    ts: int,
+    count: int,
+    max_history_points: Optional[int],
+) -> bool:
     conn = _connect(storage.db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        history_limit = (
+            get_effective_settings_sync(conn, storage.group_id).max_history_points
+            if max_history_points is None
+            else int(max_history_points)
+        )
+        if not 168 <= history_limit <= 100000:
+            raise ValueError("max_history_points 必须在 168-100000 之间")
         if not conn.execute(
             "SELECT 1 FROM servers WHERE group_id=? AND server_id=?",
             (storage.group_id, str(server_id)),
@@ -681,7 +723,7 @@ def _append_trend_sync(storage: GroupStorage, server_id: str, ts: int, count: in
                 str(server_id),
                 storage.group_id,
                 str(server_id),
-                MAX_HISTORY_POINTS,
+                history_limit,
             ),
         )
         conn.commit()
@@ -694,12 +736,21 @@ def _append_trend_sync(storage: GroupStorage, server_id: str, ts: int, count: in
 
 
 async def append_trend_point(
-    storage_arg: GroupStorage | str | os.PathLike[str], server_id: str, ts: int, count: int
+    storage_arg: GroupStorage | str | os.PathLike[str],
+    server_id: str,
+    ts: int,
+    count: int,
+    max_history_points: Optional[int] = None,
 ) -> bool:
     try:
         storage = await _prepared(storage_arg)
         return await asyncio.to_thread(
-            _append_trend_sync, storage, str(server_id), int(ts), int(count)
+            _append_trend_sync,
+            storage,
+            str(server_id),
+            int(ts),
+            int(count),
+            max_history_points,
         )
     except Exception as exc:
         logger.error(f"追加柱状图记录失败: {exc}")
@@ -805,11 +856,22 @@ async def update_server_status(
         return False
 
 
-def _cleanup_candidates_sync(storage: GroupStorage, now: Optional[int] = None) -> List[Dict[str, Any]]:
+def _cleanup_candidates_sync(
+    storage: GroupStorage,
+    cleanup_days: Optional[int] = None,
+    now: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     current_time = int(now or time.time())
-    cutoff = current_time - AUTO_CLEANUP_DAYS * 24 * 3600
     conn = _connect(storage.db_path)
     try:
+        days = (
+            get_effective_settings_sync(conn, storage.group_id).auto_cleanup_days
+            if cleanup_days is None
+            else int(cleanup_days)
+        )
+        if not 1 <= days <= 365:
+            raise ValueError("cleanup_days 必须在 1-365 之间")
+        cutoff = current_time - days * 24 * 3600
         rows = conn.execute(
             "SELECT s.server_id, s.name, s.host, s.last_success_time, s.failed_count, "
             "MAX(COALESCE(s.last_success_time, 0), COALESCE(MAX(t.ts), 0)) AS effective "
@@ -836,21 +898,31 @@ def _cleanup_candidates_sync(storage: GroupStorage, now: Optional[int] = None) -
 
 async def get_cleanup_candidates(
     storage_arg: GroupStorage | str | os.PathLike[str],
+    cleanup_days: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     try:
         storage = await _prepared(storage_arg)
-        return await asyncio.to_thread(_cleanup_candidates_sync, storage)
+        return await asyncio.to_thread(_cleanup_candidates_sync, storage, cleanup_days)
     except Exception as exc:
         logger.error(f"获取自动清理候选失败: {exc}")
         raise
 
 
-def _auto_cleanup_sync(storage: GroupStorage) -> List[Dict[str, Any]]:
+def _auto_cleanup_sync(
+    storage: GroupStorage, cleanup_days: Optional[int] = None
+) -> List[Dict[str, Any]]:
     conn = _connect(storage.db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         current_time = int(time.time())
-        cutoff = current_time - AUTO_CLEANUP_DAYS * 24 * 3600
+        days = (
+            get_effective_settings_sync(conn, storage.group_id).auto_cleanup_days
+            if cleanup_days is None
+            else int(cleanup_days)
+        )
+        if not 1 <= days <= 365:
+            raise ValueError("cleanup_days 必须在 1-365 之间")
+        cutoff = current_time - days * 24 * 3600
         rows = conn.execute(
             "SELECT s.server_id, s.name, s.host, s.last_success_time, s.failed_count, "
             "MAX(COALESCE(s.last_success_time, 0), COALESCE(MAX(t.ts), 0)) AS effective "
@@ -893,10 +965,11 @@ def _auto_cleanup_sync(storage: GroupStorage) -> List[Dict[str, Any]]:
 
 async def auto_cleanup_servers(
     storage_arg: GroupStorage | str | os.PathLike[str],
+    cleanup_days: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     try:
         storage = await _prepared(storage_arg)
-        return await asyncio.to_thread(_auto_cleanup_sync, storage)
+        return await asyncio.to_thread(_auto_cleanup_sync, storage, cleanup_days)
     except Exception as exc:
         logger.error(f"自动清理服务器失败: {exc}")
         return []

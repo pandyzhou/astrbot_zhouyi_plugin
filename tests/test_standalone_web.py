@@ -16,6 +16,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(ASTRBOT_ROOT) not in sys.path:
     sys.path.insert(0, str(ASTRBOT_ROOT))
 
+from data.plugins.astrbot_zhouyi_plugin import standalone_web as standalone_web_module
 from data.plugins.astrbot_zhouyi_plugin.standalone_web import (
     PUBLIC_API_PREFIX,
     StandaloneWebService,
@@ -71,6 +72,20 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
         self.servers.append(server)
         return server
 
+    async def test_upstream_session_allows_long_batch_requests(self):
+        service = StandaloneWebService(
+            page_root=self.root,
+            upstream_base_url="http://127.0.0.1:1",
+        )
+        app = service.create_app()
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        self.clients.append(client)
+
+        timeout = app[standalone_web_module._SESSION_KEY].timeout
+        self.assertEqual(timeout.total, 300)
+        self.assertEqual(timeout.connect, 3)
+
     async def test_static_files_security_headers_and_cache_policy(self):
         _, client = await self._start_service()
 
@@ -124,6 +139,59 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 401)
         payload = await response.json()
         self.assertEqual(payload["data"]["code"], "AUTH_REQUIRED")
+
+    async def test_settings_routes_are_in_proxy_allowlist(self):
+        seen: list[tuple[str, str]] = []
+
+        async def upstream_handler(request: web.Request) -> web.Response:
+            seen.append((request.method, request.path))
+            return web.json_response({"ok": True})
+
+        upstream = await self._start_upstream(upstream_handler)
+        _, client = await self._start_service(upstream_base_url=str(upstream.make_url("/")))
+        cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
+        post_headers = {
+            **cookie,
+            "Origin": "https://standalone.example:35020",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
+        get_response = await client.get(
+            f"{PUBLIC_API_PREFIX}/settings?group_id=123",
+            headers=cookie,
+        )
+        preview_response = await client.post(
+            f"{PUBLIC_API_PREFIX}/settings/preview",
+            json={},
+            headers=post_headers,
+        )
+        save_response = await client.post(
+            f"{PUBLIC_API_PREFIX}/settings",
+            json={},
+            headers=post_headers,
+        )
+
+        self.assertEqual(
+            [get_response.status, preview_response.status, save_response.status],
+            [200, 200, 200],
+        )
+        self.assertEqual(
+            seen,
+            [
+                (
+                    "GET",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/settings",
+                ),
+                (
+                    "POST",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/settings/preview",
+                ),
+                (
+                    "POST",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/settings",
+                ),
+            ],
+        )
 
     async def test_cross_origin_post_is_forbidden(self):
         _, client = await self._start_service()

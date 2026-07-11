@@ -20,6 +20,10 @@ import type {
   ServerMutationData,
   ServerRecord,
   ServersData,
+  SettingsData,
+  SettingsMutationInput,
+  SettingsPreviewData,
+  SettingsSaveData,
   TrendPoint,
   TrendsData,
   UpdateServerInput,
@@ -218,6 +222,15 @@ export const apiClient = {
     };
   },
   servers: loadServers,
+  settings: (groupId: string, signal?: AbortSignal): Promise<SettingsData> => request('/page/settings', {
+    query: { group_id: groupId }, signal,
+  }),
+  previewSettings: (input: SettingsMutationInput, signal?: AbortSignal): Promise<SettingsPreviewData> => request('/page/settings/preview', {
+    method: 'POST', body: input, signal,
+  }),
+  saveSettings: (input: SettingsMutationInput, signal?: AbortSignal): Promise<SettingsSaveData> => request('/page/settings', {
+    method: 'POST', body: input, signal, mutationKey: `settings:${input.scope}:${input.group_id ?? 'global'}`,
+  }),
   addServer: async (input: AddServerInput, signal?: AbortSignal): Promise<ServerMutationData> => {
     const raw = await request<RawMutationData>('/page/servers/add', {
       method: 'POST', body: input, signal, mutationKey: `add:${input.group_id}`,

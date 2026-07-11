@@ -84,7 +84,7 @@ dialog:focus-visible {
 button:disabled,
 input:disabled,
 select:disabled {
-  cursor: wait;
+  cursor: not-allowed;
   opacity: 0.62;
 }
 
@@ -529,6 +529,87 @@ svg {
 
 .wf-select-field--inline .wf-select-field__label {
   white-space: nowrap;
+}
+
+.wf-switch-field {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.wf-switch-field__copy {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.wf-switch-field__label {
+  color: var(--wf-text);
+  font-weight: 750;
+}
+
+.wf-switch-field__description {
+  color: var(--wf-muted);
+  font-size: 13px;
+}
+
+.wf-switch-field__control {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.wf-switch-field__input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+}
+
+.wf-switch-field__track {
+  display: flex;
+  width: 54px;
+  height: 30px;
+  align-items: center;
+  padding: 3px;
+  border: 2px solid var(--wf-line);
+  border-radius: 2px;
+  background: var(--wf-raised);
+  box-shadow: 3px 3px 0 #101711;
+  transition: border-color var(--wf-motion-fast) ease-out, background var(--wf-motion-fast) ease-out;
+}
+
+.wf-switch-field__thumb {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--wf-line);
+  border-radius: 1px;
+  background: var(--wf-muted);
+  transition: transform var(--wf-motion-base) ease-out, background var(--wf-motion-fast) ease-out;
+}
+
+.wf-switch-field__input:checked + .wf-switch-field__track {
+  border-color: var(--wf-accent);
+  background: color-mix(in srgb, var(--wf-accent) 24%, var(--wf-raised));
+}
+
+.wf-switch-field__input:checked + .wf-switch-field__track .wf-switch-field__thumb {
+  background: var(--wf-accent);
+  transform: translateX(24px);
+}
+
+.wf-switch-field__input:focus-visible + .wf-switch-field__track {
+  outline: 3px solid var(--wf-focus);
+  outline-offset: 3px;
+}
+
+.wf-switch-field__input:disabled + .wf-switch-field__track {
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
 .wf-status {

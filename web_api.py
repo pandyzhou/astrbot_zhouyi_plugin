@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import time
 from copy import deepcopy
@@ -14,17 +15,40 @@ from astrbot.api.web import error_response, json_response, request
 
 from .script.get_server_info import get_server_status
 from .script.json_operate import (
-    AUTO_CLEANUP_DAYS,
     GroupStorage,
     add_data,
     append_trend_point,
     auto_cleanup_servers,
     del_data,
+    get_all_servers,
     get_cleanup_candidates,
+    get_trend_history,
     list_group_storages,
     read_json,
     update_data,
     update_server_status,
+)
+from .script.query_runtime import (
+    SETTINGS_CONSTRAINTS,
+    accepts_keywords,
+    call_status_fetcher,
+    gather_limited,
+    projected_effective,
+    revision_payload,
+    serialize_group_overrides,
+    serialize_settings,
+)
+from .script.runtime_settings import (
+    HistoryPruneConfirmationRequired,
+    SettingsPreviewExpired,
+    SettingsPreviewRequired,
+    SettingsRevisionConflict,
+    SettingsValidationError,
+    apply_settings_update,
+    get_effective_settings,
+    get_global_settings,
+    get_group_settings,
+    preview_settings_update,
 )
 
 PLUGIN_NAME = "astrbot_zhouyi_plugin"
@@ -35,7 +59,7 @@ _GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _HOST_RE = re.compile(r"^[A-Za-z0-9.:-]{1,255}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
-StatusFetcher = Callable[[str], Awaitable[dict[str, Any] | None]]
+StatusFetcher = Callable[..., Awaitable[dict[str, Any] | None]]
 DataDirGetter = Callable[[], Path]
 Clock = Callable[[], float]
 
@@ -66,6 +90,31 @@ def _api_handler(handler):
                 exc.message,
                 status_code=exc.status_code,
                 data={"code": exc.code, **exc.data},
+            )
+        except SettingsValidationError as exc:
+            return error_response(
+                str(exc),
+                status_code=400,
+                data={"code": "SETTINGS_VALIDATION_ERROR"},
+            )
+        except (
+            SettingsRevisionConflict,
+            SettingsPreviewExpired,
+            SettingsPreviewRequired,
+            HistoryPruneConfirmationRequired,
+        ) as exc:
+            if isinstance(exc, SettingsRevisionConflict):
+                code = "SETTINGS_REVISION_CONFLICT"
+            elif isinstance(exc, SettingsPreviewExpired):
+                code = "SETTINGS_PREVIEW_STALE"
+            elif isinstance(exc, SettingsPreviewRequired):
+                code = "SETTINGS_PREVIEW_REQUIRED"
+            else:
+                code = "HISTORY_TRIM_CONFIRM_REQUIRED"
+            return error_response(
+                str(exc),
+                status_code=409,
+                data={"code": code},
             )
         except Exception:
             logger.error(
@@ -141,6 +190,19 @@ class McManagerWebApi:
         register = self.plugin.context.register_web_api
         routes = [
             ("/bootstrap", self.bootstrap, ["GET"], "Minecraft Manager bootstrap"),
+            ("/settings", self.get_settings, ["GET"], "Minecraft Manager settings"),
+            (
+                "/settings/preview",
+                self.preview_settings,
+                ["POST"],
+                "Minecraft Manager settings preview",
+            ),
+            (
+                "/settings",
+                self.save_settings,
+                ["POST"],
+                "Minecraft Manager settings save",
+            ),
             ("/servers", self.list_servers, ["GET"], "Minecraft Manager servers"),
             ("/servers/add", self.add_server, ["POST"], "Minecraft Manager add server"),
             (
@@ -196,6 +258,105 @@ class McManagerWebApi:
                 code="GROUP_NOT_FOUND",
             )
         return group_id, storage
+
+    @staticmethod
+    def _settings_scope(value: Any) -> str:
+        if not isinstance(value, str) or value not in {"global", "group"}:
+            raise ApiProblem(
+                "scope 必须是 global 或 group",
+                code="INVALID_SETTINGS_SCOPE",
+            )
+        return value
+
+    async def _settings_storage(
+        self,
+        scope: str,
+        group_id: Any = None,
+        *,
+        group_supplied: bool | None = None,
+    ) -> tuple[str, GroupStorage]:
+        supplied = group_id is not None if group_supplied is None else group_supplied
+        if scope == "group":
+            if not supplied:
+                raise ApiProblem(
+                    "group scope 必须提供 group_id",
+                    code="MISSING_GROUP_ID",
+                )
+            return await self._group_storage(group_id)
+        if supplied:
+            return await self._group_storage(group_id)
+        storages = await self._group_storages()
+        if not storages:
+            raise ApiProblem(
+                "没有可用于读取全局配置的群组",
+                status_code=404,
+                code="GROUP_NOT_FOUND",
+            )
+        group_id = sorted(storages, key=_group_sort_key)[0]
+        return group_id, storages[group_id]
+
+    @staticmethod
+    def _settings_values(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ApiProblem("values 必须是对象", code="INVALID_SETTINGS_VALUES")
+        return value
+
+    @staticmethod
+    def _settings_reset_keys(value: Any) -> list[str]:
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise ApiProblem("reset_keys 必须是字符串数组", code="INVALID_RESET_KEYS")
+        return value
+
+    @staticmethod
+    def _settings_revision(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ApiProblem(
+                "expected_revision 必须是非负整数",
+                code="INVALID_EXPECTED_REVISION",
+            )
+        return value
+
+    @staticmethod
+    def _preview_id(value: Any) -> str:
+        if not isinstance(value, str) or not value or len(value) > 128:
+            raise ApiProblem("preview_id 格式无效", code="INVALID_PREVIEW_ID")
+        return value
+
+    @staticmethod
+    def _confirmation(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ApiProblem("confirmation 必须是对象", code="INVALID_CONFIRMATION")
+        allowed = {"history_trim", "expected_points_to_delete"}
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ApiProblem(
+                "confirmation 包含不允许的字段",
+                code="UNSUPPORTED_FIELDS",
+                data={"fields": [f"confirmation.{field}" for field in unknown]},
+            )
+        if set(value) != allowed or value.get("history_trim") is not True:
+            raise ApiProblem(
+                "confirmation 必须明确确认历史裁剪",
+                code="INVALID_CONFIRMATION",
+            )
+        expected = value.get("expected_points_to_delete")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+            raise ApiProblem(
+                "expected_points_to_delete 必须是非负整数",
+                code="INVALID_CONFIRMATION",
+            )
+        return value
+
+    async def _notify_settings_changed(self) -> None:
+        notifier = getattr(self.plugin, "notify_settings_changed", None)
+        if callable(notifier):
+            result = notifier()
+            if inspect.isawaitable(result):
+                await result
+            return
+        event = getattr(self.plugin, "_settings_changed_event", None)
+        if event is not None and callable(getattr(event, "set", None)):
+            event.set()
 
     @staticmethod
     def _name(value: Any) -> str:
@@ -284,9 +445,23 @@ class McManagerWebApi:
             )
         return payload
 
-    async def _probe(self, host: str) -> dict[str, Any] | None:
+    async def _probe(
+        self,
+        host: str,
+        *,
+        lookup_timeout: float | None = None,
+        status_timeout: float | None = None,
+    ) -> dict[str, Any] | None:
         try:
-            result = await self._status_fetcher(host)
+            if lookup_timeout is None or status_timeout is None:
+                result = await self._status_fetcher(host)
+            else:
+                result = await call_status_fetcher(
+                    self._status_fetcher,
+                    host,
+                    lookup_timeout=lookup_timeout,
+                    status_timeout=status_timeout,
+                )
         except Exception as exc:
             logger.warning(f"Minecraft 状态探测失败 host={host}: {exc}")
             return None
@@ -368,7 +543,12 @@ class McManagerWebApi:
 
         data = await read_json(storage)
         self._check_duplicate(data, name=name, host=host)
-        if not force and await self._probe(host) is None:
+        effective = await get_effective_settings(storage)
+        if not force and await self._probe(
+            host,
+            lookup_timeout=effective.mc_lookup_timeout_seconds,
+            status_timeout=effective.mc_status_timeout_seconds,
+        ) is None:
             raise ApiProblem(
                 "服务器预探测失败；确认地址后可使用 force=true 强制添加",
                 status_code=502,
@@ -476,16 +656,202 @@ class McManagerWebApi:
         )
 
     @_api_handler
+    async def get_settings(self):
+        group_id, storage = await self._group_storage(request.query.get("group_id"))
+        global_settings, group_settings, effective = await asyncio.gather(
+            get_global_settings(storage),
+            get_group_settings(storage),
+            get_effective_settings(storage),
+        )
+        return _success(
+            {
+                "group_id": group_id,
+                "global": serialize_settings(global_settings),
+                "group_overrides": serialize_group_overrides(group_settings),
+                "effective": serialize_settings(effective),
+                "revision": revision_payload(global_settings, group_settings),
+                "constraints": deepcopy(SETTINGS_CONSTRAINTS),
+            }
+        )
+
+    async def _settings_mutation_payload(
+        self,
+        *,
+        save: bool,
+    ) -> tuple[dict[str, Any], str, str, GroupStorage, dict[str, Any], list[str], int]:
+        allowed = {"scope", "group_id", "values", "reset_keys", "expected_revision"}
+        if save:
+            allowed.update({"preview_id", "confirmation"})
+        payload = await self._json_body(
+            allowed=allowed,
+            required={"scope", "values", "reset_keys", "expected_revision"},
+        )
+        scope = self._settings_scope(payload["scope"])
+        group_id, storage = await self._settings_storage(
+            scope=scope,
+            group_id=payload.get("group_id"),
+            group_supplied="group_id" in payload,
+        )
+        values = self._settings_values(payload["values"])
+        reset_keys = self._settings_reset_keys(payload["reset_keys"])
+        if scope == "group" and (
+            "max_concurrent_queries" in values
+            or "max_concurrent_queries" in reset_keys
+        ):
+            raise ApiProblem(
+                "max_concurrent_queries 仅允许在全局范围设置",
+                code="INVALID_SETTINGS_SCOPE",
+            )
+        expected_revision = self._settings_revision(payload["expected_revision"])
+        return payload, scope, group_id, storage, values, reset_keys, expected_revision
+
+    @_api_handler
+    async def preview_settings(self):
+        (
+            _,
+            scope,
+            _,
+            storage,
+            values,
+            reset_keys,
+            expected_revision,
+        ) = await self._settings_mutation_payload(save=False)
+        global_settings, group_settings, current_effective = await asyncio.gather(
+            get_global_settings(storage),
+            get_group_settings(storage),
+            get_effective_settings(storage),
+        )
+        current_revision = (
+            global_settings.revision if scope == "global" else group_settings.revision
+        )
+        if current_revision != expected_revision:
+            raise SettingsRevisionConflict(
+                f"配置 revision 已变化，当前为 {current_revision}，请求为 {expected_revision}"
+            )
+
+        preview = await preview_settings_update(
+            storage,
+            values,
+            scope=scope,
+            reset_keys=reset_keys,
+        )
+        next_effective = projected_effective(
+            scope=scope,
+            proposed=preview.proposed,
+            global_settings=global_settings,
+            group_settings=group_settings,
+            current_effective=current_effective,
+        )
+        current_values = serialize_settings(
+            global_settings if scope == "global" else current_effective
+        )
+        history_trim = {
+            "required": preview.history_points_to_prune > 0,
+            "current_limit": current_values["max_history_points"],
+            "next_limit": next_effective["max_history_points"],
+            "affected_groups": list(preview.affected_groups),
+            "affected_servers": preview.affected_servers,
+            "points_to_delete": preview.history_points_to_prune,
+        }
+        return _success(
+            {
+                "preview_id": preview.preview_id,
+                "current_effective": current_values,
+                "next_effective": next_effective,
+                "requires_confirmation": history_trim["required"],
+                "history_trim": history_trim,
+                "cleanup_impact": {
+                    "current_candidate_count": preview.cleanup_candidates_before,
+                    "next_candidate_count": preview.cleanup_candidates_after,
+                    "new_candidate_count": max(0, preview.cleanup_candidate_change),
+                },
+                "revision": revision_payload(global_settings, group_settings),
+            }
+        )
+
+    @_api_handler
+    async def save_settings(self):
+        (
+            payload,
+            scope,
+            _,
+            storage,
+            values,
+            reset_keys,
+            expected_revision,
+        ) = await self._settings_mutation_payload(save=True)
+
+        preview_id = (
+            self._preview_id(payload["preview_id"])
+            if "preview_id" in payload
+            else None
+        )
+        confirmation = (
+            self._confirmation(payload["confirmation"])
+            if "confirmation" in payload
+            else None
+        )
+        if confirmation is not None and preview_id is None:
+            raise ApiProblem(
+                "历史裁剪确认必须关联设置预览",
+                status_code=409,
+                code="SETTINGS_PREVIEW_REQUIRED",
+            )
+
+        expected_points_to_delete = (
+            confirmation["expected_points_to_delete"]
+            if confirmation is not None
+            else None
+        )
+        confirm_history_prune = confirmation is not None
+
+        apply_kwargs: dict[str, Any] = {
+            "expected_revision": expected_revision,
+            "scope": scope,
+            "reset_keys": reset_keys,
+            "preview_id": preview_id,
+            "confirm_history_prune": confirm_history_prune,
+        }
+        if expected_points_to_delete is not None and accepts_keywords(
+            apply_settings_update,
+            {"expected_history_points_to_prune"},
+        ):
+            apply_kwargs["expected_history_points_to_prune"] = expected_points_to_delete
+
+        result = await apply_settings_update(storage, values, **apply_kwargs)
+        global_settings, group_settings, effective = await asyncio.gather(
+            get_global_settings(storage),
+            get_group_settings(storage),
+            get_effective_settings(storage),
+        )
+        await self._notify_settings_changed()
+        return _success(
+            {
+                "effective": serialize_settings(
+                    global_settings if scope == "global" else effective
+                ),
+                "revision": revision_payload(global_settings, group_settings),
+                "history_trim": {
+                    "performed": result.pruned_history_points > 0,
+                    "deleted_points": result.pruned_history_points,
+                },
+            }
+        )
+
+    @_api_handler
     async def refresh_status(self):
         payload = await self._json_body(
             allowed={"group_id", "identifier"},
             required={"group_id"},
         )
         group_id, storage = await self._group_storage(payload["group_id"])
-        data = await read_json(storage)
-        servers = data.get("servers", {})
+        servers, effective = await asyncio.gather(
+            get_all_servers(storage),
+            get_effective_settings(storage),
+        )
         if not isinstance(servers, dict):
             servers = {}
+        data = {"servers": servers}
 
         if "identifier" in payload and payload["identifier"] is not None:
             identifier = self._identifier(payload["identifier"])
@@ -501,11 +867,24 @@ class McManagerWebApi:
             )
 
         queried_at = int(self._clock())
-        probe_results = await asyncio.gather(
-            *(self._probe(str(server.get("host", ""))) for _, server in selected)
+        probe_results = await gather_limited(
+            (
+                lambda server=server: self._probe(
+                    str(server.get("host", "")),
+                    lookup_timeout=effective.mc_lookup_timeout_seconds,
+                    status_timeout=effective.mc_status_timeout_seconds,
+                )
+                for _, server in selected
+            ),
+            effective.max_concurrent_queries,
         )
         response_servers: list[dict[str, Any]] = []
         for (server_id, server), status in zip(selected, probe_results):
+            if isinstance(status, Exception):
+                logger.warning(
+                    f"Minecraft 状态探测失败 host={server.get('host')}: {status}"
+                )
+                status = None
             success = status is not None
             if not await update_server_status(storage, server_id, success):
                 raise RuntimeError(f"更新服务器状态失败: {server_id}")
@@ -518,6 +897,7 @@ class McManagerWebApi:
                         server_id,
                         queried_at,
                         online_count,
+                        max_history_points=effective.max_history_points,
                     ):
                         raise RuntimeError(f"追加趋势数据失败: {server_id}")
                 players = status.get("players_list")
@@ -570,11 +950,19 @@ class McManagerWebApi:
     @_api_handler
     async def get_trends(self):
         group_id, storage = await self._group_storage(request.query.get("group_id"))
-        hours = self._hours(request.query.get("hours", "24"))
-        data = await read_json(storage)
-        servers = data.get("servers", {})
+        servers, effective = await asyncio.gather(
+            get_all_servers(storage),
+            get_effective_settings(storage),
+        )
+        raw_hours = request.query.get("hours")
+        hours = (
+            effective.default_trend_hours
+            if raw_hours is None
+            else self._hours(raw_hours)
+        )
         if not isinstance(servers, dict):
             servers = {}
+        data = {"servers": servers}
 
         raw_identifier = request.query.get("identifier")
         if raw_identifier is not None:
@@ -592,12 +980,9 @@ class McManagerWebApi:
         generated_at = int(self._clock())
         current_bucket = generated_at // 3600 * 3600
         cutoff = current_bucket - (hours - 1) * 3600
-        trends = data.get("trends", {})
-        if not isinstance(trends, dict):
-            trends = {}
         result: list[dict[str, Any]] = []
         for server_id, server in selected:
-            history = (trends.get(server_id) or {}).get("history", [])
+            history = await get_trend_history(storage, server_id, hours=hours)
             points: list[dict[str, Any]] = []
             if isinstance(history, list):
                 for point in history:
@@ -633,11 +1018,15 @@ class McManagerWebApi:
     @_api_handler
     async def preview_cleanup(self):
         group_id, storage = await self._group_storage(request.query.get("group_id"))
-        candidates = await get_cleanup_candidates(storage)
+        effective = await get_effective_settings(storage)
+        candidates = await get_cleanup_candidates(
+            storage,
+            cleanup_days=effective.auto_cleanup_days,
+        )
         return _success(
             {
                 "group_id": group_id,
-                "cleanup_days": AUTO_CLEANUP_DAYS,
+                "cleanup_days": effective.auto_cleanup_days,
                 "candidates": candidates,
             }
         )
@@ -655,11 +1044,15 @@ class McManagerWebApi:
                 code="CONFIRM_REQUIRED",
             )
         group_id, storage = await self._group_storage(payload["group_id"])
-        deleted = await auto_cleanup_servers(storage)
+        effective = await get_effective_settings(storage)
+        deleted = await auto_cleanup_servers(
+            storage,
+            cleanup_days=effective.auto_cleanup_days,
+        )
         return _success(
             {
                 "group_id": group_id,
-                "cleanup_days": AUTO_CLEANUP_DAYS,
+                "cleanup_days": effective.auto_cleanup_days,
                 "deleted": deleted,
                 "deleted_count": len(deleted),
             }

@@ -12,3 +12,5 @@ export { ConfirmDialog } from './components/ConfirmDialog';
 export type { ConfirmDialogProps } from './components/ConfirmDialog';
 export { SelectField } from './components/SelectField';
 export type { SelectFieldOption, SelectFieldProps } from './components/SelectField';
+export { SwitchField } from './components/SwitchField';
+export type { SwitchFieldProps } from './components/SwitchField';

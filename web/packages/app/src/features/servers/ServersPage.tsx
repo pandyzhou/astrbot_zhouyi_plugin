@@ -27,10 +27,13 @@ export function ServersPage() {
     setFormMode(null);
     setEditingServer(null);
     setDeleteTarget(null);
-    apiClient.servers(groupId, controller.signal)
-      .then(async (savedData) => {
+    Promise.all([
+      apiClient.servers(groupId, controller.signal),
+      apiClient.settings(groupId, controller.signal),
+    ])
+      .then(async ([savedData, settings]) => {
         setData(savedData);
-        if (!savedData.servers.length) return;
+        if (!savedData.servers.length || !settings.effective.auto_refresh_on_page_open) return;
 
         setBusyKey('status:all');
         try {
