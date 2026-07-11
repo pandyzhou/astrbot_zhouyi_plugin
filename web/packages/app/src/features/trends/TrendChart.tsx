@@ -73,20 +73,6 @@ export function TrendChart({ serverName, hours, points }: TrendChartProps) {
           </tbody>
         </table>
       </div>
-      <details className="trend-raw-data">
-        <summary>查看原始整点趋势</summary>
-        <div className="trend-table-wrap">
-          <table className="trend-table">
-            <caption>{serverName} 原始整点采样</caption>
-            <thead><tr><th scope="col">时间</th><th scope="col">在线人数</th></tr></thead>
-            <tbody>
-              {points.map((point) => (
-                <tr key={point.timestamp}><th scope="row">{formatHour(point.timestamp)}</th><td>{point.players ?? '缺失'}</td></tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </details>
     </div>
   );
 }

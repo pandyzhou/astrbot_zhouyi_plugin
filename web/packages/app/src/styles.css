@@ -131,16 +131,14 @@
 }
 
 .advanced-options,
-.server-details,
-.trend-raw-data {
+.server-details {
   border: 2px solid var(--wf-line);
   border-radius: var(--wf-radius);
   background: var(--wf-raised);
 }
 
 .advanced-options summary,
-.server-details summary,
-.trend-raw-data summary {
+.server-details summary {
   display: flex;
   min-height: 44px;
   align-items: center;
@@ -151,14 +149,12 @@
 }
 
 .advanced-options summary::-webkit-details-marker,
-.server-details summary::-webkit-details-marker,
-.trend-raw-data summary::-webkit-details-marker {
+.server-details summary::-webkit-details-marker {
   display: none;
 }
 
 .advanced-options summary::before,
-.server-details summary::before,
-.trend-raw-data summary::before {
+.server-details summary::before {
   width: 8px;
   height: 8px;
   margin-right: 10px;
@@ -170,8 +166,7 @@
 }
 
 .advanced-options[open] summary::before,
-.server-details[open] summary::before,
-.trend-raw-data[open] summary::before {
+.server-details[open] summary::before {
   transform: rotate(45deg) translate(-2px, -2px);
 }
 
@@ -437,51 +432,6 @@
   font-size: 12px;
 }
 
-.trend-raw-data[open] summary {
-  border-bottom: 2px solid var(--wf-line);
-}
-
-.trend-table-wrap {
-  max-height: 380px;
-  overflow-y: auto;
-}
-
-.trend-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-variant-numeric: tabular-nums;
-}
-
-.trend-table caption {
-  padding: 10px 12px;
-  color: var(--wf-muted);
-  text-align: left;
-}
-
-.trend-table th,
-.trend-table td {
-  padding: 9px 12px;
-  border-top: 1px solid var(--wf-line);
-  text-align: left;
-}
-
-.trend-table thead th {
-  position: sticky;
-  z-index: 1;
-  top: 0;
-  background: var(--wf-raised-strong);
-  color: var(--wf-muted);
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.trend-table tbody th {
-  color: var(--wf-muted);
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-weight: 500;
-}
-
 @media (max-width: 1120px) {
   .server-row-main {
     grid-template-columns: minmax(220px, 1.3fr) minmax(110px, 0.5fr) minmax(180px, 0.7fr);
@@ -571,12 +521,6 @@
   .chart-frame,
   .trend-chart {
     min-height: 230px;
-  }
-
-  .trend-table th,
-  .trend-table td {
-    padding: 9px 8px;
-    font-size: 13px;
   }
 }
 
