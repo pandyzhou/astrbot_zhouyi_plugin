@@ -8,10 +8,13 @@ from .script.get_server_info import get_server_status
 from .script.get_img import generate_server_info_image
 from .script.bar_chart import generate_bar_chart_image
 from .script.json_operate import (
-    read_json, add_data, del_data, update_data, 
+    GroupStorage,
+    read_json, add_data, del_data, update_data,
     get_all_servers, get_server_info, get_server_by_name,
     update_server_status, auto_cleanup_servers,
-    append_trend_point, get_trend_history, get_all_trend_histories
+    append_trend_point, get_trend_history, get_all_trend_histories,
+    get_group_storage as locate_group_storage,
+    initialize_storage, list_group_storages,
 )
 from .web_api import McManagerWebApi
 from .standalone_web import StandaloneWebService
@@ -52,7 +55,7 @@ mchelp
 --输出当前群全部或指定服务器在最近N小时的在线人数柱状图
 """
 
-@register("astrbot_mcgetter_enhanced", "薄暝", "查询mc服务器信息和玩家列表,在线人数柱状图,渲染为图片(修改自QiChen的mcgetter)", "1.5.0")
+@register("astrbot_zhouyi_plugin", "薄暝", "查询mc服务器信息和玩家列表,在线人数柱状图,渲染为图片(修改自QiChen的mcgetter)", "1.5.0")
 class MyPlugin(Star):
     """Minecraft服务器信息查询插件"""
     
@@ -105,14 +108,14 @@ class MyPlugin(Star):
             group_id = event.get_group_id()
             logger.info(f"获取到群组ID: {group_id}")
             
-            json_path = await self.get_json_path(group_id)
-            logger.info(f"JSON文件路径: {json_path}")
-            
-            json_data = await read_json(json_path)
-            logger.info(f"读取到的JSON数据: {json_data}")
-            
+            storage = await self.get_group_storage(group_id)
+            logger.info(f"群组存储定位: {storage}")
+
+            json_data = await read_json(storage)
+            logger.info(f"读取到的群组数据: {json_data}")
+
             if not json_data or not json_data.get("servers"):
-                logger.warning("JSON数据为空或没有服务器")
+                logger.warning("群组数据为空或没有服务器")
                 yield event.plain_result("请先使用 /mcadd 添加服务器")
                 return
             
@@ -122,7 +125,7 @@ class MyPlugin(Star):
             for server_id, server_info in sorted(servers.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 1_000_000_000):
                 try:
                     logger.info(f"正在处理服务器: {server_info['name']} (ID: {server_id}), 信息: {server_info}")
-                    mcinfo_img = await self.get_img(server_info['name'], server_info['host'], server_id, str(json_path))
+                    mcinfo_img = await self.get_img(server_info['name'], server_info['host'], server_id, storage)
                     if mcinfo_img:
                         message_chain.append(Comp.Image.fromBase64(mcinfo_img))
                         logger.info(f"成功添加图片到消息链，服务器名称: {server_info['name']} (ID: {server_id})")
@@ -133,7 +136,7 @@ class MyPlugin(Star):
                     continue
 
             # 查询更新完成后再执行自动清理，避免误删刚成功的服务器
-            deleted_servers = await auto_cleanup_servers(json_path)
+            deleted_servers = await auto_cleanup_servers(storage)
             if deleted_servers:
                 cleanup_message = "自动清理完成，以下服务器因10天未查询成功已被删除:\n"
                 for server in deleted_servers:
@@ -182,11 +185,11 @@ class MyPlugin(Star):
                 return
                 
             group_id = event.get_group_id()
-            json_path = await self.get_json_path(group_id)
+            storage = await self.get_group_storage(group_id)
             
             # 检查当前地址是否已存在
             try:
-                json_data = await read_json(json_path)
+                json_data = await read_json(storage)
                 servers = json_data.get("servers", {})
                 if servers:
                     for server_id, server_info in servers.items():
@@ -198,9 +201,9 @@ class MyPlugin(Star):
                 yield event.plain_result("检查服务器地址时发生错误")
                 return
                 
-            if await add_data(json_path, name, host):
+            if await add_data(storage, name, host):
                 # 获取新添加的服务器ID
-                json_data = await read_json(json_path)
+                json_data = await read_json(storage)
                 servers = json_data.get("servers", {})
                 for server_id, server_info in servers.items():
                     if server_info['name'] == name and server_info['host'] == host:
@@ -229,9 +232,9 @@ class MyPlugin(Star):
         logger.info(f"开始执行 mcdel 命令: {identifier}")
         try:
             group_id = event.get_group_id()
-            json_path = await self.get_json_path(group_id)
+            storage = await self.get_group_storage(group_id)
             
-            if await del_data(json_path, identifier):
+            if await del_data(storage, identifier):
                 yield event.plain_result(f"成功删除服务器 {identifier}")
             else:
                 yield event.plain_result(f"无法删除 {identifier}，请检查是否存在")
@@ -248,9 +251,9 @@ class MyPlugin(Star):
         logger.info(f"开始执行 mcget 命令: {identifier}")
         try:
             group_id = event.get_group_id()
-            json_path = await self.get_json_path(group_id)
+            storage = await self.get_group_storage(group_id)
             
-            server_info = await get_server_info(json_path, identifier)
+            server_info = await get_server_info(storage, identifier)
             if not server_info:
                 yield event.plain_result(f"没有找到服务器 {identifier}")
                 return
@@ -289,11 +292,11 @@ class MyPlugin(Star):
                 return
                 
             group_id = event.get_group_id()
-            json_path = await self.get_json_path(group_id)
+            storage = await self.get_group_storage(group_id)
             
-            if await update_data(json_path, identifier, new_name, new_host):
+            if await update_data(storage, identifier, new_name, new_host):
                 # 获取更新后的服务器信息
-                updated_info = await get_server_info(json_path, identifier)
+                updated_info = await get_server_info(storage, identifier)
                 if updated_info:
                     yield event.plain_result(f"成功更新服务器信息: {updated_info['name']} (ID: {updated_info['id']})")
                 else:
@@ -313,9 +316,9 @@ class MyPlugin(Star):
         logger.info("开始执行 mclist 命令")
         try:
             group_id = event.get_group_id()
-            json_path = await self.get_json_path(group_id)
+            storage = await self.get_group_storage(group_id)
             
-            servers = await get_all_servers(json_path)
+            servers = await get_all_servers(storage)
             if not servers:
                 yield event.plain_result("没有保存的服务器")
                 return
@@ -338,9 +341,9 @@ class MyPlugin(Star):
         logger.info("开始执行 mccleanup 命令")
         try:
             group_id = event.get_group_id()
-            json_path = await self.get_json_path(group_id)
+            storage = await self.get_group_storage(group_id)
             
-            deleted_servers = await auto_cleanup_servers(json_path)
+            deleted_servers = await auto_cleanup_servers(storage)
             if deleted_servers:
                 cleanup_message = "自动清理完成，以下服务器因10天未查询成功已被删除:\n"
                 for server in deleted_servers:
@@ -359,8 +362,8 @@ class MyPlugin(Star):
         """输出当前群全部或指定服务器最近N小时（默认24）的在线人数柱状图。"""
         try:
             group_id = event.get_group_id()
-            json_path = await self.get_json_path(group_id)
-            servers = await get_all_servers(str(json_path))
+            storage = await self.get_group_storage(group_id)
+            servers = await get_all_servers(storage)
             if not servers:
                 yield event.plain_result("当前群无已配置服务器，请先使用 /mcadd 添加。")
                 return
@@ -373,7 +376,7 @@ class MyPlugin(Star):
             if identifier is not None:
                 ident_str = str(identifier)
                 if ident_str.isdigit():
-                    maybe = await get_server_info(str(json_path), ident_str)
+                    maybe = await get_server_info(storage, ident_str)
                     if maybe is None:
                         # 视为小时数
                         try:
@@ -398,7 +401,7 @@ class MyPlugin(Star):
             if identifier:
                 # 单服务器模式
                 try:
-                    sinfo = await get_server_info(str(json_path), identifier)
+                    sinfo = await get_server_info(storage, identifier)
                     if not sinfo:
                         yield event.plain_result(f"没有找到服务器 {identifier}")
                         return
@@ -410,7 +413,7 @@ class MyPlugin(Star):
                     if not status_now:
                         yield event.plain_result(f"{name} 当前不可达，已跳过")
                         return
-                    hist = await get_trend_history(str(json_path), sid, hours=hours)
+                    hist = await get_trend_history(storage, sid, hours=hours)
                     img_b64 = generate_bar_chart_image(hist or [], name, hours=hours)
                     images.append(Comp.Image.fromBase64(img_b64))
                 except Exception as ie:
@@ -419,7 +422,7 @@ class MyPlugin(Star):
             else:
                 # 全部服务器模式
                 try:
-                    all_hist = await get_all_trend_histories(str(json_path), hours=hours)
+                    all_hist = await get_all_trend_histories(storage, hours=hours)
                     for sid, sinfo in sorted(servers.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 1_000_000_000):
                         name = sinfo.get("name", f"ID:{sid}")
                         host = sinfo.get("host")
@@ -446,7 +449,7 @@ class MyPlugin(Star):
             logger.error(f"生成柱状图失败: {e}")
             yield event.plain_result("生成柱状图失败，请稍后再试。")
 
-    async def get_img(self, server_name: str, host: str, server_id: Optional[str] = None, json_path: Optional[str] = None) -> Optional[str]:
+    async def get_img(self, server_name: str, host: str, server_id: Optional[str] = None, storage: Optional[GroupStorage] = None) -> Optional[str]:
         """
         获取服务器信息图片
 
@@ -454,7 +457,7 @@ class MyPlugin(Star):
             server_name: 服务器名称
             host: 服务器地址
             server_id: 服务器ID（可选）
-            json_path: JSON文件路径（用于更新状态）
+            storage: 群组 SQLite 存储定位（用于更新状态）
 
         Returns:
             图片的base64编码字符串，如果获取失败则返回None
@@ -465,20 +468,20 @@ class MyPlugin(Star):
             if not info:
                 logger.error(f"无法获取服务器 {server_name} 的状态信息")
                 # 更新查询失败状态
-                if json_path and server_id:
-                    await update_server_status(json_path, server_id, False)
+                if storage and server_id:
+                    await update_server_status(storage, server_id, False)
                 return None
 
             # 更新查询成功状态
-            if json_path and server_id:
-                await update_server_status(json_path, server_id, True)
+            if storage and server_id:
+                await update_server_status(storage, server_id, True)
 
             # 默认对所有服务器记录小时数据：出现异常记录到日志便于排查
             try:
-                if json_path and server_id:
-                    await append_trend_point(json_path, str(server_id), int(datetime.now().timestamp()), int(info['plays_online']))
+                if storage and server_id:
+                    await append_trend_point(storage, str(server_id), int(datetime.now().timestamp()), int(info['plays_online']))
             except Exception as e:
-                logger.warning(f"追加柱状图数据失败 group={json_path}, sid={server_id}: {e}")
+                logger.warning(f"追加柱状图数据失败 group={storage}, sid={server_id}: {e}")
 
             info['server_name'] = server_name
             # 如果有服务器ID，则在名称前添加ID
@@ -500,76 +503,61 @@ class MyPlugin(Star):
         except Exception as e:
             logger.error(f"获取服务器 {server_name} 的图片时出错: {e}")
             # 更新查询失败状态
-            if json_path and server_id:
-                await update_server_status(json_path, server_id, False)
+            if storage and server_id:
+                await update_server_status(storage, server_id, False)
             return None
 
-    async def get_json_path(self, group_id: str) -> Path:
-        """
-        获取群组的JSON配置文件路径
-
-        Args:
-            group_id: 群组ID
-
-        Returns:
-            JSON文件的Path对象
-        """
+    async def get_group_storage(self, group_id: str) -> GroupStorage:
+        """校验群组 ID，并返回当前插件数据目录中的 SQLite 群存储定位。"""
         normalized_group_id = str(group_id)
         if not _GROUP_ID_RE.fullmatch(normalized_group_id):
             raise ValueError("群组 ID 格式不正确")
-        data_path = Path(StarTools.get_data_dir("astrbot_mcgetter")).expanduser()
-        data_path.mkdir(parents=True, exist_ok=True)
-        resolved_data_path = data_path.resolve()
-        json_path = (resolved_data_path / f"{normalized_group_id}.json").resolve()
-        if json_path.parent != resolved_data_path:
+        data_path = Path(StarTools.get_data_dir("astrbot_zhouyi_plugin")).expanduser().resolve()
+        await initialize_storage(data_path)
+        storage = locate_group_storage(data_path, normalized_group_id)
+        if storage.db_path.parent != data_path:
             raise ValueError("群组数据路径不安全")
-        logger.info(f"群号 {normalized_group_id} 的 JSON 文件路径: {json_path}")
-        return json_path
+        logger.info(f"群号 {normalized_group_id} 的 SQLite 存储: {storage.db_path}")
+        return storage
+
+    async def get_json_path(self, group_id: str) -> GroupStorage:
+        """兼容旧调用名，返回群组存储定位。"""
+        return await self.get_group_storage(group_id)
 
     async def _bar_data_loop(self):
-        """每小时扫描所有群配置，按 host 去重采样一次并写回所有群，保证跨群一致。"""
+        """每小时扫描所有群存储，按 host 去重采样一次并写回所有群，保证跨群一致。"""
         while True:
             try:
-                data_dir = Path(StarTools.get_data_dir("astrbot_mcgetter")).expanduser()
+                data_dir = Path(StarTools.get_data_dir("astrbot_zhouyi_plugin")).expanduser()
                 host_map: Dict[str, list] = {}
-                if data_dir.exists():
-                    resolved_data_dir = data_dir.resolve()
-                    # 先构建 host → [(json_path, sid), ...] 的映射
-                    for candidate in resolved_data_dir.glob("*.json"):
-                        try:
-                            if (
-                                candidate.is_symlink()
-                                or not candidate.is_file()
-                                or not _GROUP_ID_RE.fullmatch(candidate.stem)
-                            ):
+                for storage in await list_group_storages(data_dir):
+                    try:
+                        data = await read_json(storage)
+                        servers = data.get("servers", {})
+                        for sid, sinfo in servers.items():
+                            host = (sinfo or {}).get("host")
+                            if not host:
                                 continue
-                            p = candidate.resolve()
-                            if p.parent != resolved_data_dir:
-                                continue
-                            data = await read_json(str(p))
-                            servers = data.get("servers", {})
-                            for sid, sinfo in servers.items():
-                                host = (sinfo or {}).get("host")
-                                if not host:
-                                    continue
-                                host_map.setdefault(str(host), []).append((str(p), str(sid)))
-                        except Exception as e:
-                            logger.warning(
-                                f"数据采样预处理失败: {candidate.name}: {e}"
-                            )
+                            host_map.setdefault(str(host), []).append((storage, str(sid)))
+                    except Exception as e:
+                        logger.warning(
+                            f"数据采样预处理失败: group={storage.group_id}: {e}"
+                        )
 
-                # 逐 host 采样一次，并写回所有关联群文件
+                # 逐 host 采样一次，并写回所有关联群存储
                 now_ts = int(datetime.now().timestamp())
                 for host, targets in host_map.items():
                     try:
                         status = await get_server_status(host)
                         if status and isinstance(status.get("plays_online"), int):
                             cnt = int(status["plays_online"])
-                            for json_path, sid in targets:
+                            for storage, sid in targets:
                                 try:
-                                    await append_trend_point(json_path, sid, now_ts, cnt)
+                                    await append_trend_point(storage, sid, now_ts, cnt)
                                 except Exception as ie:
-                                    logger.debug(f"写入柱状图数据失败 host={host} file={json_path} sid={sid}: {ie}")
+                                    logger.debug(
+                                        f"写入柱状图数据失败 host={host} group={storage.group_id} sid={sid}: {ie}"
+                                    )
                     except Exception as ie:
                         logger.debug(f"host 采样失败 host={host}: {ie}")
 
