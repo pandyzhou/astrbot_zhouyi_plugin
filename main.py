@@ -1,10 +1,14 @@
+from collections.abc import AsyncGenerator, Mapping
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 import json
 import astrbot.core.message.components as Comp
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event.filter import PermissionType, permission_type
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
+from astrbot.core.utils.astrbot_path import get_astrbot_config_path
 from .script.get_server_info import get_server_status
 from .script.get_img import generate_server_info_image, get_card_background
 from .script.mcmod_search import search_mcmod
@@ -30,13 +34,40 @@ from .script.json_operate import (
 )
 from .web_api import McManagerWebApi
 from .standalone_web import StandaloneWebService
+from .livingmemory.config_migration import migrate_config_file
+from .livingmemory.core.passive_group_capture import PassiveGroupCaptureFilter
+
+try:
+    from .livingmemory.component import LivingMemoryComponent
+except Exception:
+    LivingMemoryComponent = None
+    logger.warning("LivingMemory 组件导入失败，Minecraft 功能将继续加载", exc_info=True)
+
 import asyncio
 import re
 import time
 from datetime import datetime, timedelta
 
+
+def _migrate_living_memory_config() -> None:
+    """在 AstrBot 读取根插件配置前迁移旧 LivingMemory 配置。"""
+    try:
+        if migrate_config_file(get_astrbot_config_path()):
+            logger.info("已生成合并插件的 LivingMemory 配置文件")
+    except Exception:
+        logger.warning("LivingMemory 配置迁移失败，继续加载插件", exc_info=True)
+
+
+_migrate_living_memory_config()
+
 # 常量定义
 _GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_LIVING_MEMORY_DISABLED_MESSAGE = (
+    "LivingMemory 长期记忆功能未启用，请在插件配置中开启 living_memory.enabled。"
+)
+_LIVING_MEMORY_UNAVAILABLE_MESSAGE = (
+    "LivingMemory 长期记忆组件启动失败，请检查插件日志。"
+)
 
 HELP_INFO = """
 mchelp 
@@ -68,19 +99,24 @@ mchelp
 --输出当前群全部服务器的趋势汇总图，或指定服务器的趋势仪表卡；省略小时数时使用当前配置
 """
 
-@register("astrbot_zhouyi_plugin", "薄暝", "查询mc服务器信息和玩家列表,在线人数趋势仪表卡/汇总图,提供MC百科LLM搜索,渲染为图片(修改自QiChen的mcgetter)", "0.1.1")
+@register(
+    "astrbot_zhouyi_plugin",
+    "薄暝",
+    "查询 Minecraft 服务器与在线趋势，提供 MC百科 LLM 搜索和 LivingMemory 长期记忆。",
+    "0.2.0",
+)
 class MyPlugin(Star):
-    """Minecraft服务器信息查询插件"""
-    
-    def __init__(self, context: Context):
-        """
-        初始化插件
+    """Minecraft 管理与 LivingMemory 长期记忆插件。"""
 
-        Args:
-            context: 插件上下文
-        """
+    def __init__(self, context: Context, config=None):
+        """初始化现有 MC 功能，并按配置组合 LivingMemory。"""
         super().__init__(context)
         self._settings_changed_event = asyncio.Event()
+        self._terminate_lock = asyncio.Lock()
+        self._terminated = False
+        self._living_memory_enabled = False
+        self._living_memory_component = None
+
         self._page_api = McManagerWebApi(self)
         self._page_api.register_routes()
         logger.info("MyPlugin 初始化完成")
@@ -92,6 +128,187 @@ class MyPlugin(Star):
         self._trend_task: Optional[asyncio.Task] = None
         if getattr(self, "_trend_task", None) is None:
             self._trend_task = asyncio.create_task(self._bar_data_loop())
+
+        living_memory_config = None
+        if config is not None:
+            try:
+                living_memory_config = config.get("living_memory")
+            except (AttributeError, TypeError):
+                living_memory_config = None
+        if isinstance(living_memory_config, Mapping) and living_memory_config.get(
+            "enabled"
+        ) is True:
+            self._living_memory_enabled = True
+            if LivingMemoryComponent is None:
+                logger.warning("LivingMemory 组件不可用，Minecraft 功能继续运行")
+            else:
+                try:
+                    self._living_memory_component = LivingMemoryComponent(
+                        context,
+                        dict(living_memory_config),
+                        str(StarTools.get_data_dir("astrbot_plugin_livingmemory")),
+                    )
+                except Exception:
+                    self._living_memory_component = None
+                    logger.warning(
+                        "LivingMemory 组件构造失败，Minecraft 功能继续运行",
+                        exc_info=True,
+                    )
+
+    def _get_living_memory_component(self):
+        if not self._living_memory_enabled:
+            return None, _LIVING_MEMORY_DISABLED_MESSAGE
+        component = self._living_memory_component
+        if component is None:
+            return None, _LIVING_MEMORY_UNAVAILABLE_MESSAGE
+        return component, ""
+
+    async def _proxy_living_memory_command(
+        self,
+        event: AstrMessageEvent,
+        command_name: str,
+        *args: Any,
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        component, message = self._get_living_memory_component()
+        if component is None:
+            yield event.plain_result(message)
+            return
+        handler = getattr(component, command_name)
+        async for result in handler(event, *args):
+            yield result
+
+    @filter.custom_filter(PassiveGroupCaptureFilter, False)
+    async def handle_all_group_messages(self, event: AstrMessageEvent):
+        """被动群消息捕获由自定义过滤器调度，handler 不参与处理。"""
+        return
+
+    @filter.on_llm_request()
+    async def handle_memory_recall(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        component = self._living_memory_component
+        if component is not None:
+            await component.handle_memory_recall(event, req)
+
+    @filter.on_llm_response()
+    async def handle_memory_reflection(
+        self,
+        event: AstrMessageEvent,
+        resp: LLMResponse,
+    ) -> None:
+        component = self._living_memory_component
+        if component is not None:
+            await component.handle_memory_reflection(event, resp)
+
+    @filter.after_message_sent()
+    async def handle_session_reset(self, event: AstrMessageEvent) -> None:
+        component = self._living_memory_component
+        if component is not None:
+            await component.handle_session_reset(event)
+
+    @filter.command_group("lmem")
+    def lmem(self):
+        """LivingMemory 长期记忆管理命令组。"""
+        pass
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("status", priority=10)
+    async def status(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(event, "status"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("search", priority=10)
+    async def search(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        k: int = 5,
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(
+            event, "search", query, k
+        ):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("forget")
+    async def forget(
+        self,
+        event: AstrMessageEvent,
+        doc_id: int,
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(
+            event, "forget", doc_id
+        ):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("rebuild-index")
+    async def rebuild_index(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(
+            event, "rebuild_index"
+        ):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("rebuild-graph")
+    async def rebuild_graph(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(
+            event, "rebuild_graph"
+        ):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("webui")
+    async def webui(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(event, "webui"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("summarize")
+    async def summarize(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(event, "summarize"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("reset")
+    async def reset(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(event, "reset"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("cleanup")
+    async def cleanup(
+        self,
+        event: AstrMessageEvent,
+        mode: str = "preview",
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(
+            event, "cleanup", mode
+        ):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @lmem.command("help")
+    async def help(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        async for result in self._proxy_living_memory_command(event, "help"):
+            yield result
 
     async def mcmod_search(
         self,
@@ -895,20 +1112,52 @@ class MyPlugin(Star):
             logger.error("Minecraft Manager 独立页面启动失败", exc_info=True)
 
     async def terminate(self):
-        """插件重载或停用时停止独立页面和每小时趋势采样任务。"""
-        await self._standalone_service.stop()
+        """幂等、隔离地停止 LivingMemory 与现有 MC 后台资源。"""
+        terminate_lock = getattr(self, "_terminate_lock", None)
+        if terminate_lock is None:
+            terminate_lock = asyncio.Lock()
+            self._terminate_lock = terminate_lock
 
-        standalone_task = self._standalone_task
-        self._standalone_task = None
-        if standalone_task:
-            await asyncio.gather(standalone_task, return_exceptions=True)
+        async with terminate_lock:
+            if getattr(self, "_terminated", False):
+                return
 
-        trend_task = self._trend_task
-        self._trend_task = None
-        settings_changed = getattr(self, "_settings_changed_event", None)
-        if settings_changed is not None:
-            settings_changed.set()
-        if trend_task:
-            if not trend_task.done():
-                trend_task.cancel()
-            await asyncio.gather(trend_task, return_exceptions=True)
+            component = getattr(self, "_living_memory_component", None)
+            self._living_memory_component = None
+            if component is not None:
+                try:
+                    await component.terminate()
+                except Exception:
+                    logger.error("LivingMemory 组件停止失败", exc_info=True)
+
+            standalone_service = getattr(self, "_standalone_service", None)
+            if standalone_service is not None:
+                try:
+                    await standalone_service.stop()
+                except Exception:
+                    logger.error("Minecraft Manager 独立页面停止失败", exc_info=True)
+
+            standalone_task = getattr(self, "_standalone_task", None)
+            self._standalone_task = None
+            if standalone_task:
+                try:
+                    if not standalone_task.done():
+                        standalone_task.cancel()
+                    await asyncio.gather(standalone_task, return_exceptions=True)
+                except Exception:
+                    logger.error("Minecraft Manager 独立页面任务回收失败", exc_info=True)
+
+            trend_task = getattr(self, "_trend_task", None)
+            self._trend_task = None
+            settings_changed = getattr(self, "_settings_changed_event", None)
+            if settings_changed is not None:
+                settings_changed.set()
+            if trend_task:
+                try:
+                    if not trend_task.done():
+                        trend_task.cancel()
+                    await asyncio.gather(trend_task, return_exceptions=True)
+                except Exception:
+                    logger.error("Minecraft 趋势采样任务回收失败", exc_info=True)
+
+            self._terminated = True

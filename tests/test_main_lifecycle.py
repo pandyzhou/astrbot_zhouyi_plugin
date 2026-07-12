@@ -92,7 +92,11 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             data_dir_names,
-            ["astrbot_zhouyi_plugin", "astrbot_zhouyi_plugin"],
+            [
+                "astrbot_plugin_livingmemory",
+                "astrbot_zhouyi_plugin",
+                "astrbot_zhouyi_plugin",
+            ],
         )
         self.assertNotIn("astrbot_mcgetter", data_dir_names)
         self.assertNotIn("astrbot_mcgetter_enhanced", data_dir_names)
@@ -132,7 +136,7 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 FakeStandaloneWebService,
             ),
         ):
-            plugin = MyPlugin(context)
+            plugin = MyPlugin(context, config=None)
             await asyncio.gather(trend_started.wait(), standalone_started.wait())
             self.assertEqual(len(context.registered_web_apis), 12)
             trend_task = plugin._trend_task
