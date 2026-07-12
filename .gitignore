@@ -1,4 +1,12 @@
-/__pycache__
-script/__pycache__
+/__pycache__/
+**/__pycache__/
+*.py[cod]
 /temp/
 /P22Mackinac字体.zip
+/.agents/skills/find-skills/
+/.agents/skills/tdd/
+/.agents/skills/ui-ux-pro-max/
+/.agents/skills/vercel-react-best-practices/
+/AGENTS.md
+/data/
+/skills-lock.json
