@@ -19,6 +19,7 @@
 - 清理长期未查询成功且没有近期趋势记录的服务器
 - 提供 AstrBot Plugin Page 和独立 HTTPS WebUI
 - WebUI 支持服务器增删改查、运行配置、可选自动状态刷新和交互式趋势图
+- 提供 `mcmod_search` LLM 工具，搜索 MC百科中的模组、整合包、物品/方块和教程
 
 ## 环境要求
 
@@ -34,6 +35,7 @@ mcstatus
 aiohttp
 pillow
 aiofiles
+beautifulsoup4
 ```
 
 ## 安装
@@ -75,6 +77,48 @@ pip install -r requirements.txt
 | `/mclist` | 无 | 列出当前群的服务器 ID、名称和地址 |
 | `/mccleanup` | 无 | 手动清理长期无有效记录的服务器 |
 | `/mcdata` | `[名称/ID] [小时数]` | 指定服输出趋势仪表卡；不指定服务器时输出全服趋势汇总图，默认 24 小时 |
+
+## MC百科 LLM 搜索工具
+
+插件向 AstrBot 的大模型工具系统注册 `mcmod_search`。该工具只返回结构化 JSON，供 LLM 继续组织回答；它不会主动发送消息，也不会生成图片。
+
+| 参数 | 类型 | 默认值 | 约束 |
+| --- | --- | --- | --- |
+| `query` | string | 无 | 去除首尾空白后长度 1～100 |
+| `category` | string | `all` | `all`、`mod`、`modpack`、`item`、`tutorial` |
+| `page` | integer | `1` | 1～20，不接受布尔值 |
+| `limit` | integer | `5` | 1～10，不接受布尔值 |
+
+返回状态包括：
+
+- `success`：成功解析并返回结果
+- `empty`：搜索结果容器存在，但当前页没有结果
+- `invalid_argument`：参数不符合约束，并在 `error` 中说明原因
+- `timeout`：请求超时
+- `rate_limited`：MC百科返回 HTTP 429
+- `upstream_error`：连接失败或上游 HTTP 异常
+- `parse_error`：页面结构缺失或结果节点无法解析
+
+返回示例：
+
+```json
+{
+  "status": "success",
+  "query": "机械动力",
+  "category": "mod",
+  "page": 1,
+  "limit": 2,
+  "count": 1,
+  "results": [
+    {
+      "title": "机械动力 (Create)",
+      "url": "https://www.mcmod.cn/class/2021.html",
+      "summary": "以机械动力和自动化为核心的模组。",
+      "type": "mod"
+    }
+  ]
+}
+```
 
 ### 添加服务器
 

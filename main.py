@@ -1,11 +1,13 @@
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+import json
 import astrbot.core.message.components as Comp
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 from .script.get_server_info import get_server_status
 from .script.get_img import generate_server_info_image, get_card_background
+from .script.mcmod_search import search_mcmod
 from .script.bar_chart import (
     ServerTrendInput,
     generate_bar_chart_image,
@@ -66,7 +68,7 @@ mchelp
 --输出当前群全部服务器的趋势汇总图，或指定服务器的趋势仪表卡；省略小时数时使用当前配置
 """
 
-@register("astrbot_zhouyi_plugin", "薄暝", "查询mc服务器信息和玩家列表,在线人数趋势仪表卡/汇总图,渲染为图片(修改自QiChen的mcgetter)", "0.1.0")
+@register("astrbot_zhouyi_plugin", "薄暝", "查询mc服务器信息和玩家列表,在线人数趋势仪表卡/汇总图,提供MC百科LLM搜索,渲染为图片(修改自QiChen的mcgetter)", "0.1.1")
 class MyPlugin(Star):
     """Minecraft服务器信息查询插件"""
     
@@ -90,6 +92,101 @@ class MyPlugin(Star):
         self._trend_task: Optional[asyncio.Task] = None
         if getattr(self, "_trend_task", None) is None:
             self._trend_task = asyncio.create_task(self._bar_data_loop())
+
+    async def mcmod_search(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        category: str = "all",
+        page: int = 1,
+        limit: int = 5,
+    ) -> str:
+        """搜索 MC百科中的模组、整合包、物品/方块和教程。
+
+        Args:
+            query(str): 搜索关键词，长度为 1-100 个字符。
+            category(str): 搜索分类，可选 all、mod、modpack、item、tutorial，默认为 all。
+            page(int): 结果页码，范围为 1-20，默认为 1。
+            limit(int): 返回结果数量，范围为 1-10，默认为 5。
+        """
+        try:
+            result = await search_mcmod(query, category, page, limit)
+        except Exception as exc:
+            logger.warning("MC百科搜索工具执行异常：%s", type(exc).__name__)
+            result = {
+                "status": "upstream_error",
+                "query": query,
+                "category": category,
+                "page": page,
+                "limit": limit,
+                "count": 0,
+                "results": [],
+            }
+        return json.dumps(result, ensure_ascii=False)
+
+    @filter.on_plugin_loaded()
+    async def _register_mcmod_search_tool(self, metadata) -> None:
+        if self is None or getattr(metadata, "root_dir_name", None) not in {
+            "astrbot_zhouyi_plugin",
+            "mcmod_card",
+        }:
+            return
+
+        context = getattr(self, "context", None)
+        if context is None:
+            return
+        own_metadata = context.get_registered_star("astrbot_zhouyi_plugin")
+        if (
+            own_metadata is None
+            or getattr(own_metadata, "root_dir_name", None)
+            != "astrbot_zhouyi_plugin"
+            or not getattr(own_metadata, "activated", False)
+        ):
+            return
+
+        manager = context.get_llm_tool_manager()
+        existing_tools = [
+            tool for tool in manager.func_list if tool.name == "mcmod_search"
+        ]
+        keep_inactive = any(
+            getattr(tool, "handler_module_path", None) == __name__
+            and getattr(tool, "active", True) is False
+            for tool in existing_tools
+        )
+        while any(tool.name == "mcmod_search" for tool in manager.func_list):
+            manager.remove_func("mcmod_search")
+
+        manager.add_func(
+            "mcmod_search",
+            [
+                {
+                    "type": "string",
+                    "name": "query",
+                    "description": "搜索关键词，长度为 1-100 个字符。",
+                },
+                {
+                    "type": "string",
+                    "name": "category",
+                    "description": "搜索分类，可选 all、mod、modpack、item、tutorial，默认为 all。",
+                },
+                {
+                    "type": "integer",
+                    "name": "page",
+                    "description": "结果页码，范围为 1-20，默认为 1。",
+                },
+                {
+                    "type": "integer",
+                    "name": "limit",
+                    "description": "返回结果数量，范围为 1-10，默认为 5。",
+                },
+            ],
+            "搜索 MC百科中的模组、整合包、物品/方块和教程。",
+            self.mcmod_search,
+        )
+        tool = manager.get_func("mcmod_search")
+        if tool is not None:
+            tool.handler_module_path = __name__
+            tool.active = not keep_inactive
 
     def notify_settings_changed(self) -> None:
         """通知后台采样循环重新读取运行配置。"""

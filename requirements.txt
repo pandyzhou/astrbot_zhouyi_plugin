@@ -2,3 +2,4 @@ mcstatus
 aiohttp
 pillow
 aiofiles
+beautifulsoup4
