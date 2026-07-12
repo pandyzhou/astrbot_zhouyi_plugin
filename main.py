@@ -5,8 +5,12 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 from .script.get_server_info import get_server_status
-from .script.get_img import generate_server_info_image
-from .script.bar_chart import generate_bar_chart_image
+from .script.get_img import generate_server_info_image, get_card_background
+from .script.bar_chart import (
+    ServerTrendInput,
+    generate_bar_chart_image,
+    generate_summary_chart_images,
+)
 from .script.query_runtime import call_status_fetcher, gather_limited
 from .script.runtime_settings import (
     EffectiveRuntimeSettings,
@@ -26,6 +30,7 @@ from .web_api import McManagerWebApi
 from .standalone_web import StandaloneWebService
 import asyncio
 import re
+import time
 from datetime import datetime, timedelta
 
 # 常量定义
@@ -58,10 +63,10 @@ mchelp
 --按当前群配置手动清理长期未查询成功的服务器
 
 /mcdata [服务器名称/ID] [小时数]
---输出当前群全部或指定服务器在最近N小时的在线人数柱状图，省略小时数时使用当前配置
+--输出当前群全部服务器的趋势汇总图，或指定服务器的趋势仪表卡；省略小时数时使用当前配置
 """
 
-@register("astrbot_zhouyi_plugin", "薄暝", "查询mc服务器信息和玩家列表,在线人数柱状图,渲染为图片(修改自QiChen的mcgetter)", "0.1.0")
+@register("astrbot_zhouyi_plugin", "薄暝", "查询mc服务器信息和玩家列表,在线人数趋势仪表卡/汇总图,渲染为图片(修改自QiChen的mcgetter)", "0.1.0")
 class MyPlugin(Star):
     """Minecraft服务器信息查询插件"""
     
@@ -430,7 +435,7 @@ class MyPlugin(Star):
         identifier: Optional[str] = None,
         hours: Optional[int] = None,
     ) -> Optional[MessageEventResult]:
-        """输出当前群全部或指定服务器最近 N 小时的在线人数柱状图。"""
+        """输出指定服务器的趋势仪表卡，或当前群的全服趋势汇总图。"""
         try:
             group_id = event.get_group_id()
             storage = await self.get_group_storage(group_id)
@@ -457,6 +462,7 @@ class MyPlugin(Star):
                 except (TypeError, ValueError):
                     normalized_hours = effective.default_trend_hours
             normalized_hours = max(1, min(168, normalized_hours))
+            command_now = int(time.time())
             logger.info(
                 f"mcdata 解析后: target={'ALL' if not identifier else identifier}, hours={normalized_hours}"
             )
@@ -483,10 +489,13 @@ class MyPlugin(Star):
                     sid,
                     hours=normalized_hours,
                 )
+                background = await get_card_background()
                 img_b64 = generate_bar_chart_image(
                     hist or [],
                     name,
                     hours=normalized_hours,
+                    background=background,
+                    now_ts=command_now,
                 )
                 images.append(Comp.Image.fromBase64(img_b64))
             else:
@@ -511,6 +520,7 @@ class MyPlugin(Star):
                     (lambda sinfo=sinfo: probe(sinfo) for _, sinfo in selected),
                     effective.max_concurrent_queries,
                 )
+                summary_inputs: list[ServerTrendInput] = []
                 for (sid, sinfo), status_now in zip(selected, statuses):
                     if isinstance(status_now, Exception):
                         logger.debug(
@@ -519,22 +529,33 @@ class MyPlugin(Star):
                         continue
                     if not status_now:
                         continue
-                    name = sinfo.get("name", f"ID:{sid}")
-                    hist = all_hist.get(str(sid), [])
-                    img_b64 = generate_bar_chart_image(
-                        hist or [],
-                        name,
-                        hours=normalized_hours,
+                    summary_inputs.append(
+                        ServerTrendInput(
+                            id=str(sid),
+                            name=sinfo.get("name", f"ID:{sid}"),
+                            history=all_hist.get(str(sid), []) or [],
+                        )
                     )
+
+                if not summary_inputs:
+                    yield event.plain_result("所有服务器当前均不可达，已跳过")
+                    return
+                background = await get_card_background()
+                for img_b64 in generate_summary_chart_images(
+                    summary_inputs,
+                    hours=normalized_hours,
+                    background=background,
+                    now_ts=command_now,
+                ):
                     images.append(Comp.Image.fromBase64(img_b64))
 
             if images:
                 yield event.chain_result(images)
             else:
-                yield event.plain_result("暂无柱状图数据，稍后再试。")
+                yield event.plain_result("暂无趋势图数据，稍后再试。")
         except Exception as e:
-            logger.error(f"生成柱状图失败: {e}")
-            yield event.plain_result("生成柱状图失败，请稍后再试。")
+            logger.error(f"生成趋势图失败: {e}")
+            yield event.plain_result("生成趋势图失败，请稍后再试。")
 
     async def get_img(
         self,

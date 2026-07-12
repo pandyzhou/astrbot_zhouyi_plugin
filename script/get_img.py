@@ -302,7 +302,8 @@ async def _fetch_background() -> Image.Image:
     return _prepare_background(_decode_background_image(data))
 
 
-async def _get_cached_background() -> Image.Image:
+async def get_card_background() -> Image.Image:
+    """获取可复用的卡片背景；缓存对象始终通过副本对外返回。"""
     global _background_cache, _background_cache_at
     now = time.monotonic()
     if _background_cache is not None and now - _background_cache_at < BACKGROUND_CACHE_TTL:
@@ -396,7 +397,7 @@ async def generate_server_info_image(
 ) -> str:
     """生成固定 800×440 的 D「相框贴纸卡」，返回 Base64 PNG。"""
     try:
-        background = await _get_cached_background()
+        background = await get_card_background()
     except Exception as exc:
         logger.warning(f"读取卡片背景失败，使用本地渐变: {exc}")
         background = _make_gradient_background()
@@ -407,12 +408,12 @@ async def generate_server_info_image(
         overlay,
         (12, 12, 788, 428),
         radius=25,
-        fill=(7, 13, 25, 52),
+        fill=(7, 13, 25, 18),
         outline=(255, 255, 255, 185),
         width=2,
     )
-    _rounded_panel(overlay, (24, 22, 776, 148), radius=20, fill=(12, 20, 35, 190))
-    _rounded_panel(overlay, (24, 164, 776, 414), radius=20, fill=(12, 20, 35, 204))
+    _rounded_panel(overlay, (24, 22, 776, 148), radius=20, fill=(12, 20, 35, 132))
+    _rounded_panel(overlay, (24, 164, 776, 414), radius=20, fill=(12, 20, 35, 146))
     canvas = Image.alpha_composite(canvas, overlay)
 
     draw = ImageDraw.Draw(canvas)

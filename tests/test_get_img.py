@@ -221,7 +221,9 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_online_and_offline_cards_are_800x440_png(self):
         background = get_img._make_gradient_background()
-        with patch.object(get_img, "_get_cached_background", AsyncMock(return_value=background)):
+        with patch.object(
+            get_img, "get_card_background", AsyncMock(return_value=background)
+        ) as get_background:
             online = await get_img.generate_server_info_image(
                 ["Alice", "Bob"],
                 42,
@@ -244,6 +246,7 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
                 host_address="offline.example:25565",
                 is_online=False,
             )
+        self.assertEqual(get_background.await_count, 2)
         for value in (online, offline):
             image = decode_card(value)
             self.assertEqual(image.format, None)
@@ -257,7 +260,7 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
         icon_data = base64.b64encode(encode_image(icon, "PNG")).decode("ascii")
         with patch.object(
             get_img,
-            "_get_cached_background",
+            "get_card_background",
             AsyncMock(return_value=get_img._make_gradient_background()),
         ):
             value = await get_img.generate_server_info_image(
@@ -280,10 +283,14 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
             patch.object(get_img.time, "monotonic", return_value=101.0),
             patch.object(get_img, "_fetch_background", AsyncMock()) as fetch,
         ):
-            result = await get_img._get_cached_background()
+            result = await get_img.get_card_background()
+            second = await get_img.get_card_background()
         fetch.assert_not_awaited()
         self.assertEqual(result.getpixel((0, 0)), (255, 0, 0))
         self.assertIsNot(result, get_img._background_cache)
+        self.assertIsNot(result, second)
+        result.putpixel((0, 0), (0, 0, 0))
+        self.assertEqual(second.getpixel((0, 0)), (255, 0, 0))
 
     async def test_concurrent_refresh_downloads_once(self):
         calls = 0
@@ -296,7 +303,7 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(get_img, "_fetch_background", side_effect=fake_fetch):
             results = await asyncio.gather(
-                *(get_img._get_cached_background() for _ in range(8))
+                *(get_img.get_card_background() for _ in range(8))
             )
         self.assertEqual(calls, 1)
         self.assertEqual(len(results), 8)
@@ -309,14 +316,14 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
             patch.object(get_img.time, "monotonic", return_value=1000.0),
             patch.object(get_img, "_fetch_background", AsyncMock(side_effect=RuntimeError("down"))),
         ):
-            stale = await get_img._get_cached_background()
+            stale = await get_img.get_card_background()
         self.assertEqual(stale.getpixel((0, 0)), (0, 128, 0))
 
         get_img._reset_background_cache_for_tests()
         with patch.object(
             get_img, "_fetch_background", AsyncMock(side_effect=RuntimeError("down"))
         ):
-            fallback = await get_img._get_cached_background()
+            fallback = await get_img.get_card_background()
         self.assertEqual(fallback.size, (800, 440))
         self.assertEqual(fallback.mode, "RGB")
 
