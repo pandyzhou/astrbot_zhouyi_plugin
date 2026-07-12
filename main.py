@@ -1,4 +1,4 @@
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 import json
@@ -32,16 +32,9 @@ from .script.json_operate import (
     get_group_storage as locate_group_storage,
     initialize_storage, list_group_storages,
 )
-from .web_api import McManagerWebApi
-from .standalone_web import StandaloneWebService
-from .livingmemory.config_migration import migrate_config_file
-from .livingmemory.core.passive_group_capture import PassiveGroupCaptureFilter
-
-try:
-    from .livingmemory.component import LivingMemoryComponent
-except Exception:
-    LivingMemoryComponent = None
-    logger.warning("LivingMemory 组件导入失败，Minecraft 功能将继续加载", exc_info=True)
+from .memory.config_migration import migrate_config_file
+from .memory.core.memory_capture import MemoryCaptureFilter
+from .runtime import PluginRuntime
 
 import asyncio
 import re
@@ -49,25 +42,21 @@ import time
 from datetime import datetime, timedelta
 
 
-def _migrate_living_memory_config() -> None:
-    """在 AstrBot 读取根插件配置前迁移旧 LivingMemory 配置。"""
+def _migrate_memory_config() -> None:
+    """在 AstrBot 读取根插件配置前迁移旧 长期记忆配置。"""
     try:
         if migrate_config_file(get_astrbot_config_path()):
-            logger.info("已生成合并插件的 LivingMemory 配置文件")
+            logger.info("已生成合并插件的 长期记忆配置文件")
     except Exception:
-        logger.warning("LivingMemory 配置迁移失败，继续加载插件", exc_info=True)
+        logger.warning("长期记忆配置迁移失败，继续加载插件", exc_info=True)
 
 
-_migrate_living_memory_config()
+_migrate_memory_config()
 
 # 常量定义
 _GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_LIVING_MEMORY_DISABLED_MESSAGE = (
-    "LivingMemory 长期记忆功能未启用，请在插件配置中开启 living_memory.enabled。"
-)
-_LIVING_MEMORY_UNAVAILABLE_MESSAGE = (
-    "LivingMemory 长期记忆组件启动失败，请检查插件日志。"
-)
+_MEMORY_DISABLED_MESSAGE = "长期记忆功能未启用，请在插件配置中开启 memory.enabled。"
+_MEMORY_UNAVAILABLE_MESSAGE = "长期记忆后端启动失败，请检查插件日志。"
 
 HELP_INFO = """
 mchelp 
@@ -102,82 +91,41 @@ mchelp
 @register(
     "astrbot_zhouyi_plugin",
     "薄暝",
-    "查询 Minecraft 服务器与在线趋势，提供 MC百科 LLM 搜索和 LivingMemory 长期记忆。",
-    "0.2.0",
+    "查询 Minecraft 服务器与在线趋势，提供 MC百科 LLM 搜索和 长期记忆 Memory。",
+    "0.3.0",
 )
 class MyPlugin(Star):
-    """Minecraft 管理与 LivingMemory 长期记忆插件。"""
+    """Minecraft 管理与 长期记忆 Memory插件。"""
 
     def __init__(self, context: Context, config=None):
-        """初始化现有 MC 功能，并按配置组合 LivingMemory。"""
+        """初始化统一运行时。"""
         super().__init__(context)
-        self._settings_changed_event = asyncio.Event()
-        self._terminate_lock = asyncio.Lock()
-        self._terminated = False
-        self._living_memory_enabled = False
-        self._living_memory_component = None
+        self.runtime = PluginRuntime(self, context, config)
+        self.runtime.start()
+        logger.info("周易插件运行时初始化完成")
 
-        self._page_api = McManagerWebApi(self)
-        self._page_api.register_routes()
-        logger.info("MyPlugin 初始化完成")
-        self._standalone_service = StandaloneWebService()
-        self._standalone_task: Optional[asyncio.Task] = asyncio.create_task(
-            self._run_standalone_web()
-        )
-        # 启动每小时柱状图数据采样后台任务（单例，默认对所有已配置服务器启用）
-        self._trend_task: Optional[asyncio.Task] = None
-        if getattr(self, "_trend_task", None) is None:
-            self._trend_task = asyncio.create_task(self._bar_data_loop())
+    def _get_memory_service(self):
+        if not self.runtime.memory_enabled:
+            return None, _MEMORY_DISABLED_MESSAGE
+        if self.runtime.memory is None:
+            return None, self.runtime.memory_error or _MEMORY_UNAVAILABLE_MESSAGE
+        return self.runtime.memory, ""
 
-        living_memory_config = None
-        if config is not None:
-            try:
-                living_memory_config = config.get("living_memory")
-            except (AttributeError, TypeError):
-                living_memory_config = None
-        if isinstance(living_memory_config, Mapping) and living_memory_config.get(
-            "enabled"
-        ) is True:
-            self._living_memory_enabled = True
-            if LivingMemoryComponent is None:
-                logger.warning("LivingMemory 组件不可用，Minecraft 功能继续运行")
-            else:
-                try:
-                    self._living_memory_component = LivingMemoryComponent(
-                        context,
-                        dict(living_memory_config),
-                        str(StarTools.get_data_dir("astrbot_plugin_livingmemory")),
-                    )
-                except Exception:
-                    self._living_memory_component = None
-                    logger.warning(
-                        "LivingMemory 组件构造失败，Minecraft 功能继续运行",
-                        exc_info=True,
-                    )
-
-    def _get_living_memory_component(self):
-        if not self._living_memory_enabled:
-            return None, _LIVING_MEMORY_DISABLED_MESSAGE
-        component = self._living_memory_component
-        if component is None:
-            return None, _LIVING_MEMORY_UNAVAILABLE_MESSAGE
-        return component, ""
-
-    async def _proxy_living_memory_command(
+    async def _memory_command_impl(
         self,
         event: AstrMessageEvent,
         command_name: str,
         *args: Any,
     ) -> AsyncGenerator[MessageEventResult, None]:
-        component, message = self._get_living_memory_component()
-        if component is None:
+        service, message = self._get_memory_service()
+        if service is None:
             yield event.plain_result(message)
             return
-        handler = getattr(component, command_name)
+        handler = getattr(service, command_name)
         async for result in handler(event, *args):
             yield result
 
-    @filter.custom_filter(PassiveGroupCaptureFilter, False)
+    @filter.custom_filter(MemoryCaptureFilter, False)
     async def handle_all_group_messages(self, event: AstrMessageEvent):
         """被动群消息捕获由自定义过滤器调度，handler 不参与处理。"""
         return
@@ -188,9 +136,9 @@ class MyPlugin(Star):
         event: AstrMessageEvent,
         req: ProviderRequest,
     ) -> None:
-        component = self._living_memory_component
-        if component is not None:
-            await component.handle_memory_recall(event, req)
+        service = self.runtime.memory
+        if service is not None:
+            await service.handle_memory_recall(event, req)
 
     @filter.on_llm_response()
     async def handle_memory_reflection(
@@ -198,19 +146,34 @@ class MyPlugin(Star):
         event: AstrMessageEvent,
         resp: LLMResponse,
     ) -> None:
-        component = self._living_memory_component
-        if component is not None:
-            await component.handle_memory_reflection(event, resp)
+        service = self.runtime.memory
+        if service is not None:
+            await service.handle_memory_reflection(event, resp)
 
     @filter.after_message_sent()
-    async def handle_session_reset(self, event: AstrMessageEvent) -> None:
-        component = self._living_memory_component
-        if component is not None:
-            await component.handle_session_reset(event)
+    async def handle_session_reset(self, event: AstrMessageEvent, *args: Any) -> None:
+        service = self.runtime.memory
+        if service is not None:
+            await service.handle_session_reset(event, *args)
+
+    @filter.command_group("zhouyi")
+    def zhouyi(self):
+        """周易插件统一命令组。"""
+        pass
+
+    @zhouyi.group(sub_command="mc")
+    def zhouyi_mc(self):
+        """Minecraft 管理嵌套命令组。"""
+        pass
+
+    @zhouyi.group(sub_command="memory")
+    def zhouyi_memory(self):
+        """长期记忆嵌套命令组。"""
+        pass
 
     @filter.command_group("lmem")
     def lmem(self):
-        """LivingMemory 长期记忆管理命令组。"""
+        """长期记忆 Memory管理命令组。"""
         pass
 
     @permission_type(PermissionType.ADMIN)
@@ -218,7 +181,7 @@ class MyPlugin(Star):
     async def status(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(event, "status"):
+        async for result in self._memory_command_impl(event, "status"):
             yield result
 
     @permission_type(PermissionType.ADMIN)
@@ -229,7 +192,7 @@ class MyPlugin(Star):
         query: str,
         k: int = 5,
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(
+        async for result in self._memory_command_impl(
             event, "search", query, k
         ):
             yield result
@@ -241,7 +204,7 @@ class MyPlugin(Star):
         event: AstrMessageEvent,
         doc_id: int,
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(
+        async for result in self._memory_command_impl(
             event, "forget", doc_id
         ):
             yield result
@@ -251,7 +214,7 @@ class MyPlugin(Star):
     async def rebuild_index(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(
+        async for result in self._memory_command_impl(
             event, "rebuild_index"
         ):
             yield result
@@ -261,7 +224,7 @@ class MyPlugin(Star):
     async def rebuild_graph(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(
+        async for result in self._memory_command_impl(
             event, "rebuild_graph"
         ):
             yield result
@@ -271,7 +234,7 @@ class MyPlugin(Star):
     async def webui(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(event, "webui"):
+        async for result in self._memory_command_impl(event, "webui"):
             yield result
 
     @permission_type(PermissionType.ADMIN)
@@ -279,7 +242,7 @@ class MyPlugin(Star):
     async def summarize(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(event, "summarize"):
+        async for result in self._memory_command_impl(event, "summarize"):
             yield result
 
     @permission_type(PermissionType.ADMIN)
@@ -287,7 +250,7 @@ class MyPlugin(Star):
     async def reset(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(event, "reset"):
+        async for result in self._memory_command_impl(event, "reset"):
             yield result
 
     @permission_type(PermissionType.ADMIN)
@@ -297,7 +260,7 @@ class MyPlugin(Star):
         event: AstrMessageEvent,
         mode: str = "preview",
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(
+        async for result in self._memory_command_impl(
             event, "cleanup", mode
         ):
             yield result
@@ -307,7 +270,67 @@ class MyPlugin(Star):
     async def help(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
-        async for result in self._proxy_living_memory_command(event, "help"):
+        async for result in self._memory_command_impl(event, "help"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("status", priority=10)
+    async def zhouyi_memory_status(self, event: AstrMessageEvent):
+        async for result in self._memory_command_impl(event, "status"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("search", priority=10)
+    async def zhouyi_memory_search(self, event: AstrMessageEvent, query: str, k: int = 5):
+        async for result in self._memory_command_impl(event, "search", query, k):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("forget")
+    async def zhouyi_memory_forget(self, event: AstrMessageEvent, doc_id: int):
+        async for result in self._memory_command_impl(event, "forget", doc_id):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("rebuild-index")
+    async def zhouyi_memory_rebuild_index(self, event: AstrMessageEvent):
+        async for result in self._memory_command_impl(event, "rebuild_index"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("rebuild-graph")
+    async def zhouyi_memory_rebuild_graph(self, event: AstrMessageEvent):
+        async for result in self._memory_command_impl(event, "rebuild_graph"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("webui")
+    async def zhouyi_memory_webui(self, event: AstrMessageEvent):
+        async for result in self._memory_command_impl(event, "webui"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("summarize")
+    async def zhouyi_memory_summarize(self, event: AstrMessageEvent):
+        async for result in self._memory_command_impl(event, "summarize"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("reset")
+    async def zhouyi_memory_reset(self, event: AstrMessageEvent):
+        async for result in self._memory_command_impl(event, "reset"):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("cleanup")
+    async def zhouyi_memory_cleanup(self, event: AstrMessageEvent, mode: str = "preview"):
+        async for result in self._memory_command_impl(event, "cleanup", mode):
+            yield result
+
+    @permission_type(PermissionType.ADMIN)
+    @zhouyi_memory.command("help")
+    async def zhouyi_memory_help(self, event: AstrMessageEvent):
+        async for result in self._memory_command_impl(event, "help"):
             yield result
 
     async def mcmod_search(
@@ -406,12 +429,14 @@ class MyPlugin(Star):
             tool.active = not keep_inactive
 
     def notify_settings_changed(self) -> None:
-        """通知后台采样循环重新读取运行配置。"""
+        """通知统一运行时重新读取运行配置。"""
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None:
+            runtime.notify_settings_changed()
+            return
         settings_changed = getattr(self, "_settings_changed_event", None)
-        if settings_changed is None:
-            settings_changed = asyncio.Event()
-            self._settings_changed_event = settings_changed
-        settings_changed.set()
+        if settings_changed is not None:
+            settings_changed.set()
 
     @staticmethod
     async def _query_server_status(
@@ -426,7 +451,96 @@ class MyPlugin(Star):
         )
 
     @filter.command("mchelp")
-    async def get_help(self, event: AstrMessageEvent) -> MessageEventResult:
+    async def get_help(self, event: AstrMessageEvent):
+        async for result in self._mc_help_impl(event):
+            yield result
+
+    @filter.command("mc")
+    async def mcgetter(self, event: AstrMessageEvent):
+        async for result in self._mc_status_impl(event):
+            yield result
+
+    @filter.command("mcadd")
+    async def mcadd(self, event: AstrMessageEvent, name: str, host: str, force: bool = False):
+        async for result in self._mc_add_impl(event, name, host, force):
+            yield result
+
+    @filter.command("mcdel")
+    async def mcdel(self, event: AstrMessageEvent, identifier: str):
+        async for result in self._mc_delete_impl(event, identifier):
+            yield result
+
+    @filter.command("mcget")
+    async def mcget(self, event: AstrMessageEvent, identifier: str):
+        async for result in self._mc_get_impl(event, identifier):
+            yield result
+
+    @filter.command("mcup")
+    async def mcup(self, event: AstrMessageEvent, identifier: str, new_name: Optional[str] = None, new_host: Optional[str] = None):
+        async for result in self._mc_update_impl(event, identifier, new_name, new_host):
+            yield result
+
+    @filter.command("mclist")
+    async def mclist(self, event: AstrMessageEvent):
+        async for result in self._mc_list_impl(event):
+            yield result
+
+    @filter.command("mccleanup")
+    async def mccleanup(self, event: AstrMessageEvent):
+        async for result in self._mc_cleanup_impl(event):
+            yield result
+
+    @filter.command("mcdata")
+    async def mcdata(self, event: AstrMessageEvent, identifier: Optional[str] = None, hours: Optional[int] = None):
+        async for result in self._mc_data_impl(event, identifier, hours):
+            yield result
+
+    @zhouyi_mc.command("help")
+    async def zhouyi_mc_help(self, event: AstrMessageEvent):
+        async for result in self._mc_help_impl(event):
+            yield result
+
+    @zhouyi_mc.command("status")
+    async def zhouyi_mc_status(self, event: AstrMessageEvent):
+        async for result in self._mc_status_impl(event):
+            yield result
+
+    @zhouyi_mc.command("add")
+    async def zhouyi_mc_add(self, event: AstrMessageEvent, name: str, host: str, force: bool = False):
+        async for result in self._mc_add_impl(event, name, host, force):
+            yield result
+
+    @zhouyi_mc.command("delete")
+    async def zhouyi_mc_delete(self, event: AstrMessageEvent, identifier: str):
+        async for result in self._mc_delete_impl(event, identifier):
+            yield result
+
+    @zhouyi_mc.command("get")
+    async def zhouyi_mc_get(self, event: AstrMessageEvent, identifier: str):
+        async for result in self._mc_get_impl(event, identifier):
+            yield result
+
+    @zhouyi_mc.command("update")
+    async def zhouyi_mc_update(self, event: AstrMessageEvent, identifier: str, new_name: Optional[str] = None, new_host: Optional[str] = None):
+        async for result in self._mc_update_impl(event, identifier, new_name, new_host):
+            yield result
+
+    @zhouyi_mc.command("list")
+    async def zhouyi_mc_list(self, event: AstrMessageEvent):
+        async for result in self._mc_list_impl(event):
+            yield result
+
+    @zhouyi_mc.command("cleanup")
+    async def zhouyi_mc_cleanup(self, event: AstrMessageEvent):
+        async for result in self._mc_cleanup_impl(event):
+            yield result
+
+    @zhouyi_mc.command("data")
+    async def zhouyi_mc_data(self, event: AstrMessageEvent, identifier: Optional[str] = None, hours: Optional[int] = None):
+        async for result in self._mc_data_impl(event, identifier, hours):
+            yield result
+
+    async def _mc_help_impl(self, event: AstrMessageEvent) -> MessageEventResult:
         """
         显示帮助信息
 
@@ -438,8 +552,7 @@ class MyPlugin(Star):
         """
         yield event.plain_result(HELP_INFO)
 
-    @filter.command("mc")
-    async def mcgetter(self, event: AstrMessageEvent) -> Optional[MessageEventResult]:
+    async def _mc_status_impl(self, event: AstrMessageEvent) -> Optional[MessageEventResult]:
         """
         查询所有保存的服务器信息
 
@@ -535,8 +648,7 @@ class MyPlugin(Star):
             logger.error(f"执行 mc 命令时出错: {e}")
             yield event.plain_result("查询服务器信息时发生错误")
 
-    @filter.command("mcadd")
-    async def mcadd(self, event: AstrMessageEvent, name: str, host: str, force: bool = False) -> MessageEventResult:
+    async def _mc_add_impl(self, event: AstrMessageEvent, name: str, host: str, force: bool = False) -> MessageEventResult:
         """
         添加新的服务器
 
@@ -594,8 +706,7 @@ class MyPlugin(Star):
             logger.error(f"执行 mcadd 命令时出错: {e}")
             yield event.plain_result("添加服务器时发生错误")
 
-    @filter.command("mcdel")
-    async def mcdel(self, event: AstrMessageEvent, identifier: str) -> MessageEventResult:
+    async def _mc_delete_impl(self, event: AstrMessageEvent, identifier: str) -> MessageEventResult:
         """
         删除指定的服务器（支持通过名称或ID删除）
 
@@ -620,8 +731,7 @@ class MyPlugin(Star):
             logger.error(f"执行 mcdel 命令时出错: {e}")
             yield event.plain_result("删除服务器时发生错误")
 
-    @filter.command("mcget")
-    async def mcget(self, event: AstrMessageEvent, identifier: str) -> MessageEventResult:
+    async def _mc_get_impl(self, event: AstrMessageEvent, identifier: str) -> MessageEventResult:
         """
         获取指定服务器的信息（支持通过名称或ID查找）
         """
@@ -642,8 +752,7 @@ class MyPlugin(Star):
             logger.error(f"执行 mcget 命令时出错: {e}")
             yield event.plain_result("获取服务器信息时发生错误")
 
-    @filter.command("mcup")
-    async def mcup(self, event: AstrMessageEvent, identifier: str, new_name: Optional[str] = None, new_host: Optional[str] = None) -> MessageEventResult:
+    async def _mc_update_impl(self, event: AstrMessageEvent, identifier: str, new_name: Optional[str] = None, new_host: Optional[str] = None) -> MessageEventResult:
         """
         更新服务器信息（支持通过名称或ID更新）
 
@@ -685,8 +794,7 @@ class MyPlugin(Star):
             logger.error(f"执行 mcup 命令时出错: {e}")
             yield event.plain_result("更新服务器信息时发生错误")
 
-    @filter.command("mclist")
-    async def mclist(self, event: AstrMessageEvent) -> MessageEventResult:
+    async def _mc_list_impl(self, event: AstrMessageEvent) -> MessageEventResult:
         """
         列出所有服务器及其ID
         """
@@ -710,8 +818,7 @@ class MyPlugin(Star):
             logger.error(f"执行 mclist 命令时出错: {e}")
             yield event.plain_result("获取服务器列表时发生错误")
 
-    @filter.command("mccleanup")
-    async def mccleanup(self, event: AstrMessageEvent) -> MessageEventResult:
+    async def _mc_cleanup_impl(self, event: AstrMessageEvent) -> MessageEventResult:
         """按当前群配置手动触发清理。"""
         logger.info("开始执行 mccleanup 命令")
         try:
@@ -742,8 +849,7 @@ class MyPlugin(Star):
             logger.error(f"执行 mccleanup 命令时出错: {e}")
             yield event.plain_result("自动清理时发生错误")
 
-    @filter.command("mcdata")
-    async def mcdata(
+    async def _mc_data_impl(
         self,
         event: AstrMessageEvent,
         identifier: Optional[str] = None,
@@ -1103,61 +1209,6 @@ class MyPlugin(Star):
                 else:
                     settings_changed.clear()
 
-    async def _run_standalone_web(self):
-        try:
-            await self._standalone_service.run()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.error("Minecraft Manager 独立页面启动失败", exc_info=True)
-
     async def terminate(self):
-        """幂等、隔离地停止 LivingMemory 与现有 MC 后台资源。"""
-        terminate_lock = getattr(self, "_terminate_lock", None)
-        if terminate_lock is None:
-            terminate_lock = asyncio.Lock()
-            self._terminate_lock = terminate_lock
-
-        async with terminate_lock:
-            if getattr(self, "_terminated", False):
-                return
-
-            component = getattr(self, "_living_memory_component", None)
-            self._living_memory_component = None
-            if component is not None:
-                try:
-                    await component.terminate()
-                except Exception:
-                    logger.error("LivingMemory 组件停止失败", exc_info=True)
-
-            standalone_service = getattr(self, "_standalone_service", None)
-            if standalone_service is not None:
-                try:
-                    await standalone_service.stop()
-                except Exception:
-                    logger.error("Minecraft Manager 独立页面停止失败", exc_info=True)
-
-            standalone_task = getattr(self, "_standalone_task", None)
-            self._standalone_task = None
-            if standalone_task:
-                try:
-                    if not standalone_task.done():
-                        standalone_task.cancel()
-                    await asyncio.gather(standalone_task, return_exceptions=True)
-                except Exception:
-                    logger.error("Minecraft Manager 独立页面任务回收失败", exc_info=True)
-
-            trend_task = getattr(self, "_trend_task", None)
-            self._trend_task = None
-            settings_changed = getattr(self, "_settings_changed_event", None)
-            if settings_changed is not None:
-                settings_changed.set()
-            if trend_task:
-                try:
-                    if not trend_task.done():
-                        trend_task.cancel()
-                    await asyncio.gather(trend_task, return_exceptions=True)
-                except Exception:
-                    logger.error("Minecraft 趋势采样任务回收失败", exc_info=True)
-
-            self._terminated = True
+        """幂等停止统一运行时。"""
+        await self.runtime.terminate()

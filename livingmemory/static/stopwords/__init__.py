@@ -1,1 +1,0 @@
-"""Bundled LivingMemory stopword resources."""

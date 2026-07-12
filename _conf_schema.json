@@ -1,5 +1,5 @@
 {
-    "living_memory": {
+    "memory": {
         "description": "长期记忆",
         "hint": "配置长期记忆系统的启用状态和运行参数",
         "type": "object",

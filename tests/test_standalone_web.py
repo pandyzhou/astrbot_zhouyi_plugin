@@ -135,7 +135,7 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_api_requires_dashboard_cookie(self):
         _, client = await self._start_service()
-        response = await client.get(f"{PUBLIC_API_PREFIX}/bootstrap")
+        response = await client.get(f"{PUBLIC_API_PREFIX}/v1/bootstrap")
         self.assertEqual(response.status, 401)
         payload = await response.json()
         self.assertEqual(payload["data"]["code"], "AUTH_REQUIRED")
@@ -157,16 +157,16 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
         }
 
         get_response = await client.get(
-            f"{PUBLIC_API_PREFIX}/settings?group_id=123",
+            f"{PUBLIC_API_PREFIX}/v1/mc/settings?group_id=123",
             headers=cookie,
         )
         preview_response = await client.post(
-            f"{PUBLIC_API_PREFIX}/settings/preview",
+            f"{PUBLIC_API_PREFIX}/v1/mc/settings/preview",
             json={},
             headers=post_headers,
         )
         save_response = await client.post(
-            f"{PUBLIC_API_PREFIX}/settings",
+            f"{PUBLIC_API_PREFIX}/v1/mc/settings",
             json={},
             headers=post_headers,
         )
@@ -180,15 +180,15 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
             [
                 (
                     "GET",
-                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/settings",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/v1/mc/settings",
                 ),
                 (
                     "POST",
-                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/settings/preview",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/v1/mc/settings/preview",
                 ),
                 (
                     "POST",
-                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/settings",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/v1/mc/settings",
                 ),
             ],
         )
@@ -196,7 +196,7 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
     async def test_cross_origin_post_is_forbidden(self):
         _, client = await self._start_service()
         response = await client.post(
-            f"{PUBLIC_API_PREFIX}/status",
+            f"{PUBLIC_API_PREFIX}/v1/mc/status",
             json={"group_id": "123"},
             headers={
                 "Origin": "https://evil.example",
@@ -225,7 +225,7 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
         upstream = await self._start_upstream(upstream_handler)
         _, client = await self._start_service(upstream_base_url=str(upstream.make_url("/")))
         response = await client.post(
-            f"{PUBLIC_API_PREFIX}/servers/add?group_id=123",
+            f"{PUBLIC_API_PREFIX}/v1/mc/servers/add?group_id=123",
             json={"name": "Alpha"},
             headers={
                 "Origin": "https://standalone.example:35020",
@@ -244,7 +244,7 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["method"], "POST")
         self.assertEqual(
             seen["path"],
-            "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/servers/add",
+            "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/v1/mc/servers/add",
         )
         self.assertEqual(seen["query"], "group_id=123")
         self.assertEqual(seen["body"], {"name": "Alpha"})
@@ -267,13 +267,21 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
         upstream = await self._start_upstream(upstream_handler)
         _, client = await self._start_service(upstream_base_url=str(upstream.make_url("/")))
         response = await client.get(
-            f"{PUBLIC_API_PREFIX}/bootstrap",
+            f"{PUBLIC_API_PREFIX}/v1/bootstrap",
             headers={"Cookie": "astrbot_dashboard_jwt=expired"},
         )
         self.assertEqual(response.status, 401)
         payload = await response.json()
         self.assertEqual(payload["data"]["code"], "AUTH_REQUIRED")
         self.assertNotIn("detail", payload)
+
+    async def test_memory_api_is_not_exposed_by_standalone(self):
+        _, client = await self._start_service()
+        response = await client.get(
+            f"{PUBLIC_API_PREFIX}/v1/memory/stats",
+            headers={"Cookie": "astrbot_dashboard_jwt=token"},
+        )
+        self.assertEqual(response.status, 404)
 
     async def test_run_and_stop_are_idempotent(self):
         service = StandaloneWebService(

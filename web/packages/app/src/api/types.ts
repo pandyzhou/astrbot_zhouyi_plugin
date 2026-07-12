@@ -27,9 +27,23 @@ export interface BackendErrorEnvelope {
 
 export type BackendEnvelope<T> = BackendSuccessEnvelope<T> | BackendErrorEnvelope;
 
+export interface CapabilityStatus {
+  available: boolean;
+  enabled: boolean;
+  initialized: boolean;
+  error: string | null;
+  reason?: string | null;
+}
+
 export interface BackendBootstrapData {
+  brand?: string;
+  api_version?: string;
   groups: Array<{ id: string }>;
   selected_group_id: string | null;
+  capabilities?: {
+    mc: CapabilityStatus;
+    memory: CapabilityStatus;
+  };
 }
 
 export interface BackendSavedServer {
@@ -122,8 +136,13 @@ export interface GroupOption {
 }
 
 export interface BootstrapData {
+  brand: string;
   groups: GroupOption[];
   default_group_id: string | null;
+  capabilities: {
+    mc: CapabilityStatus;
+    memory: CapabilityStatus;
+  };
 }
 
 export interface PlayerSample {

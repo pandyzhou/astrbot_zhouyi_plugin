@@ -199,7 +199,7 @@ function applyStatus(saved: ServerRecord, status: RawStatusServer): ServerRecord
 }
 
 async function loadServers(groupId: string, signal?: AbortSignal) {
-  const raw = await request<RawServersData>('/page/servers', { query: { group_id: groupId }, signal });
+  const raw = await request<RawServersData>('/page/v1/mc/servers', { query: { group_id: groupId }, signal });
   return normalizeServerCollection(raw);
 }
 
@@ -215,30 +215,36 @@ function fillHourlyPoints(raw: RawTrendsData, points: Array<{ ts: number; count:
 
 export const apiClient = {
   bootstrap: async (signal?: AbortSignal): Promise<BootstrapData> => {
-    const raw = await request<RawBootstrapData>('/page/bootstrap', { signal });
+    const raw = await request<RawBootstrapData>('/page/v1/bootstrap', { signal });
+    const unavailable = { available: false, enabled: false, initialized: false, error: null };
     return {
+      brand: raw.brand ?? 'Zhouyi Dashboard',
       groups: raw.groups.map((group) => ({ group_id: group.id, label: group.id })),
       default_group_id: raw.selected_group_id,
+      capabilities: raw.capabilities ?? {
+        mc: { available: true, enabled: true, initialized: true, error: null },
+        memory: unavailable,
+      },
     };
   },
   servers: loadServers,
-  settings: (groupId: string, signal?: AbortSignal): Promise<SettingsData> => request('/page/settings', {
+  settings: (groupId: string, signal?: AbortSignal): Promise<SettingsData> => request('/page/v1/mc/settings', {
     query: { group_id: groupId }, signal,
   }),
-  previewSettings: (input: SettingsMutationInput, signal?: AbortSignal): Promise<SettingsPreviewData> => request('/page/settings/preview', {
+  previewSettings: (input: SettingsMutationInput, signal?: AbortSignal): Promise<SettingsPreviewData> => request('/page/v1/mc/settings/preview', {
     method: 'POST', body: input, signal,
   }),
-  saveSettings: (input: SettingsMutationInput, signal?: AbortSignal): Promise<SettingsSaveData> => request('/page/settings', {
+  saveSettings: (input: SettingsMutationInput, signal?: AbortSignal): Promise<SettingsSaveData> => request('/page/v1/mc/settings', {
     method: 'POST', body: input, signal, mutationKey: `settings:${input.scope}:${input.group_id ?? 'global'}`,
   }),
   addServer: async (input: AddServerInput, signal?: AbortSignal): Promise<ServerMutationData> => {
-    const raw = await request<RawMutationData>('/page/servers/add', {
+    const raw = await request<RawMutationData>('/page/v1/mc/servers/add', {
       method: 'POST', body: input, signal, mutationKey: `add:${input.group_id}`,
     });
     return { server: normalizeSavedServer(raw.server) };
   },
   updateServer: async (input: UpdateServerInput, signal?: AbortSignal): Promise<ServerMutationData> => {
-    const raw = await request<RawMutationData>('/page/servers/update', {
+    const raw = await request<RawMutationData>('/page/v1/mc/servers/update', {
       method: 'POST',
       body: { group_id: input.group_id, identifier: input.server_id, name: input.name, host: input.host },
       signal,
@@ -247,7 +253,7 @@ export const apiClient = {
     return { server: normalizeSavedServer(raw.server) };
   },
   deleteServer: async (input: DeleteServerInput, signal?: AbortSignal): Promise<DeleteServerData> => {
-    const raw = await request<RawDeleteData>('/page/servers/delete', {
+    const raw = await request<RawDeleteData>('/page/v1/mc/servers/delete', {
       method: 'POST',
       body: { group_id: input.group_id, identifier: input.server_id, confirm: true },
       signal,
@@ -260,7 +266,7 @@ export const apiClient = {
     };
   },
   refreshStatus: async (input: RefreshStatusInput, signal?: AbortSignal): Promise<RefreshStatusData> => {
-    const raw = await request<RawStatusData>('/page/status', {
+    const raw = await request<RawStatusData>('/page/v1/mc/status', {
       method: 'POST',
       body: { group_id: input.group_id, identifier: input.server_id },
       signal,
@@ -278,7 +284,7 @@ export const apiClient = {
     };
   },
   trends: async (groupId: string, serverId: string | undefined, hours: number, signal?: AbortSignal): Promise<TrendsData> => {
-    const raw = await request<RawTrendsData>('/page/trends', {
+    const raw = await request<RawTrendsData>('/page/v1/mc/trends', {
       query: { group_id: groupId, identifier: serverId, hours }, signal,
     });
     return {
@@ -299,12 +305,12 @@ export const apiClient = {
   },
   cleanup: async (groupId: string, execute: boolean, signal?: AbortSignal): Promise<CleanupData> => {
     if (!execute) {
-      const raw = await request<RawCleanupPreviewData>('/page/cleanup', {
+      const raw = await request<RawCleanupPreviewData>('/page/v1/mc/cleanup', {
         query: { group_id: groupId }, signal,
       });
       return { mode: 'preview', candidates: raw.candidates, deleted_count: 0 };
     }
-    const raw = await request<RawCleanupExecuteData>('/page/cleanup', {
+    const raw = await request<RawCleanupExecuteData>('/page/v1/mc/cleanup', {
       method: 'POST',
       body: { group_id: groupId, confirm: true },
       signal,
@@ -313,3 +319,21 @@ export const apiClient = {
     return { mode: 'execute', candidates: raw.deleted, deleted_count: raw.deleted_count };
   },
 };
+
+export function memoryGet<T>(path: string, query?: Query, signal?: AbortSignal): Promise<T> {
+  return request<T>(`/page/v1/memory/${path.replace(/^\/+/, '')}`, { query, signal });
+}
+
+export function memoryPost<T>(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
+  mutationKey?: string,
+): Promise<T> {
+  return request<T>(`/page/v1/memory/${path.replace(/^\/+/, '')}`, {
+    method: 'POST',
+    body,
+    signal,
+    mutationKey,
+  });
+}

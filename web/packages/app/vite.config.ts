@@ -25,7 +25,7 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: {
-      outDir: resolve(__dirname, '../../../pages/mc-manager'),
+      outDir: resolve(__dirname, '../../../pages/zhouyi-dashboard'),
       emptyOutDir: true,
     },
   };

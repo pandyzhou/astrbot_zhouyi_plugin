@@ -13,8 +13,8 @@ ASTRBOT_ROOT = Path(__file__).resolve().parents[4]
 if str(ASTRBOT_ROOT) not in sys.path:
     sys.path.insert(0, str(ASTRBOT_ROOT))
 
-MODULE_NAME = "data.plugins.astrbot_zhouyi_plugin.livingmemory.component"
-PACKAGE_NAME = "data.plugins.astrbot_zhouyi_plugin.livingmemory"
+MODULE_NAME = "data.plugins.astrbot_zhouyi_plugin.memory.service"
+PACKAGE_NAME = "data.plugins.astrbot_zhouyi_plugin.memory"
 
 
 class _Logger:
@@ -61,6 +61,11 @@ class _FailingInitializer:
         self.conversation_manager = None
         self.index_validator = None
         self.db = None
+        self.graph_db = None
+        self._initialized_callback = None
+
+    def set_initialized_callback(self, callback):
+        self._initialized_callback = callback
 
     async def initialize(self):
         raise RuntimeError("initializer boom")
@@ -74,10 +79,44 @@ class _FailingInitializer:
     async def stop_scheduler(self):
         return None
 
+    async def cleanup_runtime_resources(self):
+        return None
+
+
+class _RetryInitializer(_FailingInitializer):
+    async def initialize(self):
+        self.retry_task = asyncio.create_task(self._recover())
+        return False
+
+    async def _recover(self):
+        await asyncio.sleep(0)
+        self.memory_engine = object()
+        self.memory_processor = object()
+        self.conversation_manager = object()
+        self.index_validator = object()
+        self.is_initialized = True
+        await self._initialized_callback()
+
+
+class _RuntimeComponent:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+    async def shutdown(self):
+        return None
+
+
+class _Tool(_RuntimeComponent):
+    pass
+
 
 class _Context:
-    def add_llm_tools(self, *_tools):
-        pass
+    def __init__(self):
+        self.tools = []
+
+    def add_llm_tools(self, *tools):
+        self.tools.extend(tools)
 
 
 def _module(name: str, **attributes):
@@ -87,7 +126,7 @@ def _module(name: str, **attributes):
     return module
 
 
-def _load_component_module():
+def _load_component_module(initializer_cls=_FailingInitializer):
     active = {"component": None}
     logger = _Logger()
     stubs = {
@@ -110,13 +149,13 @@ def _load_component_module():
             f"{PACKAGE_NAME}.core.base.config_manager",
             ConfigManager=_ConfigManager,
         ),
-        f"{PACKAGE_NAME}.core.command_handler": _module(
-            f"{PACKAGE_NAME}.core.command_handler",
-            CommandHandler=object,
+        f"{PACKAGE_NAME}.core.memory_commands": _module(
+            f"{PACKAGE_NAME}.core.memory_commands",
+            MemoryCommands=_RuntimeComponent,
         ),
-        f"{PACKAGE_NAME}.core.event_handler": _module(
-            f"{PACKAGE_NAME}.core.event_handler",
-            EventHandler=object,
+        f"{PACKAGE_NAME}.core.memory_events": _module(
+            f"{PACKAGE_NAME}.core.memory_events",
+            MemoryEvents=_RuntimeComponent,
         ),
         f"{PACKAGE_NAME}.core.i18n_backend": _module(
             f"{PACKAGE_NAME}.core.i18n_backend",
@@ -127,10 +166,10 @@ def _load_component_module():
             f"{PACKAGE_NAME}.core.managers.backup_manager",
             BackupManager=_BackupManager,
         ),
-        f"{PACKAGE_NAME}.core.passive_group_capture": _module(
-            f"{PACKAGE_NAME}.core.passive_group_capture",
-            get_active_component=lambda: active["component"],
-            set_active_component=lambda component: active.__setitem__(
+        f"{PACKAGE_NAME}.core.memory_capture": _module(
+            f"{PACKAGE_NAME}.core.memory_capture",
+            get_active_service=lambda: active["component"],
+            set_active_service=lambda component: active.__setitem__(
                 "component", component
             ),
             is_plugin_enabled_for_session=lambda _session: asyncio.sleep(
@@ -138,14 +177,14 @@ def _load_component_module():
             ),
             is_session_enabled=lambda _session: asyncio.sleep(0, result=True),
         ),
-        f"{PACKAGE_NAME}.core.plugin_initializer": _module(
-            f"{PACKAGE_NAME}.core.plugin_initializer",
-            PluginInitializer=_FailingInitializer,
+        f"{PACKAGE_NAME}.core.memory_bootstrap": _module(
+            f"{PACKAGE_NAME}.core.memory_bootstrap",
+            MemoryBootstrap=initializer_cls,
         ),
         f"{PACKAGE_NAME}.core.tools": _module(
             f"{PACKAGE_NAME}.core.tools",
-            MemoryMemorizeTool=object,
-            MemorySearchTool=object,
+            MemoryMemorizeTool=_Tool,
+            MemorySearchTool=_Tool,
         ),
     }
     sys.modules.pop(MODULE_NAME, None)
@@ -153,11 +192,11 @@ def _load_component_module():
         return importlib.import_module(MODULE_NAME)
 
 
-class LivingMemoryComponentTests(unittest.IsolatedAsyncioTestCase):
+class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_initialization_failure_is_recorded_and_terminate_is_idempotent(self):
         component_module = _load_component_module()
         with tempfile.TemporaryDirectory() as data_dir:
-            component = component_module.LivingMemoryComponent(
+            component = component_module.MemoryService(
                 _Context(), {}, data_dir
             )
             tasks = list(component._background_tasks)
@@ -172,10 +211,24 @@ class LivingMemoryComponentTests(unittest.IsolatedAsyncioTestCase):
             await component.terminate()
             self.assertTrue(component._terminated)
 
+    async def test_provider_retry_success_automatically_creates_runtime_components(self):
+        component_module = _load_component_module(_RetryInitializer)
+        context = _Context()
+        with tempfile.TemporaryDirectory() as data_dir:
+            component = component_module.MemoryService(context, {}, data_dir)
+            await asyncio.gather(*list(component._background_tasks))
+            await component.bootstrap.retry_task
+
+            self.assertTrue(component.ready)
+            self.assertIsNotNone(component.events)
+            self.assertIsNotNone(component.commands)
+            self.assertEqual(len(context.tools), 1)
+            await component.terminate()
+
     async def test_terminate_continues_closing_resources_after_cleanup_failure(self):
         component_module = _load_component_module()
         with tempfile.TemporaryDirectory() as data_dir:
-            component = component_module.LivingMemoryComponent(
+            component = component_module.MemoryService(
                 _Context(), {}, data_dir
             )
             await asyncio.gather(*list(component._background_tasks))
@@ -185,14 +238,15 @@ class LivingMemoryComponentTests(unittest.IsolatedAsyncioTestCase):
                 (),
                 {"close": AsyncMock()},
             )()
-            initializer = type(
-                "CleanupInitializer",
+            bootstrap = type(
+                "CleanupBootstrap",
                 (),
                 {
                     "stop_background_tasks": AsyncMock(
                         side_effect=RuntimeError("background stop boom")
                     ),
                     "stop_scheduler": AsyncMock(),
+                    "cleanup_runtime_resources": AsyncMock(),
                     "conversation_manager": type(
                         "ConversationManager",
                         (),
@@ -203,6 +257,11 @@ class LivingMemoryComponentTests(unittest.IsolatedAsyncioTestCase):
                         (),
                         {"close": AsyncMock()},
                     )(),
+                    "graph_db": type(
+                        "GraphVectorDatabase",
+                        (),
+                        {"close": AsyncMock()},
+                    )(),
                     "db": type(
                         "VectorDatabase",
                         (),
@@ -210,21 +269,50 @@ class LivingMemoryComponentTests(unittest.IsolatedAsyncioTestCase):
                     )(),
                 },
             )()
-            component.initializer = initializer
-            component.event_handler = type(
-                "EventHandler",
+            component.bootstrap = bootstrap
+            component.events = type(
+                "MemoryEvents",
                 (),
                 {"shutdown": AsyncMock()},
             )()
+            events = component.events
 
             await component.terminate()
 
-            initializer.stop_background_tasks.assert_awaited_once()
-            component.event_handler.shutdown.assert_awaited_once()
-            initializer.stop_scheduler.assert_awaited_once()
-            conversation_store.close.assert_awaited_once()
-            initializer.memory_engine.close.assert_awaited_once()
-            initializer.db.close.assert_awaited_once()
+            bootstrap.stop_background_tasks.assert_awaited_once()
+            events.shutdown.assert_awaited_once()
+            bootstrap.cleanup_runtime_resources.assert_awaited_once()
+            conversation_store.close.assert_not_awaited()
+            bootstrap.memory_engine.close.assert_not_awaited()
+            bootstrap.graph_db.close.assert_not_awaited()
+            bootstrap.db.close.assert_not_awaited()
+            self.assertTrue(component._terminated)
+
+    async def test_terminate_times_out_stuck_cleanup_and_continues(self):
+        component_module = _load_component_module()
+        with tempfile.TemporaryDirectory() as data_dir:
+            component = component_module.MemoryService(_Context(), {}, data_dir)
+            await asyncio.gather(*list(component._background_tasks))
+            component.RESOURCE_STOP_TIMEOUT_SECONDS = 0.01
+
+            async def ignore_cancellation():
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    return None
+
+            bootstrap = types.SimpleNamespace(
+                stop_background_tasks=ignore_cancellation,
+                cleanup_runtime_resources=AsyncMock(),
+            )
+            events = type("Events", (), {"shutdown": AsyncMock()})()
+            component.bootstrap = bootstrap
+            component.events = events
+
+            await asyncio.wait_for(component.terminate(), timeout=0.2)
+
+            events.shutdown.assert_awaited_once()
+            bootstrap.cleanup_runtime_resources.assert_awaited_once()
             self.assertTrue(component._terminated)
 
     def test_exposes_ten_command_business_proxies(self):
@@ -242,7 +330,7 @@ class LivingMemoryComponentTests(unittest.IsolatedAsyncioTestCase):
             "help",
         }
         self.assertTrue(
-            command_names.issubset(vars(component_module.LivingMemoryComponent))
+            command_names.issubset(vars(component_module.MemoryService))
         )
 
 

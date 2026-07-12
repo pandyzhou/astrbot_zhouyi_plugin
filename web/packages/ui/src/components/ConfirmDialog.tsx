@@ -8,6 +8,7 @@ export interface ConfirmDialogProps {
   cancelLabel?: string;
   danger?: boolean;
   busy?: boolean;
+  busyLabel?: string;
   onConfirm: () => void;
   onClose: () => void;
 }
@@ -20,6 +21,7 @@ export function ConfirmDialog({
   cancelLabel = '取消',
   danger = false,
   busy = false,
+  busyLabel = '处理中…',
   onConfirm,
   onClose,
 }: ConfirmDialogProps) {
@@ -58,7 +60,7 @@ export function ConfirmDialog({
           {cancelLabel}
         </button>
         <button className={danger ? 'wf-button wf-button--danger' : 'wf-button wf-button--primary'} type="button" disabled={busy} onClick={onConfirm}>
-          {busy ? '处理中…' : confirmLabel}
+          {busy ? busyLabel : confirmLabel}
         </button>
       </div>
     </dialog>

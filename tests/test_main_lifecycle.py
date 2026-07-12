@@ -81,19 +81,22 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(register_call.args[0].value, "astrbot_zhouyi_plugin")
 
+        runtime_tree = ast.parse((PLUGIN_ROOT / "runtime.py").read_text(encoding="utf-8"))
         data_dir_names = [
             node.args[0].value
-            for node in ast.walk(tree)
+            for current_tree in (tree, runtime_tree)
+            for node in ast.walk(current_tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "get_data_dir"
             and node.args
             and isinstance(node.args[0], ast.Constant)
         ]
-        self.assertEqual(
+        self.assertCountEqual(
             data_dir_names,
             [
                 "astrbot_plugin_livingmemory",
+                "astrbot_zhouyi_plugin",
                 "astrbot_zhouyi_plugin",
                 "astrbot_zhouyi_plugin",
             ],
@@ -132,23 +135,23 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(MyPlugin, "_bar_data_loop", fake_loop),
             patch(
-                "data.plugins.astrbot_zhouyi_plugin.main.StandaloneWebService",
+                "data.plugins.astrbot_zhouyi_plugin.runtime.StandaloneWebService",
                 FakeStandaloneWebService,
             ),
         ):
             plugin = MyPlugin(context, config=None)
             await asyncio.gather(trend_started.wait(), standalone_started.wait())
-            self.assertEqual(len(context.registered_web_apis), 12)
-            trend_task = plugin._trend_task
-            standalone_task = plugin._standalone_task
+            self.assertEqual(len(context.registered_web_apis), 45)
+            trend_task = plugin.runtime.trend_task
+            standalone_task = plugin.runtime.standalone_task
             self.assertIsNotNone(trend_task)
             self.assertIsNotNone(standalone_task)
             self.assertFalse(trend_task.done())
             self.assertFalse(standalone_task.done())
             await plugin.terminate()
 
-        self.assertIsNone(plugin._trend_task)
-        self.assertIsNone(plugin._standalone_task)
+        self.assertIsNone(plugin.runtime.trend_task)
+        self.assertIsNone(plugin.runtime.standalone_task)
         self.assertTrue(trend_task.cancelled())
         self.assertTrue(standalone_task.done())
         self.assertTrue(standalone_stopped.is_set())

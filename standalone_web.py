@@ -14,23 +14,23 @@ PLUGIN_NAME = "astrbot_zhouyi_plugin"
 PUBLIC_API_PREFIX = f"/api/plug/{PLUGIN_NAME}/page"
 UPSTREAM_API_PREFIX = f"/api/v1/plugins/extensions/{PLUGIN_NAME}/page"
 DEFAULT_CONFIG_PATH = Path("/data/astrbot/data/cmd_config.json")
-DEFAULT_PAGE_ROOT = Path(__file__).resolve().parent / "pages" / "mc-manager"
+DEFAULT_PAGE_ROOT = Path(__file__).resolve().parent / "pages" / "zhouyi-dashboard"
 DEFAULT_PUBLIC_ORIGIN = "https://astr.zhouyihub.com:35020"
 MAX_REQUEST_BODY = 64 * 1024
 
 _ALLOWED_API_ROUTES = (
-    ("GET", "/bootstrap"),
-    ("GET", "/servers"),
-    ("POST", "/servers/add"),
-    ("POST", "/servers/update"),
-    ("POST", "/servers/delete"),
-    ("POST", "/status"),
-    ("GET", "/settings"),
-    ("POST", "/settings/preview"),
-    ("POST", "/settings"),
-    ("GET", "/trends"),
-    ("GET", "/cleanup"),
-    ("POST", "/cleanup"),
+    ("GET", "/v1/bootstrap"),
+    ("GET", "/v1/mc/servers"),
+    ("POST", "/v1/mc/servers/add"),
+    ("POST", "/v1/mc/servers/update"),
+    ("POST", "/v1/mc/servers/delete"),
+    ("POST", "/v1/mc/status"),
+    ("GET", "/v1/mc/settings"),
+    ("POST", "/v1/mc/settings/preview"),
+    ("POST", "/v1/mc/settings"),
+    ("GET", "/v1/mc/trends"),
+    ("GET", "/v1/mc/cleanup"),
+    ("POST", "/v1/mc/cleanup"),
 )
 _HASHED_ASSET_RE = re.compile(r"-[A-Za-z0-9_]+(?:\.[A-Za-z0-9]+)$")
 _SECURITY_HEADERS = {
@@ -82,7 +82,7 @@ async def _security_middleware(
 
 
 class StandaloneWebService:
-    """为 Minecraft Manager 页面提供独立 HTTPS 服务和受限 API 转发。"""
+    """为 Zhouyi Dashboard 提供独立 HTTPS 服务，仅转发 MC API。"""
 
     def __init__(
         self,

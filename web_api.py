@@ -63,6 +63,23 @@ StatusFetcher = Callable[..., Awaitable[dict[str, Any] | None]]
 DataDirGetter = Callable[[], Path]
 Clock = Callable[[], float]
 
+# suffix, handler name, methods, description. 统一 Dashboard facade 会复用这份
+# 描述注册新版 /page/v1/mc/* 与旧版 /page/* 兼容路由，业务 handler 仍留在本类。
+MC_ROUTE_DESCRIPTORS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
+    ("/bootstrap", "bootstrap", ("GET",), "Minecraft Manager bootstrap"),
+    ("/settings", "get_settings", ("GET",), "Minecraft Manager settings"),
+    ("/settings/preview", "preview_settings", ("POST",), "Minecraft Manager settings preview"),
+    ("/settings", "save_settings", ("POST",), "Minecraft Manager settings save"),
+    ("/servers", "list_servers", ("GET",), "Minecraft Manager servers"),
+    ("/servers/add", "add_server", ("POST",), "Minecraft Manager add server"),
+    ("/servers/update", "update_server", ("POST",), "Minecraft Manager update server"),
+    ("/servers/delete", "delete_server", ("POST",), "Minecraft Manager delete server"),
+    ("/status", "refresh_status", ("POST",), "Minecraft Manager status"),
+    ("/trends", "get_trends", ("GET",), "Minecraft Manager trends"),
+    ("/cleanup", "preview_cleanup", ("GET",), "Minecraft Manager cleanup preview"),
+    ("/cleanup", "execute_cleanup", ("POST",), "Minecraft Manager cleanup execute"),
+)
+
 
 class ApiProblem(Exception):
     def __init__(
@@ -186,53 +203,16 @@ class McManagerWebApi:
         self._status_fetcher = status_fetcher or get_server_status
         self._clock = clock or time.time
 
+    def route_descriptors(self):
+        """返回绑定到当前实例的 MC 路由描述，供统一 Dashboard facade 复用。"""
+        return tuple(
+            (suffix, getattr(self, handler_name), list(methods), description)
+            for suffix, handler_name, methods, description in MC_ROUTE_DESCRIPTORS
+        )
+
     def register_routes(self) -> None:
         register = self.plugin.context.register_web_api
-        routes = [
-            ("/bootstrap", self.bootstrap, ["GET"], "Minecraft Manager bootstrap"),
-            ("/settings", self.get_settings, ["GET"], "Minecraft Manager settings"),
-            (
-                "/settings/preview",
-                self.preview_settings,
-                ["POST"],
-                "Minecraft Manager settings preview",
-            ),
-            (
-                "/settings",
-                self.save_settings,
-                ["POST"],
-                "Minecraft Manager settings save",
-            ),
-            ("/servers", self.list_servers, ["GET"], "Minecraft Manager servers"),
-            ("/servers/add", self.add_server, ["POST"], "Minecraft Manager add server"),
-            (
-                "/servers/update",
-                self.update_server,
-                ["POST"],
-                "Minecraft Manager update server",
-            ),
-            (
-                "/servers/delete",
-                self.delete_server,
-                ["POST"],
-                "Minecraft Manager delete server",
-            ),
-            ("/status", self.refresh_status, ["POST"], "Minecraft Manager status"),
-            ("/trends", self.get_trends, ["GET"], "Minecraft Manager trends"),
-            (
-                "/cleanup",
-                self.preview_cleanup,
-                ["GET"],
-                "Minecraft Manager cleanup preview",
-            ),
-            (
-                "/cleanup",
-                self.execute_cleanup,
-                ["POST"],
-                "Minecraft Manager cleanup execute",
-            ),
-        ]
-        for suffix, handler, methods, description in routes:
+        for suffix, handler, methods, description in self.route_descriptors():
             register(
                 f"{PAGE_API_PREFIX}{suffix}",
                 handler,

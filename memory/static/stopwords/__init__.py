@@ -1,0 +1,1 @@
+"""Bundled Memory stopword resources."""

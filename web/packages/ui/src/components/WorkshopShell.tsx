@@ -15,7 +15,7 @@ export function WorkshopShell({ brand, navigation, groupControl, children }: Wor
       </a>
       <header className="wf-topbar">
         <div className="wf-brand" aria-label={brand}>
-          <span className="wf-brand-mark" aria-hidden="true">MC</span>
+          <span className="wf-brand-mark" aria-hidden="true">ZY</span>
           <span>{brand}</span>
         </div>
         <nav className="wf-nav" aria-label="主导航">

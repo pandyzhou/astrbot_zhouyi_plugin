@@ -1,0 +1,12 @@
+Third-Party Notices
+===================
+
+The Memory backend includes code derived from LivingMemory 2.3.6 by lxfight:
+https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory
+
+That upstream code is licensed under GNU Affero General Public License v3.0.
+The applicable license text is preserved in memory/LICENSE and the repository root LICENSE.
+
+Legacy names such as astrbot_plugin_livingmemory, living_memory, livingmemory.db,
+and livingmemory_* SQLite schema identifiers are retained only for migration and
+on-disk compatibility.
