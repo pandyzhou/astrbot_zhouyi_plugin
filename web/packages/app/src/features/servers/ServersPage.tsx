@@ -143,7 +143,6 @@ export function ServersPage() {
         <div>
           <p className="eyebrow">Server Workshop</p>
           <h1>服务器工坊</h1>
-          <p>管理当前 group_id 保存的服务器，并按需查询临时在线状态。</p>
         </div>
         <div className="page-actions">
           <button className="wf-button" type="button" disabled={Boolean(busyKey)} onClick={() => { setEditingServer(null); setFormMode('add'); }}>

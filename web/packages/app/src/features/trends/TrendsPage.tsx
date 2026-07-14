@@ -80,7 +80,6 @@ export function TrendsPage() {
         <div>
           <p className="eyebrow">Hourly Trends</p>
           <h1>在线趋势</h1>
-          <p>按当前 group_id 查看单台或全部服务器各自的整点在线人数采样。</p>
         </div>
       </header>
 

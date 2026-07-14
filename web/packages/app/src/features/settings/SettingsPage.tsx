@@ -422,7 +422,6 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
         <div>
           <p className="eyebrow">Runtime Settings</p>
           <h1>运行配置</h1>
-          <p>管理插件核心运行参数；群组范围可逐字段继承全局配置。</p>
         </div>
         <div className="page-actions settings-scope" role="group" aria-label="配置范围">
           <button className="wf-button" type="button" aria-pressed={scope === 'global'} disabled={saving || loading || Boolean(loadError) || !currentGroupLoaded} onClick={() => switchScope('global')}>全局</button>

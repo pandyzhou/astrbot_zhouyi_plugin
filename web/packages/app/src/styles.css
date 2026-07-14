@@ -24,12 +24,6 @@
   letter-spacing: -0.045em;
 }
 
-.page-heading p:not(.eyebrow) {
-  max-width: 68ch;
-  margin-bottom: 0;
-  color: var(--wf-muted);
-}
-
 .eyebrow {
   margin-bottom: 5px;
   color: var(--wf-accent);

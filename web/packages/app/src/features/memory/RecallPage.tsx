@@ -54,7 +54,7 @@ export function RecallPage() {
 
   return (
     <div className="page-stack">
-      <header className="page-heading"><div><p className="eyebrow">HYBRID RETRIEVAL</p><h1>{t('recall')}</h1><p>{t('keyboardHint')}</p></div></header>
+      <header className="page-heading"><div><p className="eyebrow">HYBRID RETRIEVAL</p><h1>{t('recall')}</h1></div></header>
       <WorkshopPanel title={t('query')}>
         <form className="recall-form" onSubmit={(event) => { event.preventDefault(); void run(); }}>
           <label className="wf-label recall-query">{t('query')}<textarea className="wf-input" rows={4} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); void run(); } }} /></label>

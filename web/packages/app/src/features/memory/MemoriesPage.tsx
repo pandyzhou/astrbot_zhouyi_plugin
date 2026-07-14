@@ -124,7 +124,7 @@ export function MemoriesPage() {
   return (
     <div className="page-stack">
       <header className="page-heading">
-        <div><p className="eyebrow">MEMORY INDEX</p><h1>{t('memories')}</h1><p>{data?.total ?? 0} {t('records')}</p></div>
+        <div><p className="eyebrow">MEMORY INDEX</p><h1>{t('memories')}</h1></div>
         <button className="wf-button" type="button" disabled={loading} onClick={() => void load()}>{t('refresh')}</button>
       </header>
       <WorkshopPanel title={t('filters')}>

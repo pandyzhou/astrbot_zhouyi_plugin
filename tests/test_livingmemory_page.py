@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -33,6 +34,27 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("standalone", app)
         for name in ("OverviewPage.tsx", "MemoriesPage.tsx", "RecallPage.tsx", "GraphPage.tsx"):
             self.assertTrue((APP_ROOT / "src" / "features" / "memory" / name).is_file())
+
+    def test_page_headings_do_not_include_subtitles_after_h1(self):
+        page_sources = [
+            path
+            for path in (APP_ROOT / "src").rglob("*.tsx")
+            if "page-heading" in path.read_text(encoding="utf-8")
+        ]
+        self.assertTrue(page_sources)
+
+        heading_pattern = re.compile(
+            r'<header\b[^>]*className=["\']page-heading["\'][^>]*>(.*?)</header>',
+            re.DOTALL,
+        )
+        subtitle_pattern = re.compile(r"</h1>\s*<p\b")
+        for path in page_sources:
+            source = path.read_text(encoding="utf-8")
+            headings = heading_pattern.findall(source)
+            with self.subTest(page=path.relative_to(APP_ROOT)):
+                self.assertTrue(headings)
+                for heading in headings:
+                    self.assertIsNone(subtitle_pattern.search(heading))
 
     def test_api_client_uses_v1_namespaces(self):
         client = (APP_ROOT / "src" / "api" / "client.ts").read_text(encoding="utf-8")
