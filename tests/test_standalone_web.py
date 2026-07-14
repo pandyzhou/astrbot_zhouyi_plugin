@@ -275,13 +275,176 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["data"]["code"], "AUTH_REQUIRED")
         self.assertNotIn("detail", payload)
 
-    async def test_memory_api_is_not_exposed_by_standalone(self):
-        _, client = await self._start_service()
-        response = await client.get(
-            f"{PUBLIC_API_PREFIX}/v1/memory/stats",
-            headers={"Cookie": "astrbot_dashboard_jwt=token"},
+    async def test_source_update_routes_proxy_to_upstream(self):
+        seen: list[tuple[str, str, str, object | None]] = []
+
+        async def upstream_handler(request: web.Request) -> web.Response:
+            body = await request.json() if request.method == "POST" else None
+            seen.append((request.method, request.path, request.query_string, body))
+            return web.json_response({"ok": True})
+
+        upstream = await self._start_upstream(upstream_handler)
+        _, client = await self._start_service(upstream_base_url=str(upstream.make_url("/")))
+        cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
+        post_headers = {
+            **cookie,
+            "Origin": "https://standalone.example:35020",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
+        get_response = await client.get(
+            f"{PUBLIC_API_PREFIX}/v1/sources/updates?channel=stable",
+            headers=cookie,
         )
-        self.assertEqual(response.status, 404)
+        refresh_response = await client.post(
+            f"{PUBLIC_API_PREFIX}/v1/sources/updates/refresh",
+            json={"force": True},
+            headers=post_headers,
+        )
+
+        self.assertEqual([get_response.status, refresh_response.status], [200, 200])
+        self.assertEqual(
+            seen,
+            [
+                (
+                    "GET",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/v1/sources/updates",
+                    "channel=stable",
+                    None,
+                ),
+                (
+                    "POST",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/v1/sources/updates/refresh",
+                    "",
+                    {"force": True},
+                ),
+            ],
+        )
+
+    async def test_source_refresh_preserves_post_security_boundaries(self):
+        upstream_calls = 0
+
+        async def upstream_handler(request: web.Request) -> web.Response:
+            nonlocal upstream_calls
+            upstream_calls += 1
+            return web.json_response({"ok": True})
+
+        upstream = await self._start_upstream(upstream_handler)
+        _, client = await self._start_service(upstream_base_url=str(upstream.make_url("/")))
+        refresh_path = f"{PUBLIC_API_PREFIX}/v1/sources/updates/refresh"
+        cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
+        valid_origin = "https://standalone.example:35020"
+
+        missing_cookie = await client.post(
+            refresh_path,
+            json={},
+            headers={"Origin": valid_origin, "Sec-Fetch-Site": "same-origin"},
+        )
+        missing_origin = await client.post(
+            refresh_path,
+            json={},
+            headers={**cookie, "Sec-Fetch-Site": "same-origin"},
+        )
+        wrong_origin = await client.post(
+            refresh_path,
+            json={},
+            headers={
+                **cookie,
+                "Origin": "https://evil.example",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        cross_site = await client.post(
+            refresh_path,
+            json={},
+            headers={
+                **cookie,
+                "Origin": valid_origin,
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+        non_json = await client.post(
+            refresh_path,
+            data="{}",
+            headers={
+                **cookie,
+                "Origin": valid_origin,
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "text/plain",
+            },
+        )
+        oversized = await client.post(
+            refresh_path,
+            data=b"x" * (standalone_web_module.MAX_REQUEST_BODY + 1),
+            headers={
+                **cookie,
+                "Origin": valid_origin,
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "application/json",
+            },
+        )
+
+        responses = [
+            missing_cookie,
+            missing_origin,
+            wrong_origin,
+            cross_site,
+            non_json,
+            oversized,
+        ]
+        self.assertEqual(
+            [response.status for response in responses],
+            [401, 403, 403, 403, 415, 413],
+        )
+        self.assertEqual(
+            [(await response.json())["data"]["code"] for response in responses],
+            [
+                "AUTH_REQUIRED",
+                "ORIGIN_FORBIDDEN",
+                "ORIGIN_FORBIDDEN",
+                "FETCH_SITE_FORBIDDEN",
+                "INVALID_CONTENT_TYPE",
+                "REQUEST_TOO_LARGE",
+            ],
+        )
+        self.assertEqual(upstream_calls, 0)
+
+    async def test_memory_other_source_routes_and_wrong_methods_remain_closed(self):
+        _, client = await self._start_service()
+        cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
+        post_headers = {
+            **cookie,
+            "Origin": "https://standalone.example:35020",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
+        memory_response = await client.get(
+            f"{PUBLIC_API_PREFIX}/v1/memory/stats",
+            headers=cookie,
+        )
+        source_root_response = await client.get(
+            f"{PUBLIC_API_PREFIX}/v1/sources",
+            headers=cookie,
+        )
+        source_other_response = await client.get(
+            f"{PUBLIC_API_PREFIX}/v1/sources/updates/history",
+            headers=cookie,
+        )
+        wrong_get_response = await client.get(
+            f"{PUBLIC_API_PREFIX}/v1/sources/updates/refresh",
+            headers=cookie,
+        )
+        wrong_post_response = await client.post(
+            f"{PUBLIC_API_PREFIX}/v1/sources/updates",
+            json={},
+            headers=post_headers,
+        )
+
+        self.assertEqual(memory_response.status, 404)
+        self.assertEqual(source_root_response.status, 404)
+        self.assertEqual(source_other_response.status, 404)
+        self.assertEqual(wrong_get_response.status, 405)
+        self.assertEqual(wrong_post_response.status, 405)
 
     async def test_run_and_stop_are_idempotent(self):
         service = StandaloneWebService(

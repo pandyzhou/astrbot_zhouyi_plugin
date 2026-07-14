@@ -8,6 +8,7 @@ import type {
   SettingsMutationInput,
   SettingsPreviewData,
   SettingsSaveData,
+  SourceUpdatesData,
 } from './types';
 
 type Query = Record<string, string | number | boolean | undefined>;
@@ -57,6 +58,63 @@ let previewSequence = 0;
 const now = () => Math.floor(Date.now() / 1000);
 const bucketNow = () => Math.floor(now() / 3600) * 3600;
 const hoursAgo = (hours: number) => now() - hours * 3600;
+let sourceUpdatesCheckedAt = now() - 120;
+
+function sourceUpdatesData(force = false): SourceUpdatesData {
+  if (force) sourceUpdatesCheckedAt = now();
+  return {
+    checked_at: sourceUpdatesCheckedAt,
+    next_check_at: sourceUpdatesCheckedAt + 300,
+    refresh_allowed_at: force ? sourceUpdatesCheckedAt + 60 : sourceUpdatesCheckedAt,
+    rate_limit: { limit: 60, remaining: 54, reset_at: sourceUpdatesCheckedAt + 1800 },
+    sources: [
+      {
+        id: 'livingmemory',
+        display_name: 'LivingMemory',
+        role: '长期记忆来源，提供记忆存储、检索与图谱能力',
+        status: 'new_commits',
+        stale: false,
+        baseline: {
+          version: '2.3.6',
+          commit_sha: 'fdcdaa063c43dad29f176eeede9cb1c54e325470',
+          repository: 'lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory',
+          branch: 'master',
+        },
+        upstream: {
+          version: '2.3.6',
+          commit_sha: 'e2ac45d4bdb0',
+          committed_at: hoursAgo(5),
+          commit_title: '更新 LivingMemory 来源实现',
+          repository_url: 'https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory',
+          commit_url: 'https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/commit/e2ac45d4bdb0',
+        },
+        error: null,
+      },
+      {
+        id: 'mcgetter_enhanced',
+        display_name: 'MCGetter Enhanced',
+        role: 'Minecraft 来源，提供服务器查询、管理与趋势能力',
+        status: 'current',
+        stale: false,
+        baseline: {
+          version: 'v1.5.0',
+          commit_sha: '731cc450a44deed185c336fcabc5cd4fbd832f59',
+          repository: 'exynos967/astrbot_mcgetter_enhanced',
+          branch: 'main',
+        },
+        upstream: {
+          version: 'v1.5.0',
+          commit_sha: '731cc450a44deed185c336fcabc5cd4fbd832f59',
+          committed_at: hoursAgo(48),
+          commit_title: 'release: v1.5.0',
+          repository_url: 'https://github.com/exynos967/astrbot_mcgetter_enhanced',
+          commit_url: 'https://github.com/exynos967/astrbot_mcgetter_enhanced/commit/731cc450a44deed185c336fcabc5cd4fbd832f59',
+        },
+        error: null,
+      },
+    ],
+  };
+}
 
 const groups = ['10001', '10002'];
 const serverDb: Record<string, Record<string, SavedServer>> = {
@@ -307,7 +365,15 @@ export async function mockRequest<T>(
 ): Promise<ApiEnvelope<T>> {
   await wait(signal);
 
-  if (method === 'GET' && endpoint === '/page/bootstrap') {
+  if (method === 'GET' && endpoint === '/page/v1/sources/updates') {
+    return ok(sourceUpdatesData()) as ApiEnvelope<T>;
+  }
+
+  if (method === 'POST' && endpoint === '/page/v1/sources/updates/refresh') {
+    return ok(sourceUpdatesData(true)) as ApiEnvelope<T>;
+  }
+
+  if (method === 'GET' && (endpoint === '/page/bootstrap' || endpoint === '/page/v1/bootstrap')) {
     return ok({ groups: groups.map((id) => ({ id })), selected_group_id: groups[0] ?? null }) as ApiEnvelope<T>;
   }
 

@@ -24,6 +24,9 @@ import type {
   SettingsMutationInput,
   SettingsPreviewData,
   SettingsSaveData,
+  SourceUpdateItem,
+  SourceUpdateStatus,
+  SourceUpdatesData,
   TrendPoint,
   TrendsData,
   UpdateServerInput,
@@ -150,6 +153,84 @@ async function request<T>(endpoint: string, options: RequestOptions = {}): Promi
 
 function numberOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value ? value : null;
+}
+
+function timestampOrNull(value: unknown): number | null {
+  const numeric = numberOrNull(value);
+  if (numeric !== null) return numeric;
+  if (typeof value !== 'string') return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : null;
+}
+
+function objectOrEmpty(value: unknown): RawObject {
+  return value && typeof value === 'object' ? value as RawObject : {};
+}
+
+const sourceStatuses = new Set<SourceUpdateStatus>(['current', 'new_version', 'new_commits', 'changed', 'unavailable']);
+const sourceRoles: Record<string, string> = {
+  livingmemory: '提供长期记忆能力的上游来源',
+  mcgetter_enhanced: '提供 Minecraft 服务器查询能力的上游来源',
+};
+
+function repositoryUrl(repository: string): string | null {
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ? `https://github.com/${repository}` : null;
+}
+
+function normalizeSourceUpdateItem(value: unknown): SourceUpdateItem {
+  const raw = objectOrEmpty(value);
+  const baselineRaw = objectOrEmpty(raw.baseline);
+  const upstreamRaw = objectOrEmpty(raw.upstream);
+  const id = stringOrNull(raw.id) ?? '';
+  const repository = stringOrNull(baselineRaw.repository) ?? stringOrNull(raw.repository) ?? '';
+  const upstreamCommit = stringOrNull(upstreamRaw.commit_sha) ?? stringOrNull(raw.latest_commit);
+  const upstreamRepositoryUrl = stringOrNull(upstreamRaw.repository_url) ?? repositoryUrl(repository);
+  const status = stringOrNull(raw.status);
+
+  return {
+    id,
+    display_name: stringOrNull(raw.display_name) ?? stringOrNull(raw.name) ?? id,
+    role: stringOrNull(raw.role) ?? sourceRoles[id] ?? '监控固定上游来源的版本与提交变化',
+    status: status && sourceStatuses.has(status as SourceUpdateStatus) ? status as SourceUpdateStatus : 'unavailable',
+    stale: raw.stale === true,
+    baseline: {
+      version: stringOrNull(baselineRaw.version) ?? stringOrNull(raw.baseline_version),
+      commit_sha: stringOrNull(baselineRaw.commit_sha) ?? stringOrNull(raw.baseline_commit),
+      repository,
+      branch: stringOrNull(baselineRaw.branch) ?? stringOrNull(raw.branch) ?? '',
+    },
+    upstream: {
+      version: stringOrNull(upstreamRaw.version) ?? stringOrNull(raw.latest_version),
+      commit_sha: upstreamCommit,
+      committed_at: timestampOrNull(upstreamRaw.committed_at),
+      commit_title: stringOrNull(upstreamRaw.commit_title),
+      repository_url: upstreamRepositoryUrl,
+      commit_url: stringOrNull(upstreamRaw.commit_url)
+        ?? (upstreamRepositoryUrl && upstreamCommit ? `${upstreamRepositoryUrl}/commit/${upstreamCommit}` : null),
+    },
+    error: stringOrNull(raw.error),
+  };
+}
+
+function normalizeSourceUpdates(value: unknown): SourceUpdatesData {
+  const raw = objectOrEmpty(value);
+  const rateLimitRaw = objectOrEmpty(raw.rate_limit);
+  const hasRateLimit = raw.rate_limit !== null && typeof raw.rate_limit === 'object';
+  return {
+    checked_at: timestampOrNull(raw.checked_at),
+    next_check_at: timestampOrNull(raw.next_check_at),
+    refresh_allowed_at: timestampOrNull(raw.refresh_allowed_at),
+    rate_limit: hasRateLimit ? {
+      limit: numberOrNull(rateLimitRaw.limit),
+      remaining: numberOrNull(rateLimitRaw.remaining),
+      reset_at: timestampOrNull(rateLimitRaw.reset_at),
+    } : null,
+    sources: Array.isArray(raw.sources) ? raw.sources.map(normalizeSourceUpdateItem) : [],
+  };
 }
 
 function validateGroupResponse<T extends { group_id: string }>(value: T, expectedGroupId: string, label: string): T {
@@ -314,6 +395,17 @@ export const apiClient = {
       }),
     };
   },
+  sourceUpdates: async (signal?: AbortSignal): Promise<SourceUpdatesData> => normalizeSourceUpdates(
+    await request<unknown>('/page/v1/sources/updates', { signal }),
+  ),
+  refreshSourceUpdates: async (signal?: AbortSignal): Promise<SourceUpdatesData> => normalizeSourceUpdates(
+    await request<unknown>('/page/v1/sources/updates/refresh', {
+      method: 'POST',
+      body: { force: true },
+      signal,
+      mutationKey: 'source-updates:refresh',
+    }),
+  ),
   cleanup: async (groupId: string, execute: boolean, signal?: AbortSignal): Promise<CleanupData> => {
     if (!execute) {
       const raw = await request<RawCleanupPreviewData>('/page/v1/mc/cleanup', {

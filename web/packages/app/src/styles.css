@@ -1140,3 +1140,193 @@
   .retrieval-list li { grid-template-columns: auto minmax(0, 1fr); }
   .retrieval-list strong { grid-column: 2; }
 }
+
+/* Source update monitoring */
+.source-refresh-button,
+.source-link-actions .wf-button {
+  min-height: 44px;
+}
+
+.source-update-meta,
+.source-update-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.source-update-meta article {
+  display: grid;
+  min-width: 0;
+  align-content: center;
+  gap: 6px;
+  min-height: 104px;
+  padding: 16px;
+  border: 2px solid var(--wf-line);
+  border-radius: var(--wf-radius);
+  background: var(--wf-surface);
+  box-shadow: var(--wf-shadow);
+}
+
+.source-update-meta span,
+.source-role > span:first-child,
+.source-latest-commit > span {
+  color: var(--wf-muted);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .04em;
+}
+
+.source-update-meta strong,
+.source-update-meta small {
+  overflow-wrap: anywhere;
+}
+
+.source-update-meta strong {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 15px;
+}
+
+.source-update-meta small {
+  color: var(--wf-muted);
+}
+
+.source-update-card {
+  min-width: 0;
+}
+
+.source-role {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid var(--wf-line);
+}
+
+.source-role strong {
+  min-width: 0;
+  flex: 1 1 180px;
+  overflow-wrap: anywhere;
+}
+
+.source-status-chip,
+.source-stale-chip {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  padding: 3px 9px;
+  border: 2px solid var(--wf-line);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.source-status-chip--current { border-color: var(--wf-accent); color: var(--wf-accent); }
+.source-status-chip--new-version { border-color: var(--wf-focus); color: var(--wf-focus); }
+.source-status-chip--new-commits { border-color: var(--wf-dirt); color: var(--wf-text); }
+.source-status-chip--changed,
+.source-status-chip--unavailable { border-color: var(--wf-danger); color: var(--wf-danger); }
+.source-stale-chip { border-style: dashed; color: var(--wf-muted); }
+
+.source-version-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.source-version-grid > section {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 10px;
+  padding: 13px;
+  border: 2px solid var(--wf-line);
+  background: var(--wf-raised);
+}
+
+.source-version-grid h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.source-version-grid dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.source-version-grid dl > div {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(82px, auto) minmax(0, 1fr);
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--wf-line);
+}
+
+.source-version-grid dt {
+  color: var(--wf-muted);
+  font-size: 12px;
+}
+
+.source-version-grid dd {
+  min-width: 0;
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.source-version-grid code {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.source-latest-commit {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  padding: 10px;
+  background: var(--wf-surface);
+}
+
+.source-latest-commit strong,
+.source-latest-commit time {
+  overflow-wrap: anywhere;
+}
+
+.source-latest-commit time {
+  color: var(--wf-muted);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+}
+
+.source-error {
+  margin-top: 12px;
+}
+
+.source-link-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+@media (max-width: 900px) {
+  .source-update-grid,
+  .source-version-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .source-update-meta {
+    grid-template-columns: 1fr;
+  }
+
+  .source-link-actions .wf-button {
+    width: 100%;
+  }
+}

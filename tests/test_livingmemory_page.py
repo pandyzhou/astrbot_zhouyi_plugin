@@ -72,6 +72,8 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("useSyncExternalStore", hook)
         for key_factory in ("mcServers", "mcSettings", "mcTrends", "memoryList", "memoryGraphOverview"):
             self.assertIn(f"function {key_factory}", keys)
+        self.assertIn("SOURCE_UPDATES_QUERY_PREFIX", keys)
+        self.assertIn("sourceUpdates", keys)
 
         pages = {
             name: (APP_ROOT / "src" / relative).read_text(encoding="utf-8")
@@ -83,9 +85,10 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
                 "memories": "features/memory/MemoriesPage.tsx",
                 "graph": "features/memory/GraphPage.tsx",
                 "recall": "features/memory/RecallPage.tsx",
+                "source_updates": "features/sources/SourceUpdatesPage.tsx",
             }.items()
         }
-        for name in ("servers", "trends", "settings", "overview", "memories", "graph"):
+        for name in ("servers", "trends", "settings", "overview", "memories", "graph", "source_updates"):
             self.assertIn("useCachedQuery", pages[name], name)
         self.assertNotIn("useCachedQuery", pages["recall"])
         self.assertNotIn("setData(null)", pages["servers"])
@@ -93,6 +96,70 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("if (!cachedData || dirty || saving || pendingPreview) return", pages["settings"])
         self.assertIn("MEMORY_LIST_QUERY_PREFIX", pages["memories"])
         self.assertIn("MEMORY_GRAPH_QUERY_PREFIX", pages["memories"])
+
+    def test_source_updates_page_contracts(self):
+        source_page_path = APP_ROOT / "src" / "features" / "sources" / "SourceUpdatesPage.tsx"
+        self.assertTrue(source_page_path.is_file())
+
+        source_page = source_page_path.read_text(encoding="utf-8")
+        app = (APP_ROOT / "src" / "App.tsx").read_text(encoding="utf-8")
+        client = (APP_ROOT / "src" / "api" / "client.ts").read_text(encoding="utf-8")
+        mock_client = (APP_ROOT / "src" / "api" / "mockClient.ts").read_text(encoding="utf-8")
+        styles = (APP_ROOT / "src" / "styles.css").read_text(encoding="utf-8")
+        all_frontend_source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (APP_ROOT / "src").rglob("*")
+            if path.suffix in {".ts", ".tsx"}
+        )
+
+        self.assertIn('<NavLink to="/sources/updates">', app)
+        self.assertNotIn('!standalone ? <NavLink to="/sources/updates">', app)
+        self.assertIn('<Route path="/sources/updates" element={<SourceUpdatesPage />} />', app)
+        self.assertNotIn('!standalone ? <Route path="/sources/updates"', app)
+        self.assertIn("const standalone = !window.AstrBotPluginPage; const memoryAvailable = !standalone && Boolean(bootstrap?.capabilities.memory.available)", app)
+        self.assertIn('{memoryAvailable ? <><NavLink to="/memory/overview">', app)
+        self.assertIn('{memoryAvailable ? <><Route path="/memory/overview"', app)
+        self.assertIn("const defaultPath = memoryAvailable ? '/memory/overview' : '/mc/servers';", app)
+
+        self.assertIn("<h1>{t('sourceUpdates')}</h1>", source_page)
+        self.assertIsNone(re.search(r"<h1>.*?</h1>\s*<p\b", source_page, re.DOTALL))
+        self.assertNotIn("description=", source_page)
+
+        self.assertIn("useCachedQuery<SourceUpdatesData>", source_page)
+        self.assertIn("const SOURCE_UPDATES_TTL = 300_000", source_page)
+        self.assertIn("{ ttl: SOURCE_UPDATES_TTL }", source_page)
+        self.assertIn("sourceUpdatesQuery.setData(result)", source_page)
+        self.assertNotIn("setData(null)", source_page)
+        self.assertNotIn("setData(undefined)", source_page)
+        self.assertIn("sourceUpdates: async (signal?: AbortSignal)", client)
+        self.assertIn("refreshSourceUpdates: async (signal?: AbortSignal)", client)
+        self.assertIn("normalizeSourceUpdates", client)
+        self.assertIn("timestampOrNull", client)
+        self.assertIn("raw.baseline_version", client)
+        self.assertIn("raw.latest_commit", client)
+        self.assertIn("'/page/v1/sources/updates'", client)
+        self.assertIn("'/page/v1/sources/updates/refresh'", client)
+        self.assertIn("method: 'POST'", client)
+        self.assertIn("body: { force: true }", client)
+        self.assertIn("/page/v1/bootstrap", mock_client)
+        self.assertIn("/page/v1/sources/updates", mock_client)
+        self.assertNotIn("api.github.com", all_frontend_source)
+
+        for status in ("current", "new_version", "new_commits", "changed", "unavailable"):
+            self.assertIn(f"{status}:", source_page)
+        self.assertIn("source-status-chip", source_page)
+        self.assertNotIn("StatusBadge", source_page)
+        self.assertIn("safeExternalUrl", source_page)
+        self.assertIn("url.protocol === 'https:'", source_page)
+        self.assertIn('target="_blank"', source_page)
+        self.assertIn('rel="noopener noreferrer"', source_page)
+
+        self.assertIn(".source-refresh-button", styles)
+        self.assertIn("min-height: 44px", styles)
+        self.assertIn(".source-update-grid", styles)
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", styles)
+        self.assertIn("@media (max-width: 900px)", styles)
+        self.assertIn("grid-template-columns: 1fr", styles)
 
     def test_api_client_uses_v1_namespaces(self):
         client = (APP_ROOT / "src" / "api" / "client.ts").read_text(encoding="utf-8")

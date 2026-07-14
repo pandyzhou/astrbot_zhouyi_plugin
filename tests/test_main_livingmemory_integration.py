@@ -365,7 +365,7 @@ class MainMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             plugin = MyPlugin(
                 context, config={"memory": {"enabled": True}}
             )
-            self.assertEqual(len(context.registered_web_apis), 45)
+            self.assertEqual(len(context.registered_web_apis), 47)
             self.assertIsNone(plugin.runtime.memory)
             self.assertIsNotNone(plugin.runtime.standalone_task)
             self.assertIsNotNone(plugin.runtime.trend_task)

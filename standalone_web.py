@@ -31,6 +31,8 @@ _ALLOWED_API_ROUTES = (
     ("GET", "/v1/mc/trends"),
     ("GET", "/v1/mc/cleanup"),
     ("POST", "/v1/mc/cleanup"),
+    ("GET", "/v1/sources/updates"),
+    ("POST", "/v1/sources/updates/refresh"),
 )
 _HASHED_ASSET_RE = re.compile(r"-[A-Za-z0-9_]+(?:\.[A-Za-z0-9]+)$")
 _SECURITY_HEADERS = {
@@ -82,7 +84,7 @@ async def _security_middleware(
 
 
 class StandaloneWebService:
-    """为 Zhouyi Dashboard 提供独立 HTTPS 服务，仅转发 MC API。"""
+    """为 Zhouyi Dashboard 提供独立 HTTPS 服务，仅转发 MC 与来源更新 API。"""
 
     def __init__(
         self,

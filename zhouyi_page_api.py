@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 from astrbot.api import logger
 from astrbot.api.web import error_response, json_response
 
+from .source_update_monitor import SourceUpdateMonitor, get_source_update_monitor
 from .web_api import (
     MC_ROUTE_DESCRIPTORS,
     PAGE_API_PREFIX,
@@ -17,6 +18,7 @@ from .web_api import (
 PAGE_V1_PREFIX = f"{PAGE_API_PREFIX}/v1"
 MC_V1_PREFIX = f"{PAGE_V1_PREFIX}/mc"
 MEMORY_V1_PREFIX = f"{PAGE_V1_PREFIX}/memory"
+SOURCES_V1_PREFIX = f"{PAGE_V1_PREFIX}/sources"
 
 MemoryHandler = Callable[[], Awaitable[Any]]
 
@@ -38,10 +40,16 @@ MEMORY_ROUTE_DESCRIPTORS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
 class ZhouyiDashboardApi:
     """Zhouyi Dashboard 的统一 Page API facade。"""
 
-    def __init__(self, plugin: Any, memory_service: Any) -> None:
+    def __init__(
+        self,
+        plugin: Any,
+        memory_service: Any,
+        source_update_monitor: SourceUpdateMonitor | None = None,
+    ) -> None:
         self.plugin = plugin
         self.memory_service = memory_service
         self.mc_api = McManagerWebApi(plugin)
+        self.source_update_monitor = source_update_monitor or get_source_update_monitor()
         self._memory_route_handlers: dict[str, MemoryHandler] = {}
         self._memory_components: dict[str, Any] = {}
         if memory_service is not None:
@@ -101,6 +109,43 @@ class ZhouyiDashboardApi:
             )
             register(f"{MEMORY_V1_PREFIX}{suffix}", handler, list(methods), description)
             register(f"{PAGE_API_PREFIX}{suffix}", handler, list(methods), f"Legacy {description}")
+
+        register(
+            f"{SOURCES_V1_PREFIX}/updates",
+            self.get_source_updates,
+            ["GET"],
+            "Zhouyi Dashboard source updates",
+        )
+        register(
+            f"{SOURCES_V1_PREFIX}/updates/refresh",
+            self.refresh_source_updates,
+            ["POST"],
+            "Zhouyi Dashboard source updates refresh",
+        )
+
+    async def get_source_updates(self):
+        try:
+            payload = await self.source_update_monitor.get_updates()
+            return json_response({"status": "ok", "data": payload})
+        except Exception as exc:
+            logger.error("读取来源更新状态失败", exc_info=True)
+            return error_response(
+                "来源更新状态当前不可用",
+                status_code=503,
+                data={"code": "SOURCE_UPDATES_UNAVAILABLE", "detail": str(exc)},
+            )
+
+    async def refresh_source_updates(self):
+        try:
+            payload = await self.source_update_monitor.refresh()
+            return json_response({"status": "ok", "data": payload})
+        except Exception as exc:
+            logger.error("刷新来源更新状态失败", exc_info=True)
+            return error_response(
+                "来源更新状态刷新失败",
+                status_code=503,
+                data={"code": "SOURCE_UPDATES_REFRESH_FAILED", "detail": str(exc)},
+            )
 
     async def bootstrap(self):
         groups: list[dict[str, str]] = []

@@ -336,3 +336,46 @@ export interface SettingsSaveData {
     deleted_points: number;
   };
 }
+
+export type SourceUpdateStatus = 'current' | 'new_version' | 'new_commits' | 'changed' | 'unavailable';
+
+export interface SourceUpdateBaseline {
+  version: string | null;
+  commit_sha: string | null;
+  repository: string;
+  branch: string;
+}
+
+export interface SourceUpdateUpstream {
+  version: string | null;
+  commit_sha: string | null;
+  committed_at: UnixTimestamp | null;
+  commit_title: string | null;
+  repository_url: string | null;
+  commit_url: string | null;
+}
+
+export interface SourceUpdateItem {
+  id: string;
+  display_name: string;
+  role: string;
+  status: SourceUpdateStatus;
+  stale: boolean;
+  baseline: SourceUpdateBaseline;
+  upstream: SourceUpdateUpstream;
+  error: string | null;
+}
+
+export interface SourceUpdateRateLimit {
+  limit: number | null;
+  remaining: number | null;
+  reset_at: UnixTimestamp | null;
+}
+
+export interface SourceUpdatesData {
+  checked_at: UnixTimestamp | null;
+  next_check_at: UnixTimestamp | null;
+  refresh_allowed_at: UnixTimestamp | null;
+  rate_limit: SourceUpdateRateLimit | null;
+  sources: SourceUpdateItem[];
+}
