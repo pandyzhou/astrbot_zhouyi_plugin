@@ -79,6 +79,7 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
             self.assertIn(f"key: '{key}'", settings)
         self.assertIn("useState<SettingsSectionKey>('trend')", settings)
         self.assertIn("key={section.key}", settings)
+        self.assertIsNone(re.search(r"<WorkshopPanel\b[^>]*\bdescription=", settings, re.DOTALL))
         for class_name in (
             "settings-layout",
             "category-panel",

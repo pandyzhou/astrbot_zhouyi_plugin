@@ -45,31 +45,26 @@ type SettingsSectionKey = 'trend' | 'query' | 'cleanup' | 'experience';
 const sections: Array<{
   key: SettingsSectionKey;
   title: string;
-  description: string;
   fields: RuntimeSettingKey[];
 }> = [
   {
     key: 'trend',
     title: '趋势数据',
-    description: '控制整点采样、单服务器历史上限和趋势页默认查询范围。',
     fields: ['trend_sampling_enabled', 'max_history_points', 'default_trend_hours'],
   },
   {
     key: 'query',
     title: '查询行为',
-    description: '控制地址解析、状态查询超时和全局并发量。',
     fields: ['mc_lookup_timeout_seconds', 'mc_status_timeout_seconds', 'max_concurrent_queries'],
   },
   {
     key: 'cleanup',
     title: '自动清理',
-    description: '控制长期无成功记录服务器的候选判定；配置变化本身不会立即执行删除。',
     fields: ['auto_cleanup_enabled', 'auto_cleanup_days'],
   },
   {
     key: 'experience',
     title: '页面体验',
-    description: '控制进入服务器页时是否执行一次全量状态刷新。',
     fields: ['auto_refresh_on_page_open'],
   },
 ];
@@ -446,7 +441,7 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
       {!loading && !loadError && currentGroupLoaded && draft && data ? (
         <div className="settings-layout">
           <aside className="category-panel">
-            <WorkshopPanel title="配置分类" description="选择要编辑的运行参数分组。">
+            <WorkshopPanel title="配置分类">
               <nav className="category-nav" aria-label="运行配置分类">
                 {sections.map((section) => (
                   <button
@@ -468,14 +463,13 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
             <WorkshopPanel
               key={currentSection.key}
               title={currentSection.title}
-              description={currentSection.description}
             >
               <div className="settings-fields">{currentSection.fields.map(renderField)}</div>
             </WorkshopPanel>
           </main>
 
           <aside className="summary-panel">
-            <WorkshopPanel title="配置摘要" description="确认当前范围、校验状态并保存更改。">
+            <WorkshopPanel title="配置摘要">
               <dl className="summary-list">
                 <div><dt>目标</dt><dd>{scope === 'global' ? '全局默认值（全部群组）' : `群组 ${groupId}`}</dd></div>
                 <div><dt>当前分类</dt><dd>{currentSection.title}</dd></div>
