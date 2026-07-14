@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ConfirmDialog, DataState, SwitchField, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
 import { ApiClientError, apiClient } from '../../api/client';
 import type {
@@ -40,27 +40,34 @@ const fallbackConstraints: Partial<Record<RuntimeSettingKey, SettingConstraint>>
   max_concurrent_queries: { min: 1, max: 20, step: 1, unit: '个' },
 };
 
+type SettingsSectionKey = 'trend' | 'query' | 'cleanup' | 'experience';
+
 const sections: Array<{
+  key: SettingsSectionKey;
   title: string;
   description: string;
   fields: RuntimeSettingKey[];
 }> = [
   {
+    key: 'trend',
     title: '趋势数据',
     description: '控制整点采样、单服务器历史上限和趋势页默认查询范围。',
     fields: ['trend_sampling_enabled', 'max_history_points', 'default_trend_hours'],
   },
   {
+    key: 'query',
     title: '查询行为',
     description: '控制地址解析、状态查询超时和全局并发量。',
     fields: ['mc_lookup_timeout_seconds', 'mc_status_timeout_seconds', 'max_concurrent_queries'],
   },
   {
+    key: 'cleanup',
     title: '自动清理',
     description: '控制长期无成功记录服务器的候选判定；配置变化本身不会立即执行删除。',
     fields: ['auto_cleanup_enabled', 'auto_cleanup_days'],
   },
   {
+    key: 'experience',
     title: '页面体验',
     description: '控制进入服务器页时是否执行一次全量状态刷新。',
     fields: ['auto_refresh_on_page_open'],
@@ -87,14 +94,23 @@ function inheritedKeys(data: SettingsData) {
   return new Set<GroupRuntimeSettingKey>(groupKeys.filter((key) => data.group_overrides[key] === undefined));
 }
 
-export function SettingsPage() {
+interface SettingsPageProps {
+  onNavigationLockChange?: (locked: boolean) => void;
+}
+
+export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
   const groupId = useWorkshopStore((state) => state.selectedGroupId);
+  const groupIdRef = useRef(groupId);
+  const scopeRef = useRef<SettingsScope>('global');
+  groupIdRef.current = groupId;
   const [scope, setScope] = useState<SettingsScope>('global');
+  const [activeSection, setActiveSection] = useState<SettingsSectionKey>('trend');
   const [data, setData] = useState<SettingsData | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [inherited, setInherited] = useState<Set<GroupRuntimeSettingKey>>(new Set());
   const [initialSignature, setInitialSignature] = useState('');
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [feedback, setFeedback] = useState('');
@@ -109,29 +125,64 @@ export function SettingsPage() {
     setInitialSignature(JSON.stringify({ draft: nextDraft, inherited: [...nextInherited].sort() }));
   }, []);
 
-  const load = useCallback(async (nextScope: SettingsScope, signal?: AbortSignal) => {
+  const load = useCallback(async (
+    nextScope: SettingsScope,
+    signal?: AbortSignal,
+    requestedGroupId = groupIdRef.current,
+  ): Promise<boolean> => {
     setLoading(true);
-    setError('');
+    setLoadError('');
     try {
-      const loaded = await apiClient.settings(groupId, signal);
+      const loaded = await apiClient.settings(requestedGroupId, signal);
+      if (signal?.aborted || groupIdRef.current !== requestedGroupId) return false;
+      if (loaded.group_id !== requestedGroupId) {
+        setLoadError('读取到的配置不属于当前群组，请重新加载。');
+        return false;
+      }
       applyLoadedData(loaded, nextScope);
+      return true;
+    } catch (reason) {
+      if ((reason as Error).name === 'AbortError' || groupIdRef.current !== requestedGroupId) return false;
+      setLoadError((reason as Error).message || '读取运行配置失败');
+      return false;
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (!signal?.aborted && groupIdRef.current === requestedGroupId) setLoading(false);
     }
-  }, [applyLoadedData, groupId]);
+  }, [applyLoadedData]);
 
   useEffect(() => {
     const controller = new AbortController();
     setFeedback('');
     setPendingPreview(null);
-    void load(scope, controller.signal).catch((reason: unknown) => {
-      if ((reason as Error).name !== 'AbortError') setError((reason as Error).message || '读取运行配置失败');
-    });
+    void load(scopeRef.current, controller.signal, groupId);
     return () => controller.abort();
-  }, [groupId, load, scope]);
+  }, [groupId, load]);
 
-  const currentSignature = draft ? JSON.stringify({ draft, inherited: [...inherited].sort() }) : '';
-  const dirty = Boolean(draft && currentSignature !== initialSignature);
+  const changeCount = useMemo(() => {
+    if (!draft || !initialSignature) return 0;
+    try {
+      const initial = JSON.parse(initialSignature) as { draft: Draft; inherited: GroupRuntimeSettingKey[] };
+      const initialInherited = new Set(initial.inherited);
+      const keys = scope === 'global' ? (Object.keys(draft) as RuntimeSettingKey[]) : groupKeys;
+      return keys.reduce((count, key) => {
+        const valueChanged = String(draft[key]) !== String(initial.draft[key]);
+        const inheritanceChanged = scope === 'group'
+          && inherited.has(key as GroupRuntimeSettingKey) !== initialInherited.has(key as GroupRuntimeSettingKey);
+        return count + (valueChanged || inheritanceChanged ? 1 : 0);
+      }, 0);
+    } catch {
+      return 0;
+    }
+  }, [draft, inherited, initialSignature, scope]);
+  const dirty = changeCount > 0;
+
+  useEffect(() => {
+    onNavigationLockChange?.(dirty || saving);
+  }, [dirty, onNavigationLockChange, saving]);
+
+  useEffect(() => () => {
+    onNavigationLockChange?.(false);
+  }, [onNavigationLockChange]);
 
   const validationErrors = useMemo(() => {
     const errors: Partial<Record<RuntimeSettingKey, string>> = {};
@@ -164,6 +215,8 @@ export function SettingsPage() {
       setFeedback('');
       return;
     }
+    scopeRef.current = nextScope;
+    if (data?.group_id === groupId) applyLoadedData(data, nextScope);
     setScope(nextScope);
     setError('');
     setFeedback('');
@@ -213,12 +266,8 @@ export function SettingsPage() {
   async function handleContractError(reason: unknown, fallback: string) {
     const apiError = reason instanceof ApiClientError ? reason : null;
     if (apiError && ['SETTINGS_REVISION_CONFLICT', 'SETTINGS_PREVIEW_STALE'].includes(apiError.code)) {
-      try {
-        await load(scope);
-        setError(`${apiError.message}，已重新加载最新配置。`);
-      } catch (reloadReason) {
-        setError((reloadReason as Error).message || '配置已变化，重新加载失败');
-      }
+      const reloaded = await load(scopeRef.current);
+      setError(reloaded ? `${apiError.message}，已重新加载最新配置。` : apiError.message);
       return;
     }
     setError((reason as Error).message || fallback);
@@ -237,9 +286,12 @@ export function SettingsPage() {
         };
       }
       const result = await apiClient.saveSettings(input);
-      const loaded = await apiClient.settings(groupId);
-      applyLoadedData(loaded, scope);
+      const reloaded = await load(scopeRef.current);
       setPendingPreview(null);
+      if (!reloaded) {
+        setFeedback('配置已保存，但重新读取当前群组失败。');
+        return;
+      }
       setFeedback(result.history_trim.performed
         ? `配置已保存，并裁剪 ${result.history_trim.deleted_points.toLocaleString()} 个历史点。`
         : '运行配置已保存。');
@@ -273,36 +325,39 @@ export function SettingsPage() {
 
   function renderField(key: RuntimeSettingKey) {
     if (!draft || !data) return null;
-    if (scope === 'group' && key === 'max_concurrent_queries') return null;
     const copy = fieldCopy[key];
     const isBoolean = typeof data.effective[key] === 'boolean';
-    const canInherit = scope === 'group';
+    const globalOnly = scope === 'group' && key === 'max_concurrent_queries';
+    const canInherit = scope === 'group' && !globalOnly;
     const isInherited = canInherit && inherited.has(key as GroupRuntimeSettingKey);
     const constraint = data.constraints[key] ?? fallbackConstraints[key];
-    const effectiveValue = isInherited ? data.global[key] : draft[key];
+    const effectiveValue = globalOnly ? data.global.max_concurrent_queries : (isInherited ? data.global[key] : draft[key]);
     const helpId = `${key}-help`;
 
     return (
       <div className={`settings-field${isInherited ? ' settings-field--inherited' : ''}`} key={key}>
-        <div className="settings-field__inheritance">
-          {canInherit ? (
-            <button
-              className="wf-button wf-button--quiet settings-inherit-button"
-              type="button"
-              aria-pressed={isInherited}
-              disabled={saving}
-              onClick={() => setInherit(key as GroupRuntimeSettingKey, !isInherited)}
-            >
-              {isInherited ? '继承全局' : '群组覆盖'}
-            </button>
-          ) : <span className="settings-scope-badge">全局</span>}
+        <div className="settings-field__inheritance field__topline">
+          <code className="field__key">{key}</code>
+          <div className="field__action-slot">
+            {globalOnly ? <span className="settings-scope-badge">仅全局</span> : canInherit ? (
+              <button
+                className="wf-button wf-button--quiet settings-inherit-button"
+                type="button"
+                aria-pressed={isInherited}
+                disabled={saving}
+                onClick={() => setInherit(key as GroupRuntimeSettingKey, !isInherited)}
+              >
+                {isInherited ? '继承全局' : '群组覆盖'}
+              </button>
+            ) : <span className="settings-scope-badge">全局</span>}
+          </div>
         </div>
         {isBoolean ? (
           <SwitchField
             id={`setting-${key}`}
             label={copy.label}
             checked={Boolean(effectiveValue)}
-            disabled={saving || isInherited}
+            disabled={saving || isInherited || globalOnly}
             description={copy.help}
             onChange={(checked) => setValue(key, checked)}
           />
@@ -319,7 +374,7 @@ export function SettingsPage() {
                 max={constraint?.max}
                 step={constraint?.step ?? 1}
                 value={String(effectiveValue)}
-                disabled={saving || isInherited}
+                disabled={saving || isInherited || globalOnly}
                 aria-describedby={helpId}
                 aria-invalid={Boolean(validationErrors[key])}
                 onChange={(event) => setValue(key, event.target.value)}
@@ -338,9 +393,13 @@ export function SettingsPage() {
             {validationErrors[key] ? <span className="settings-field-error">{validationErrors[key]}</span> : null}
           </label>
         )}
-        {canInherit ? (
-          <p className="settings-effective">当前 effective：{String(isInherited ? data.global[key] : effectiveValue)}{isInherited ? '（来自全局）' : '（群组覆盖）'}</p>
-        ) : null}
+        <p className="settings-effective">
+          {globalOnly
+            ? `当前 effective：${String(data.global.max_concurrent_queries)}（仅全局）`
+            : scope === 'global'
+              ? `当前 effective：${String(effectiveValue)}（全局）`
+              : `当前 effective：${String(isInherited ? data.global[key] : effectiveValue)}${isInherited ? '（来自全局）' : '（群组覆盖）'}`}
+        </p>
       </div>
     );
   }
@@ -353,6 +412,9 @@ export function SettingsPage() {
       ? `清理判定天数降低后，候选数量将从 ${pendingPreview.cleanup_impact.current_candidate_count} 变为 ${pendingPreview.cleanup_impact.next_candidate_count}（新增 ${pendingPreview.cleanup_impact.new_candidate_count}）。这只是候选变化，保存配置不会立即删除服务器。`
       : '',
   ].filter(Boolean).join(' ') : '';
+  const currentSection = sections.find((section) => section.key === activeSection) ?? sections[0];
+  const currentGroupLoaded = data?.group_id === groupId;
+  const validationErrorCount = Object.keys(validationErrors).length;
 
   return (
     <div className="page-stack">
@@ -363,8 +425,8 @@ export function SettingsPage() {
           <p>管理插件核心运行参数；群组范围可逐字段继承全局配置。</p>
         </div>
         <div className="page-actions settings-scope" role="group" aria-label="配置范围">
-          <button className="wf-button" type="button" aria-pressed={scope === 'global'} disabled={saving} onClick={() => switchScope('global')}>全局</button>
-          <button className="wf-button" type="button" aria-pressed={scope === 'group'} disabled={saving} onClick={() => switchScope('group')}>当前群组</button>
+          <button className="wf-button" type="button" aria-pressed={scope === 'global'} disabled={saving || loading || Boolean(loadError) || !currentGroupLoaded} onClick={() => switchScope('global')}>全局</button>
+          <button className="wf-button" type="button" aria-pressed={scope === 'group'} disabled={saving || loading || Boolean(loadError) || !currentGroupLoaded} onClick={() => switchScope('group')}>当前群组</button>
         </div>
       </header>
 
@@ -373,28 +435,68 @@ export function SettingsPage() {
       {feedback ? <p className="inline-feedback" role="status">{feedback}</p> : null}
       {error ? <p className="inline-feedback inline-feedback--error" role="alert">{error}</p> : null}
       {loading ? <DataState state="loading" title="正在读取运行配置" /> : null}
+      {!loading && (loadError || !currentGroupLoaded) ? (
+        <DataState
+          state={loadError ? 'error' : 'empty'}
+          title={loadError ? '读取运行配置失败' : '暂无当前群组配置'}
+          message={loadError || `未读取到群组 ${groupId} 的运行配置。`}
+          action={<button className="wf-button" type="button" onClick={() => void load(scopeRef.current)}>重新加载</button>}
+        />
+      ) : null}
 
-      {!loading && draft && data ? (
-        <>
-          {sections.map((section) => {
-            const fields = section.fields.filter((key) => scope === 'global' || key !== 'max_concurrent_queries');
-            if (!fields.length) return null;
-            return (
-              <WorkshopPanel key={section.title} title={section.title} description={section.description}>
-                <div className="settings-grid">{fields.map(renderField)}</div>
-              </WorkshopPanel>
-            );
-          })}
-          <div className="settings-save-bar">
-            <span>{dirty ? '有未保存更改' : '所有更改已保存'}</span>
-            <div className="form-actions">
-              <button className="wf-button" type="button" disabled={!dirty || saving} onClick={cancelChanges}>取消更改</button>
-              <button className="wf-button wf-button--primary" type="button" disabled={!dirty || hasValidationError || saving} onClick={() => void previewAndSave()}>
-                {saving ? '保存中…' : '保存配置'}
-              </button>
-            </div>
-          </div>
-        </>
+      {!loading && !loadError && currentGroupLoaded && draft && data ? (
+        <div className="settings-layout">
+          <aside className="category-panel">
+            <WorkshopPanel title="配置分类" description="选择要编辑的运行参数分组。">
+              <nav className="category-nav" aria-label="运行配置分类">
+                {sections.map((section) => (
+                  <button
+                    className="wf-button wf-button--quiet category-nav__button"
+                    type="button"
+                    key={section.key}
+                    aria-current={activeSection === section.key ? 'page' : undefined}
+                    onClick={() => setActiveSection(section.key)}
+                  >
+                    <strong>{section.title}</strong>
+                    <span>{section.fields.length} 项配置</span>
+                  </button>
+                ))}
+              </nav>
+            </WorkshopPanel>
+          </aside>
+
+          <main className="main-panel">
+            <WorkshopPanel
+              key={currentSection.key}
+              title={currentSection.title}
+              description={currentSection.description}
+            >
+              <div className="settings-fields">{currentSection.fields.map(renderField)}</div>
+            </WorkshopPanel>
+          </main>
+
+          <aside className="summary-panel">
+            <WorkshopPanel title="配置摘要" description="确认当前范围、校验状态并保存更改。">
+              <dl className="summary-list">
+                <div><dt>目标</dt><dd>{scope === 'global' ? '全局默认值（全部群组）' : `群组 ${groupId}`}</dd></div>
+                <div><dt>当前分类</dt><dd>{currentSection.title}</dd></div>
+                <div><dt>继承状态</dt><dd>{scope === 'global' ? '9 项全局值' : `${inherited.size} 项继承 / ${groupKeys.length - inherited.size} 项覆盖`}</dd></div>
+                <div><dt>变更项数</dt><dd>{changeCount}</dd></div>
+                <div><dt>字段校验</dt><dd>{validationErrorCount ? `${validationErrorCount} 项待修正` : '已通过'}</dd></div>
+                <div><dt>保存状态</dt><dd className="save-state">{saving ? '保存中…' : dirty ? '待保存' : '已保存'}</dd></div>
+              </dl>
+              <p className="risk-copy">
+                保存前会先执行安全预览；降低历史上限可能裁剪旧趋势点，降低清理天数只会改变候选范围，不会立即删除服务器。
+              </p>
+              <div className="form-actions summary-actions">
+                <button className="wf-button" type="button" disabled={!dirty || saving} onClick={cancelChanges}>取消更改</button>
+                <button className="wf-button wf-button--primary" type="button" disabled={!dirty || hasValidationError || saving} onClick={() => void previewAndSave()}>
+                  {saving ? '保存中…' : '保存配置'}
+                </button>
+              </div>
+            </WorkshopPanel>
+          </aside>
+        </div>
       ) : null}
 
       <ConfirmDialog
