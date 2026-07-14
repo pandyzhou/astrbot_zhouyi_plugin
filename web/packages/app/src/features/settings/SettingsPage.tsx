@@ -80,7 +80,7 @@ const fieldCopy: Record<RuntimeSettingKey, { label: string; help: string }> = {
   auto_cleanup_enabled: { label: '启用自动清理', help: '允许后端按清理规则处理长期无成功记录的服务器。' },
   auto_cleanup_days: { label: '自动清理判定天数', help: '降低天数可能增加候选服务器，但保存配置本身不代表立即删除。' },
   auto_refresh_on_page_open: { label: '进入服务器页时自动刷新', help: '每次进入或切换群组后最多执行一次全量状态查询，不会周期刷新。' },
-  default_trend_hours: { label: '趋势页默认小时数', help: '进入趋势页或切换群组时使用，范围 1–168 小时。' },
+  default_trend_hours: { label: '趋势页默认小时数', help: '进入趋势页或切换群组时使用。' },
   mc_lookup_timeout_seconds: { label: 'Minecraft 地址解析超时', help: '用于域名与 SRV 等地址查找阶段。' },
   mc_status_timeout_seconds: { label: 'Minecraft 状态查询超时', help: '用于连接服务器并读取状态阶段。' },
   max_concurrent_queries: { label: '最大并发查询数', help: '仅全局配置，限制同时执行的 Minecraft 查询数量。' },
