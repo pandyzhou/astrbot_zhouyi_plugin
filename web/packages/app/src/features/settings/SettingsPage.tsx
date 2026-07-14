@@ -11,6 +11,9 @@ import type {
   SettingsPreviewData,
   SettingsScope,
 } from '../../api/types';
+import { queryCache } from '../../store/queryCacheCore';
+import { queryKeyPrefixes, queryKeys } from '../../store/queryKeys';
+import { useCachedQuery } from '../../store/useCachedQuery';
 import { useWorkshopStore } from '../../store/workshopStore';
 
 type Draft = { [Key in RuntimeSettingKey]: RuntimeSettings[Key] | string };
@@ -89,6 +92,15 @@ function inheritedKeys(data: SettingsData) {
   return new Set<GroupRuntimeSettingKey>(groupKeys.filter((key) => data.group_overrides[key] === undefined));
 }
 
+function validateGroup(value: SettingsData, groupId: string): SettingsData {
+  if (value.group_id !== groupId) throw new Error('读取到的配置不属于当前群组，请重新加载。');
+  return value;
+}
+
+function errorMessage(reason: unknown, fallback: string) {
+  return reason instanceof Error ? reason.message || fallback : reason ? fallback : '';
+}
+
 interface SettingsPageProps {
   onNavigationLockChange?: (locked: boolean) => void;
 }
@@ -98,18 +110,30 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
   const groupIdRef = useRef(groupId);
   const scopeRef = useRef<SettingsScope>('global');
   groupIdRef.current = groupId;
+
+  const settingsKey = queryKeys.mcSettings(groupId);
+  const initialCached = queryCache.peek<SettingsData>(settingsKey)?.data;
+  const initialData = initialCached?.group_id === groupId ? initialCached : null;
+  const initialDraft = initialData ? createDraft(initialData.global) : null;
   const [scope, setScope] = useState<SettingsScope>('global');
   const [activeSection, setActiveSection] = useState<SettingsSectionKey>('trend');
-  const [data, setData] = useState<SettingsData | null>(null);
-  const [draft, setDraft] = useState<Draft | null>(null);
+  const [data, setData] = useState<SettingsData | null>(initialData);
+  const [draft, setDraft] = useState<Draft | null>(initialDraft);
   const [inherited, setInherited] = useState<Set<GroupRuntimeSettingKey>>(new Set());
-  const [initialSignature, setInitialSignature] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState('');
+  const [initialSignature, setInitialSignature] = useState(initialDraft
+    ? JSON.stringify({ draft: initialDraft, inherited: [] })
+    : '');
+  const [reloading, setReloading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [feedback, setFeedback] = useState('');
   const [pendingPreview, setPendingPreview] = useState<SettingsPreviewData | null>(null);
+
+  const settingsQuery = useCachedQuery<SettingsData>(settingsKey, async () => (
+    validateGroup(await apiClient.settings(groupId), groupId)
+  ));
+  const cachedData = settingsQuery.data?.group_id === groupId ? settingsQuery.data : undefined;
+  const cacheError = errorMessage(settingsQuery.error, '读取运行配置失败');
 
   const applyLoadedData = useCallback((loaded: SettingsData, nextScope: SettingsScope) => {
     const nextDraft = createDraft(nextScope === 'global' ? loaded.global : loaded.effective);
@@ -122,36 +146,33 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
 
   const load = useCallback(async (
     nextScope: SettingsScope,
-    signal?: AbortSignal,
     requestedGroupId = groupIdRef.current,
   ): Promise<boolean> => {
-    setLoading(true);
-    setLoadError('');
+    setReloading(true);
     try {
-      const loaded = await apiClient.settings(requestedGroupId, signal);
-      if (signal?.aborted || groupIdRef.current !== requestedGroupId) return false;
-      if (loaded.group_id !== requestedGroupId) {
-        setLoadError('读取到的配置不属于当前群组，请重新加载。');
-        return false;
-      }
+      const loaded = await queryCache.revalidate(
+        queryKeys.mcSettings(requestedGroupId),
+        async () => validateGroup(await apiClient.settings(requestedGroupId), requestedGroupId),
+      );
+      if (groupIdRef.current !== requestedGroupId) return false;
       applyLoadedData(loaded, nextScope);
       return true;
-    } catch (reason) {
-      if ((reason as Error).name === 'AbortError' || groupIdRef.current !== requestedGroupId) return false;
-      setLoadError((reason as Error).message || '读取运行配置失败');
+    } catch {
       return false;
     } finally {
-      if (!signal?.aborted && groupIdRef.current === requestedGroupId) setLoading(false);
+      if (groupIdRef.current === requestedGroupId) setReloading(false);
     }
   }, [applyLoadedData]);
 
   useEffect(() => {
-    const controller = new AbortController();
     setFeedback('');
+    setError('');
     setPendingPreview(null);
-    void load(scopeRef.current, controller.signal, groupId);
-    return () => controller.abort();
-  }, [groupId, load]);
+    setData(null);
+    setDraft(null);
+    setInherited(new Set());
+    setInitialSignature('');
+  }, [groupId]);
 
   const changeCount = useMemo(() => {
     if (!draft || !initialSignature) return 0;
@@ -170,6 +191,11 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
     }
   }, [draft, inherited, initialSignature, scope]);
   const dirty = changeCount > 0;
+
+  useEffect(() => {
+    if (!cachedData || dirty || saving || pendingPreview) return;
+    applyLoadedData(cachedData, scopeRef.current);
+  }, [applyLoadedData, cachedData, dirty, pendingPreview, saving]);
 
   useEffect(() => {
     onNavigationLockChange?.(dirty || saving);
@@ -211,14 +237,16 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
       return;
     }
     scopeRef.current = nextScope;
-    if (data?.group_id === groupId) applyLoadedData(data, nextScope);
+    const latestSnapshot = cachedData ?? (data?.group_id === groupId ? data : undefined);
+    if (latestSnapshot) applyLoadedData(latestSnapshot, nextScope);
     setScope(nextScope);
     setError('');
     setFeedback('');
   }
 
   function cancelChanges() {
-    if (data) applyLoadedData(data, scope);
+    const latestSnapshot = cachedData ?? data;
+    if (latestSnapshot) applyLoadedData(latestSnapshot, scope);
     setError('');
     setFeedback('已取消未保存的更改。');
   }
@@ -281,6 +309,13 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
         };
       }
       const result = await apiClient.saveSettings(input);
+      if (input.scope === 'global') {
+        queryCache.invalidate(queryKeyPrefixes.mcSettings);
+        queryCache.invalidate(queryKeyPrefixes.mcTrends);
+      } else {
+        queryCache.invalidate(queryKeys.mcSettings(groupId));
+        queryCache.invalidate([...queryKeyPrefixes.mcTrends, groupId]);
+      }
       const reloaded = await load(scopeRef.current);
       setPendingPreview(null);
       if (!reloaded) {
@@ -409,6 +444,8 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
   ].filter(Boolean).join(' ') : '';
   const currentSection = sections.find((section) => section.key === activeSection) ?? sections[0];
   const currentGroupLoaded = data?.group_id === groupId;
+  const loading = !currentGroupLoaded && (settingsQuery.isInitialLoading || reloading);
+  const blockingLoadError = !currentGroupLoaded ? cacheError : '';
   const validationErrorCount = Object.keys(validationErrors).length;
 
   return (
@@ -419,8 +456,9 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
           <h1>运行配置</h1>
         </div>
         <div className="page-actions settings-scope" role="group" aria-label="配置范围">
-          <button className="wf-button" type="button" aria-pressed={scope === 'global'} disabled={saving || loading || Boolean(loadError) || !currentGroupLoaded} onClick={() => switchScope('global')}>全局</button>
-          <button className="wf-button" type="button" aria-pressed={scope === 'group'} disabled={saving || loading || Boolean(loadError) || !currentGroupLoaded} onClick={() => switchScope('group')}>当前群组</button>
+          <button className="wf-button" type="button" aria-pressed={scope === 'global'} disabled={saving || loading || !currentGroupLoaded} onClick={() => switchScope('global')}>全局</button>
+          <button className="wf-button" type="button" aria-pressed={scope === 'group'} disabled={saving || loading || !currentGroupLoaded} onClick={() => switchScope('group')}>当前群组</button>
+          <button className="wf-button" type="button" disabled={saving || reloading} onClick={() => void load(scopeRef.current)}>{reloading ? '重新加载中…' : '重新加载'}</button>
         </div>
       </header>
 
@@ -428,17 +466,18 @@ export function SettingsPage({ onNavigationLockChange }: SettingsPageProps) {
       <div className="wf-sr-only" aria-live="polite">{saving ? '正在保存运行配置' : feedback}</div>
       {feedback ? <p className="inline-feedback" role="status">{feedback}</p> : null}
       {error ? <p className="inline-feedback inline-feedback--error" role="alert">{error}</p> : null}
+      {currentGroupLoaded && cacheError ? <p className="inline-feedback inline-feedback--error" role="alert">{cacheError}</p> : null}
       {loading ? <DataState state="loading" title="正在读取运行配置" /> : null}
-      {!loading && (loadError || !currentGroupLoaded) ? (
+      {!loading && (blockingLoadError || !currentGroupLoaded) ? (
         <DataState
-          state={loadError ? 'error' : 'empty'}
-          title={loadError ? '读取运行配置失败' : '暂无当前群组配置'}
-          message={loadError || `未读取到群组 ${groupId} 的运行配置。`}
+          state={blockingLoadError ? 'error' : 'empty'}
+          title={blockingLoadError ? '读取运行配置失败' : '暂无当前群组配置'}
+          message={blockingLoadError || `未读取到群组 ${groupId} 的运行配置。`}
           action={<button className="wf-button" type="button" onClick={() => void load(scopeRef.current)}>重新加载</button>}
         />
       ) : null}
 
-      {!loading && !loadError && currentGroupLoaded && draft && data ? (
+      {!loading && currentGroupLoaded && draft && data ? (
         <div className="settings-layout">
           <aside className="category-panel">
             <WorkshopPanel title="配置分类">

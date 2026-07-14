@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ConfirmDialog, DataState, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
 import { memoryGet, memoryPost } from '../../api/client';
 import { useI18n } from '../../i18n';
+import { queryCache } from '../../store/queryCacheCore';
+import { MEMORY_GRAPH_QUERY_PREFIX, MEMORY_LIST_QUERY_PREFIX, queryKeys, type MemoryListQueryParams } from '../../store/queryKeys';
+import { useCachedQuery } from '../../store/useCachedQuery';
 import { displayImportance, formatMemoryTime, MemoryDetailDrawer } from './MemoryDetailDrawer';
 import type { MemoryDetail, MemoryItem, MemoryListData } from './types';
 
@@ -10,9 +13,12 @@ interface DeleteRequest {
   single?: MemoryDetail;
 }
 
+function errorMessage(reason: unknown) {
+  return reason instanceof Error ? reason.message : String(reason ?? '');
+}
+
 export function MemoriesPage() {
   const { t } = useI18n();
-  const [data, setData] = useState<MemoryListData | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [keyword, setKeyword] = useState('');
@@ -20,8 +26,6 @@ export function MemoriesPage() {
   const [status, setStatus] = useState('all');
   const [type, setType] = useState('all');
   const [sort, setSort] = useState('created_desc');
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [detail, setDetail] = useState<MemoryDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -30,33 +34,43 @@ export function MemoriesPage() {
   const [feedbackError, setFeedbackError] = useState(false);
   const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(null);
 
-  const load = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const next = await memoryGet<MemoryListData>('memories', {
-        page,
-        page_size: pageSize,
-        keyword: keyword || undefined,
-        session_id: session || undefined,
-        status,
-        type,
-        sort,
-      }, signal);
-      setData(next);
-      setSelected(new Set());
-    } catch (reason) {
-      if ((reason as Error).name !== 'AbortError') setError(reason as Error);
-    } finally {
-      if (!signal?.aborted) setLoading(false);
-    }
-  }, [keyword, page, pageSize, session, sort, status, type]);
+  const listParams = useMemo<MemoryListQueryParams>(() => ({
+    page,
+    page_size: pageSize,
+    keyword: keyword || undefined,
+    session_id: session || undefined,
+    status,
+    type,
+    sort,
+  }), [keyword, page, pageSize, session, sort, status, type]);
+  const listKey = useMemo(() => queryKeys.memoryList(listParams), [listParams]);
+  const listParamsRef = useRef(listParams);
+  const listKeyRef = useRef(listKey);
+  listParamsRef.current = listParams;
+  listKeyRef.current = listKey;
+
+  const listQuery = useCachedQuery<MemoryListData>(
+    listKey,
+    () => memoryGet<MemoryListData>('memories', listParams),
+  );
+  const data = listQuery.data ?? null;
+  const loading = listQuery.isInitialLoading;
+  const error = listQuery.error;
 
   useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+    setSelected(new Set());
+  }, [listKey]);
+
+  const refreshAfterMutation = useCallback(async () => {
+    queryCache.invalidate(MEMORY_LIST_QUERY_PREFIX);
+    queryCache.invalidate(queryKeys.memoryOverviewStats);
+    queryCache.invalidate(MEMORY_GRAPH_QUERY_PREFIX);
+    setSelected(new Set());
+    await queryCache.revalidate(
+      listKeyRef.current,
+      () => memoryGet<MemoryListData>('memories', listParamsRef.current),
+    ).catch(() => undefined);
+  }, []);
 
   const openDetail = async (item: Pick<MemoryItem, 'id'>) => {
     setDetail(null);
@@ -80,9 +94,9 @@ export function MemoriesPage() {
     setFeedback('');
     try {
       await memoryPost('memories/batch-update', { memory_ids: ids, field: 'status', value: 'archived' }, undefined, `memory-archive:${ids.join(',')}`);
+      await refreshAfterMutation();
       setFeedbackError(false);
       setFeedback(t('operationDone'));
-      await load();
     } catch (reason) {
       setFeedbackError(true);
       setFeedback((reason as Error).message);
@@ -97,10 +111,10 @@ export function MemoriesPage() {
     try {
       await memoryPost('memories/batch-delete', { memory_ids: request.ids }, undefined, `memory-delete:${request.ids.join(',')}`);
       if (detail && request.ids.includes(detail.memory_id)) setDetail(null);
+      await refreshAfterMutation();
       setFeedbackError(false);
       setFeedback(t('operationDone'));
       setDeleteRequest(null);
-      await load();
     } catch (reason) {
       setFeedbackError(true);
       setFeedback((reason as Error).message);
@@ -110,10 +124,13 @@ export function MemoriesPage() {
   };
 
   const reloadDetail = async (memoryId: number) => {
+    const [nextDetail] = await Promise.all([
+      memoryGet<MemoryDetail>('memories/detail', { memory_id: memoryId }),
+      refreshAfterMutation(),
+    ]);
+    setDetail(nextDetail);
     setFeedbackError(false);
     setFeedback(t('operationDone'));
-    setDetail(await memoryGet<MemoryDetail>('memories/detail', { memory_id: memoryId }));
-    await load();
   };
 
   const allSelected = useMemo(
@@ -125,7 +142,7 @@ export function MemoriesPage() {
     <div className="page-stack">
       <header className="page-heading">
         <div><p className="eyebrow">MEMORY INDEX</p><h1>{t('memories')}</h1></div>
-        <button className="wf-button" type="button" disabled={loading} onClick={() => void load()}>{t('refresh')}</button>
+        <button className="wf-button" type="button" disabled={loading} onClick={() => { void listQuery.refresh().catch(() => undefined); }}>{t('refresh')}</button>
       </header>
       <WorkshopPanel title={t('filters')}>
         <form className="memory-filter-grid" onSubmit={(event) => { event.preventDefault(); setPage(1); }}>
@@ -139,13 +156,14 @@ export function MemoriesPage() {
         </form>
       </WorkshopPanel>
       {feedback ? <p className={`inline-feedback${feedbackError ? ' inline-feedback--error' : ''}`} role={feedbackError ? 'alert' : 'status'}>{feedback}</p> : null}
+      {data && error ? <p className="inline-feedback inline-feedback--error" role="alert">{errorMessage(error)}</p> : null}
       <div className="batch-toolbar">
         <label><input aria-label={t('selectAll')} type="checkbox" checked={allSelected} onChange={(event) => setSelected(event.target.checked ? new Set(data?.items.map((item) => item.id)) : new Set())} /> {t('selectAll')}</label>
         <span>{selected.size} {t('selected')}</span>
         <button className="wf-button" type="button" disabled={busy || !selected.size} onClick={() => void archiveSelected()}>{t('archive')}</button>
         <button className="wf-button wf-button--danger" type="button" disabled={busy || !selected.size} onClick={() => setDeleteRequest({ ids: [...selected] })}>{busy ? t('processing') : t('delete')}</button>
       </div>
-      {loading ? <DataState state="loading" title={t('loading')} message={t('memoryIndex')} /> : error ? <DataState state="error" title={t('operationFailed')} message={error.message} /> : !data?.items.length ? <DataState state="empty" title={t('empty')} message={t('memoryIndex')} /> : (
+      {loading ? <DataState state="loading" title={t('loading')} message={t('memoryIndex')} /> : !data && error ? <DataState state="error" title={t('operationFailed')} message={errorMessage(error)} action={<button className="wf-button" type="button" onClick={() => void listQuery.refresh().catch(() => undefined)}>{t('retry')}</button>} /> : !data?.items.length ? <DataState state="empty" title={t('empty')} message={t('memoryIndex')} /> : (
         <div className="memory-table-wrap">
           <table className="memory-table">
             <thead><tr><th aria-label={t('select')} /><th>ID</th><th>{t('content')}</th><th>{t('type')}</th><th>{t('importance')}</th><th>{t('status')}</th><th>{t('created')}</th></tr></thead>

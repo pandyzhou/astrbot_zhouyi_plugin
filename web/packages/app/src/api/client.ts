@@ -152,6 +152,13 @@ function numberOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+function validateGroupResponse<T extends { group_id: string }>(value: T, expectedGroupId: string, label: string): T {
+  if (value.group_id !== expectedGroupId) {
+    throw new ApiClientError('GROUP_MISMATCH', `${label}响应不属于当前群组，请重试。`);
+  }
+  return value;
+}
+
 function normalizeSavedServer(value: unknown, idHint?: string): ServerRecord {
   const raw = (value ?? {}) as RawObject;
   return {
@@ -199,7 +206,11 @@ function applyStatus(saved: ServerRecord, status: RawStatusServer): ServerRecord
 }
 
 async function loadServers(groupId: string, signal?: AbortSignal) {
-  const raw = await request<RawServersData>('/page/v1/mc/servers', { query: { group_id: groupId }, signal });
+  const raw = validateGroupResponse(
+    await request<RawServersData>('/page/v1/mc/servers', { query: { group_id: groupId }, signal }),
+    groupId,
+    '服务器列表',
+  );
   return normalizeServerCollection(raw);
 }
 
@@ -238,27 +249,27 @@ export const apiClient = {
     method: 'POST', body: input, signal, mutationKey: `settings:${input.scope}:${input.group_id ?? 'global'}`,
   }),
   addServer: async (input: AddServerInput, signal?: AbortSignal): Promise<ServerMutationData> => {
-    const raw = await request<RawMutationData>('/page/v1/mc/servers/add', {
+    const raw = validateGroupResponse(await request<RawMutationData>('/page/v1/mc/servers/add', {
       method: 'POST', body: input, signal, mutationKey: `add:${input.group_id}`,
-    });
+    }), input.group_id, '新增服务器');
     return { server: normalizeSavedServer(raw.server) };
   },
   updateServer: async (input: UpdateServerInput, signal?: AbortSignal): Promise<ServerMutationData> => {
-    const raw = await request<RawMutationData>('/page/v1/mc/servers/update', {
+    const raw = validateGroupResponse(await request<RawMutationData>('/page/v1/mc/servers/update', {
       method: 'POST',
       body: { group_id: input.group_id, identifier: input.server_id, name: input.name, host: input.host },
       signal,
       mutationKey: `update:${input.group_id}:${input.server_id}`,
-    });
+    }), input.group_id, '更新服务器');
     return { server: normalizeSavedServer(raw.server) };
   },
   deleteServer: async (input: DeleteServerInput, signal?: AbortSignal): Promise<DeleteServerData> => {
-    const raw = await request<RawDeleteData>('/page/v1/mc/servers/delete', {
+    const raw = validateGroupResponse(await request<RawDeleteData>('/page/v1/mc/servers/delete', {
       method: 'POST',
       body: { group_id: input.group_id, identifier: input.server_id, confirm: true },
       signal,
       mutationKey: `delete:${input.group_id}:${input.server_id}`,
-    });
+    }), input.group_id, '删除服务器');
     return {
       deleted_server_id: String(raw.server.id ?? input.server_id),
       trend_cascade_deleted: raw.trend_cascade_deleted,

@@ -32,6 +32,10 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("/memory/recall", app)
         self.assertIn("/memory/graph", app)
         self.assertIn("standalone", app)
+        self.assertNotIn("setLocale", app)
+        self.assertNotIn("zhouyi-dashboard-locale", app)
+        self.assertNotIn("compact-control", app)
+        self.assertNotIn("t('language')", app)
         for name in ("OverviewPage.tsx", "MemoriesPage.tsx", "RecallPage.tsx", "GraphPage.tsx"):
             self.assertTrue((APP_ROOT / "src" / "features" / "memory" / name).is_file())
 
@@ -55,6 +59,40 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
                 self.assertTrue(headings)
                 for heading in headings:
                     self.assertIsNone(subtitle_pattern.search(heading))
+
+    def test_page_data_cache_contracts(self):
+        store = APP_ROOT / "src" / "store"
+        core = (store / "queryCacheCore.ts").read_text(encoding="utf-8")
+        hook = (store / "useCachedQuery.ts").read_text(encoding="utf-8")
+        keys = (store / "queryKeys.ts").read_text(encoding="utf-8")
+        self.assertIn("class QueryCacheCore", core)
+        self.assertIn("inFlight", core)
+        self.assertIn("invalidate(prefix", core)
+        self.assertIn("generation", core)
+        self.assertIn("useSyncExternalStore", hook)
+        for key_factory in ("mcServers", "mcSettings", "mcTrends", "memoryList", "memoryGraphOverview"):
+            self.assertIn(f"function {key_factory}", keys)
+
+        pages = {
+            name: (APP_ROOT / "src" / relative).read_text(encoding="utf-8")
+            for name, relative in {
+                "servers": "features/servers/ServersPage.tsx",
+                "trends": "features/trends/TrendsPage.tsx",
+                "settings": "features/settings/SettingsPage.tsx",
+                "overview": "features/memory/OverviewPage.tsx",
+                "memories": "features/memory/MemoriesPage.tsx",
+                "graph": "features/memory/GraphPage.tsx",
+                "recall": "features/memory/RecallPage.tsx",
+            }.items()
+        }
+        for name in ("servers", "trends", "settings", "overview", "memories", "graph"):
+            self.assertIn("useCachedQuery", pages[name], name)
+        self.assertNotIn("useCachedQuery", pages["recall"])
+        self.assertNotIn("setData(null)", pages["servers"])
+        self.assertNotIn("setData(null)", pages["trends"])
+        self.assertIn("if (!cachedData || dirty || saving || pendingPreview) return", pages["settings"])
+        self.assertIn("MEMORY_LIST_QUERY_PREFIX", pages["memories"])
+        self.assertIn("MEMORY_GRAPH_QUERY_PREFIX", pages["memories"])
 
     def test_api_client_uses_v1_namespaces(self):
         client = (APP_ROOT / "src" / "api" / "client.ts").read_text(encoding="utf-8")
@@ -102,7 +140,7 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("仅全局", settings)
         self.assertIn("data.global.max_concurrent_queries", settings)
         self.assertIn("（仅全局）", settings)
-        self.assertIn("disabled={saving || loading || Boolean(loadError) || !currentGroupLoaded}", settings)
+        self.assertIn("disabled={saving || loading || !currentGroupLoaded}", settings)
         group_keys = settings.split("const groupKeys: GroupRuntimeSettingKey[] = [", 1)[1].split("];", 1)[0]
         self.assertNotIn("'max_concurrent_queries'", group_keys)
         self.assertIn("const keys = scope === 'global' ? (Object.keys(data.global) as RuntimeSettingKey[]) : groupKeys", settings)
@@ -120,18 +158,18 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("<SettingsPage onNavigationLockChange={setSettingsNavigationLocked} />", app)
 
         self.assertIn("const scopeRef = useRef<SettingsScope>('global')", settings)
-        self.assertIn("void load(scopeRef.current, controller.signal, groupId)", settings)
-        self.assertIn("}, [groupId, load]);", settings)
-        self.assertNotIn("[groupId, load, scope]", settings)
-        self.assertIn("applyLoadedData(data, nextScope)", settings)
+        self.assertIn("useCachedQuery<SettingsData>", settings)
+        self.assertIn("queryCache.revalidate(", settings)
+        self.assertIn("applyLoadedData(loaded, nextScope)", settings)
         self.assertIn("scopeRef.current = nextScope", settings)
 
-        self.assertIn("const controller = new AbortController()", settings)
+        self.assertNotIn("const controller = new AbortController()", settings)
         self.assertIn("groupIdRef.current !== requestedGroupId", settings)
-        self.assertIn("loaded.group_id !== requestedGroupId", settings)
+        self.assertIn("value.group_id !== groupId", settings)
+        self.assertIn("if (!cachedData || dirty || saving || pendingPreview) return", settings)
         self.assertIn("{loading ? <DataState state=\"loading\"", settings)
-        self.assertIn("!loading && (loadError || !currentGroupLoaded)", settings)
-        self.assertIn("state={loadError ? 'error' : 'empty'}", settings)
+        self.assertIn("!loading && (blockingLoadError || !currentGroupLoaded)", settings)
+        self.assertIn("state={blockingLoadError ? 'error' : 'empty'}", settings)
         self.assertIn("onClick={() => void load(scopeRef.current)}", settings)
         self.assertIn(">重新加载</button>", settings)
 

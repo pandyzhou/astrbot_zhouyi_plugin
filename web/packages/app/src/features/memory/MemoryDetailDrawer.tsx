@@ -116,25 +116,42 @@ export function MemoryDetailDrawer({
   const save = async () => {
     if (!detail) return;
     const memoryId = detail.memory_id;
+    let nextId = memoryId;
+    let changed = false;
     setSaving(true);
     setError('');
     try {
-      if (Number(importance) !== displayImportance(detail.importance ?? detail.metadata?.importance)) {
-        await memoryPost('memories/update', { memory_id: memoryId, field: 'importance', value: Number(importance), value_scale: 'display', reason }, undefined, `memory-importance:${memoryId}`);
+      try {
+        if (Number(importance) !== displayImportance(detail.importance ?? detail.metadata?.importance)) {
+          await memoryPost('memories/update', { memory_id: memoryId, field: 'importance', value: Number(importance), value_scale: 'display', reason }, undefined, `memory-importance:${memoryId}`);
+          changed = true;
+        }
+        if (type !== String(detail.memory_type ?? detail.metadata?.memory_type ?? 'GENERAL')) {
+          await memoryPost('memories/update', { memory_id: memoryId, field: 'type', value: type, reason }, undefined, `memory-type:${memoryId}`);
+          changed = true;
+        }
+        if (status !== String(detail.status ?? detail.metadata?.status ?? 'active')) {
+          await memoryPost('memories/update', { memory_id: memoryId, field: 'status', value: status, reason }, undefined, `memory-status:${memoryId}`);
+          changed = true;
+        }
+        if (content.trim() !== detail.text) {
+          const result = await memoryPost<{ new_memory_id?: number }>('memories/update', { memory_id: memoryId, field: 'content', value: content.trim(), reason }, undefined, `memory-content:${memoryId}`);
+          nextId = result.new_memory_id ?? memoryId;
+          changed = true;
+        }
+      } catch (mutationError) {
+        if (changed) {
+          try {
+            await onSaved?.(nextId);
+          } catch {
+            // 父页面回调已先执行缓存失效；这里保留原始 mutation 错误。
+          }
+        }
+        throw mutationError;
       }
-      if (type !== String(detail.memory_type ?? detail.metadata?.memory_type ?? 'GENERAL')) {
-        await memoryPost('memories/update', { memory_id: memoryId, field: 'type', value: type, reason }, undefined, `memory-type:${memoryId}`);
-      }
-      if (status !== String(detail.status ?? detail.metadata?.status ?? 'active')) {
-        await memoryPost('memories/update', { memory_id: memoryId, field: 'status', value: status, reason }, undefined, `memory-status:${memoryId}`);
-      }
-      let nextId = memoryId;
-      if (content.trim() !== detail.text) {
-        const result = await memoryPost<{ new_memory_id?: number }>('memories/update', { memory_id: memoryId, field: 'content', value: content.trim(), reason }, undefined, `memory-content:${memoryId}`);
-        nextId = result.new_memory_id ?? memoryId;
-      }
+
       setEditing(false);
-      await onSaved?.(nextId);
+      if (changed) await onSaved?.(nextId);
     } catch (reasonValue) {
       setError((reasonValue as Error).message);
     } finally {

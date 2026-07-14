@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "ignoreDeprecations": "6.0",
+    "noEmit": false,
+    "outDir": "../../../temp/query-cache-tests",
+    "rootDir": "src/store",
+    "types": ["node"]
+  },
+  "include": [
+    "src/store/queryCacheCore.ts",
+    "src/store/queryCacheCore.test.ts"
+  ]
+}

@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DataState, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
 import { memoryGet, memoryPost } from '../../api/client';
 import { useI18n } from '../../i18n';
+import { queryCache } from '../../store/queryCacheCore';
+import { queryKeys } from '../../store/queryKeys';
+import { useCachedQuery } from '../../store/useCachedQuery';
 import { displayImportance, MemoryDetailDrawer } from './MemoryDetailDrawer';
-import type { GraphEdge, GraphMemory, GraphNode, GraphPayload, MemoryDetail } from './types';
+import type { GraphMemory, GraphNode, GraphPayload, MemoryDetail } from './types';
 
 const WIDTH = 1000;
 const HEIGHT = 640;
@@ -46,8 +49,23 @@ export default function GraphPage() {
   const [session, setSession] = useState('');
   const [persona, setPersona] = useState('');
   const [memoryId, setMemoryId] = useState('');
-  const [data, setData] = useState<GraphPayload | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [overviewFilters, setOverviewFilters] = useState({ session: '', persona: '' });
+  const overviewKey = useMemo(
+    () => queryKeys.memoryGraphOverview(overviewFilters.session || undefined, overviewFilters.persona || undefined),
+    [overviewFilters.persona, overviewFilters.session],
+  );
+  const overviewToken = `${overviewFilters.session}\u0000${overviewFilters.persona}`;
+  const initialOverview = queryCache.peek<GraphPayload>(queryKeys.memoryGraphOverview(undefined, undefined))?.data ?? null;
+  const overviewQuery = useCachedQuery<GraphPayload>(
+    overviewKey,
+    () => memoryGet<GraphPayload>('graph/overview', {
+      session_id: overviewFilters.session || undefined,
+      persona_id: overviewFilters.persona || undefined,
+    }),
+  );
+  const [viewMode, setViewMode] = useState<'overview' | 'custom'>('overview');
+  const [data, setData] = useState<GraphPayload | null>(initialOverview);
+  const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null);
   const [selectedMemoryId, setSelectedMemoryId] = useState<number | null>(null);
@@ -58,30 +76,52 @@ export default function GraphPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; panX: number; panY: number } | null>(null);
+  const viewModeRef = useRef<'overview' | 'custom'>('overview');
+  const appliedOverviewKeyRef = useRef(initialOverview ? '\u0000' : '');
+  viewModeRef.current = viewMode;
 
-  const applyData = (next: GraphPayload) => {
+  const applyData = useCallback((next: GraphPayload | null) => {
     setData(next);
     setSelectedNodeId(null);
-    setSelectedMemoryId(next.memory_id ?? null);
+    setSelectedMemoryId(next?.memory_id ?? null);
     setActiveRelations(null);
     setZoom(1);
     setPan({ x: 0, y: 0 });
-  };
+  }, []);
 
-  const overview = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      applyData(await memoryGet<GraphPayload>('graph/overview', { session_id: session || undefined, persona_id: persona || undefined }));
-    } catch (reason) {
-      setError(reason as Error);
-    } finally {
-      setLoading(false);
+  useEffect(() => {
+    const next = overviewQuery.data;
+    if (!next || viewModeRef.current !== 'overview') return;
+    if (appliedOverviewKeyRef.current !== overviewToken) {
+      appliedOverviewKeyRef.current = overviewToken;
+      applyData(next);
+      return;
     }
+    setData(next);
+  }, [applyData, overviewQuery.data, overviewToken]);
+
+  const overview = () => {
+    const nextFilters = { session: session.trim(), persona: persona.trim() };
+    const nextToken = `${nextFilters.session}\u0000${nextFilters.persona}`;
+    const sameKey = nextToken === overviewToken;
+    const nextKey = queryKeys.memoryGraphOverview(nextFilters.session || undefined, nextFilters.persona || undefined);
+    const cached = sameKey ? overviewQuery.data : queryCache.peek<GraphPayload>(nextKey)?.data;
+
+    viewModeRef.current = 'overview';
+    setViewMode('overview');
+    setError(null);
+    if (!sameKey) setOverviewFilters(nextFilters);
+    if (!sameKey || viewModeRef.current !== viewMode) {
+      appliedOverviewKeyRef.current = cached ? nextToken : '';
+      applyData(cached ?? null);
+    }
+    if (sameKey) void overviewQuery.refresh().catch(() => undefined);
   };
 
   const search = async (focus = false) => {
-    setLoading(true);
+    viewModeRef.current = 'custom';
+    setViewMode('custom');
+    setActionLoading(true);
     setError(null);
     try {
       applyData(await memoryPost<GraphPayload>('graph/query', focus
@@ -90,11 +130,9 @@ export default function GraphPage() {
     } catch (reason) {
       setError(reason as Error);
     } finally {
-      setLoading(false);
+      setActionLoading(false);
     }
   };
-
-  useEffect(() => { void overview(); }, []);
 
   const layout = useMemo(() => createLayout(data?.snapshot.nodes ?? []), [data]);
   const positions = useMemo(() => new Map(layout.map((item) => [item.node.id, item])), [layout]);
@@ -156,6 +194,9 @@ export default function GraphPage() {
   };
 
   const transform = `translate(${WIDTH / 2 + pan.x} ${HEIGHT / 2 + pan.y}) scale(${zoom}) translate(${-WIDTH / 2} ${-HEIGHT / 2})`;
+  const displayError = viewMode === 'overview' ? overviewQuery.error : error;
+  const loading = viewMode === 'overview' ? !data && overviewQuery.isInitialLoading : actionLoading;
+  const controlsBusy = actionLoading || (viewMode === 'overview' && overviewQuery.isInitialLoading);
 
   return (
     <div className="page-stack">
@@ -165,14 +206,15 @@ export default function GraphPage() {
           <label className="wf-label">{t('query')}<input className="wf-input" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
           <label className="wf-label">{t('session')}<input className="wf-input" value={session} onChange={(event) => setSession(event.target.value)} /></label>
           <label className="wf-label">{t('persona')}<input className="wf-input" value={persona} onChange={(event) => setPersona(event.target.value)} /></label>
-          <button className="wf-button wf-button--primary" disabled={loading}>{t('search')}</button>
+          <button className="wf-button wf-button--primary" disabled={controlsBusy}>{t('search')}</button>
           <label className="wf-label">{t('memoryId')}<input className="wf-input" inputMode="numeric" value={memoryId} onChange={(event) => setMemoryId(event.target.value)} /></label>
-          <button className="wf-button" type="button" disabled={loading || !/^\d+$/.test(memoryId)} onClick={() => void search(true)}>{t('focus')}</button>
-          <button className="wf-button" type="button" disabled={loading} onClick={() => void overview()}>{t('recent')}</button>
+          <button className="wf-button" type="button" disabled={controlsBusy || !/^\d+$/.test(memoryId)} onClick={() => void search(true)}>{t('focus')}</button>
+          <button className="wf-button" type="button" disabled={controlsBusy} onClick={overview}>{t('recent')}</button>
         </form>
       </WorkshopPanel>
       {detailError ? <p className="inline-feedback inline-feedback--error" role="alert">{detailError}</p> : null}
-      {loading ? <DataState state="loading" title={t('loading')} message={t('graphSnapshot')} /> : error ? <DataState state="error" title={t('operationFailed')} message={error.message} /> : !data?.enabled ? <DataState state="empty" title={t('disabled')} message={t('memoryUnavailable')} /> : !layout.length ? <DataState state="empty" title={t('graphEmpty')} message={t('graphSnapshot')} /> : (
+      {data && displayError ? <p className="inline-feedback inline-feedback--error" role="alert">{displayError instanceof Error ? displayError.message : String(displayError)}</p> : null}
+      {loading ? <DataState state="loading" title={t('loading')} message={t('graphSnapshot')} /> : !data && displayError ? <DataState state="error" title={t('operationFailed')} message={displayError instanceof Error ? displayError.message : String(displayError)} action={viewMode === 'overview' ? <button className="wf-button" type="button" onClick={overview}>{t('retry')}</button> : undefined} /> : !data?.enabled ? <DataState state="empty" title={t('disabled')} message={t('memoryUnavailable')} /> : !layout.length ? <DataState state="empty" title={t('graphEmpty')} message={t('graphSnapshot')} /> : (
         <div className="graph-layout">
           <WorkshopPanel title={`${data.mode} · ${data.summary.visible_node_count} ${t('nodes')}`} description={`${data.summary.visible_edge_count} ${t('edges')} · ${data.summary.visible_memory_count} ${t('memoriesLabel')}`}>
             <div className="graph-view-controls" aria-label={t('graphControls')}>

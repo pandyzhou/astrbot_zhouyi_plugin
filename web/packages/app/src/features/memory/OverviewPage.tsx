@@ -1,38 +1,31 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { DataState, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
 import { memoryGet } from '../../api/client';
 import { useI18n } from '../../i18n';
+import { queryCache } from '../../store/queryCacheCore';
+import { queryKeys } from '../../store/queryKeys';
+import { useCachedQuery } from '../../store/useCachedQuery';
 import type { BackupItem, StatsData } from './types';
 
 export function OverviewPage() {
   const { t } = useI18n();
-  const [stats, setStats] = useState<StatsData | null>(null);
-  const [backups, setBackups] = useState<BackupItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
+  const statsQuery = useCachedQuery<StatsData>(
+    queryKeys.memoryOverviewStats,
+    () => memoryGet<StatsData>('stats'),
+  );
+  const backupsQuery = useCachedQuery<{ backups: BackupItem[] }>(
+    queryKeys.memoryOverviewBackups,
+    () => memoryGet<{ backups: BackupItem[] }>('backups'),
+    { ttl: 300_000 },
+  );
+  const stats = statsQuery.data;
+  const backups = backupsQuery.data?.backups ?? [];
 
-  const load = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [nextStats, backupData] = await Promise.all([
-        memoryGet<StatsData>('stats', undefined, signal),
-        memoryGet<{ backups: BackupItem[] }>('backups', undefined, signal).catch(() => ({ backups: [] })),
-      ]);
-      setStats(nextStats);
-      setBackups(backupData.backups ?? []);
-    } catch (reason) {
-      if ((reason as Error).name !== 'AbortError') setError(reason as Error);
-    } finally {
-      if (!signal?.aborted) setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+  const refresh = () => {
+    queryCache.invalidate(queryKeys.memoryOverviewStats);
+    queryCache.invalidate(queryKeys.memoryOverviewBackups);
+    void Promise.allSettled([statsQuery.refresh(), backupsQuery.refresh()]);
+  };
 
   const status = stats?.status_breakdown ?? {};
   const importance = useMemo(() => Object.entries(stats?.importance_distribution ?? {}), [stats]);
@@ -40,8 +33,8 @@ export function OverviewPage() {
   const importanceMax = Math.max(...importance.map(([, value]) => value), 1);
   const atomMax = Math.max(...atoms.map(([, value]) => value), 1);
 
-  if (loading) return <DataState state="loading" title={t('loading')} message={t('memoryCapability')} />;
-  if (error) return <DataState state="error" title={t('operationFailed')} message={error.message} action={<button className="wf-button" type="button" onClick={() => void load()}>{t('retry')}</button>} />;
+  if (statsQuery.isInitialLoading) return <DataState state="loading" title={t('loading')} message={t('memoryCapability')} />;
+  if (!stats && statsQuery.error) return <DataState state="error" title={t('operationFailed')} message={statsQuery.error instanceof Error ? statsQuery.error.message : String(statsQuery.error)} action={<button className="wf-button" type="button" onClick={() => { void statsQuery.refresh().catch(() => undefined); }}>{t('retry')}</button>} />;
 
   const cards = [
     [t('total'), stats?.total_memories ?? 0],
@@ -54,7 +47,9 @@ export function OverviewPage() {
 
   return (
     <div className="page-stack">
-      <header className="page-heading"><div><p className="eyebrow">MEMORY OPERATIONS</p><h1>{t('overview')}</h1></div><button className="wf-button" type="button" onClick={() => void load()}>{t('refresh')}</button></header>
+      <header className="page-heading"><div><p className="eyebrow">MEMORY OPERATIONS</p><h1>{t('overview')}</h1></div><button className="wf-button" type="button" onClick={refresh}>{t('refresh')}</button></header>
+      {stats && statsQuery.error ? <p className="inline-feedback inline-feedback--error" role="alert">{statsQuery.error instanceof Error ? statsQuery.error.message : String(statsQuery.error)}</p> : null}
+      {backupsQuery.data && backupsQuery.error ? <p className="inline-feedback inline-feedback--error" role="alert">{backupsQuery.error instanceof Error ? backupsQuery.error.message : String(backupsQuery.error)}</p> : null}
       <div className="memory-stat-grid">{cards.map(([label, value]) => <article className="summary-card" key={String(label)}><span>{label}</span><strong>{value}</strong></article>)}</div>
       <div className="memory-overview-grid">
         <WorkshopPanel title={t('importanceDistribution')} description="0–10">
@@ -64,7 +59,9 @@ export function OverviewPage() {
           {atoms.length ? <div className="bar-list">{atoms.map(([label, value]) => <div className="bar-item bar-item--wide" key={label}><span>{label}</span><progress aria-label={`${label}: ${value}`} max={atomMax} value={value} /><strong>{value}</strong></div>)}</div> : <DataState state="empty" title={t('empty')} message={t('noAtomBreakdown')} />}
         </WorkshopPanel>
         <WorkshopPanel title={t('sessions')}><div className="dense-list">{stats?.recent_sessions?.length ? stats.recent_sessions.map((item) => <article key={item.session_id}><code>{item.session_id}</code><strong>{item.message_count}</strong></article>) : <p className="muted">{t('empty')}</p>}</div></WorkshopPanel>
-        <WorkshopPanel title={t('backups')}><div className="dense-list">{backups.length ? backups.map((item, index) => <article key={`${item.name ?? item.directory}-${index}`}><div><strong>{item.name ?? item.directory ?? 'backup'}</strong><small>{item.backup_timestamp ?? '—'}</small></div><span>{item.file_count ?? item.files_copied ?? 0} {t('files')}</span></article>) : <p className="muted">{t('empty')}</p>}</div></WorkshopPanel>
+        <WorkshopPanel title={t('backups')}>
+          {backupsQuery.isInitialLoading ? <DataState state="loading" title={t('loading')} message={t('backups')} /> : !backupsQuery.data && backupsQuery.error ? <DataState state="error" title={t('operationFailed')} message={backupsQuery.error instanceof Error ? backupsQuery.error.message : String(backupsQuery.error)} /> : <div className="dense-list">{backups.length ? backups.map((item, index) => <article key={`${item.name ?? item.directory}-${index}`}><div><strong>{item.name ?? item.directory ?? 'backup'}</strong><small>{item.backup_timestamp ?? '—'}</small></div><span>{item.file_count ?? item.files_copied ?? 0} {t('files')}</span></article>) : <p className="muted">{t('empty')}</p>}</div>}
+        </WorkshopPanel>
       </div>
     </div>
   );

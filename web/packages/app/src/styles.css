@@ -981,8 +981,6 @@
 :root[data-theme="light"] .wf-nav a[aria-current="page"] { box-shadow: 3px 3px 0 #b8bcae; }
 
 .dashboard-controls { display: flex; min-width: 0; align-items: end; justify-content: flex-end; gap: 8px; }
-.compact-control { display: grid; gap: 2px; color: var(--wf-muted); font-size: 12px; font-weight: 700; }
-.compact-control select { min-width: 72px; min-height: 44px; padding: 0 8px; border: 2px solid var(--wf-line); border-radius: var(--wf-radius); background: var(--wf-raised); color: var(--wf-text); }
 .theme-button { min-width: 64px; }
 .capability-banner { margin: 0 0 18px; padding: 12px 14px; border: 2px solid var(--wf-accent); border-left-width: 6px; background: var(--wf-surface); color: var(--wf-muted); }
 .memory-stat-grid { display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 12px; }
