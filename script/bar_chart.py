@@ -59,7 +59,6 @@ class ServerTrendInput:
 def _load_font(size: int) -> ImageFont.ImageFont:
     candidates = (
         Path(__file__).resolve().parent.parent / "resource" / "LXGWWenKai-Regular.ttf",
-        Path(__file__).resolve().parent.parent / "resource" / "msyh.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",

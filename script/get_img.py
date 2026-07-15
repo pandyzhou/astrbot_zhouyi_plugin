@@ -24,6 +24,7 @@ BACKGROUND_URLS = (
 )
 BACKGROUND_MAX_BYTES = 8 * 1024 * 1024
 BACKGROUND_CACHE_TTL = 60.0
+BACKGROUND_FALLBACK_COLOR = (48, 60, 105)
 _ALLOWED_BACKGROUND_FORMATS = {"JPEG", "PNG", "WEBP"}
 _BACKGROUND_TIMEOUT = aiohttp.ClientTimeout(total=6.0)
 
@@ -54,7 +55,6 @@ def _get_background_lock() -> asyncio.Lock:
 async def load_font(font_size: int) -> ImageFont.ImageFont:
     font_paths = [
         Path(__file__).resolve().parent.parent / "resource" / "LXGWWenKai-Regular.ttf",
-        Path(__file__).resolve().parent.parent / "resource" / "msyh.ttf",
         "msyh.ttf",
         "/usr/share/fonts/zh_CN/msyh.ttf",
         "C:/Windows/Fonts/msyh.ttc",
@@ -251,20 +251,8 @@ def _prepare_background(image: Image.Image, size: tuple[int, int] = CANVAS_SIZE)
     return backdrop
 
 
-def _make_gradient_background(size: tuple[int, int] = CANVAS_SIZE) -> Image.Image:
-    width, height = size
-    image = Image.new("RGB", size)
-    pixels = image.load()
-    for y in range(height):
-        vertical = y / max(1, height - 1)
-        for x in range(width):
-            horizontal = x / max(1, width - 1)
-            pixels[x, y] = (
-                int(31 + 35 * horizontal),
-                int(42 + 37 * (1 - vertical)),
-                int(72 + 48 * vertical + 18 * horizontal),
-            )
-    return image
+def _make_solid_background(size: tuple[int, int] = CANVAS_SIZE) -> Image.Image:
+    return Image.new("RGB", size, BACKGROUND_FALLBACK_COLOR)
 
 
 async def _download_background_bytes(
@@ -296,10 +284,26 @@ async def _download_background_bytes(
 
 
 async def _fetch_background() -> Image.Image:
-    url = random.choice(BACKGROUND_URLS)
+    urls = list(BACKGROUND_URLS)
+    random.shuffle(urls)
+    attempt_total = len(urls)
     async with aiohttp.ClientSession(timeout=_BACKGROUND_TIMEOUT) as session:
-        data = await _download_background_bytes(session, url)
-    return _prepare_background(_decode_background_image(data))
+        for attempt, url in enumerate(urls, start=1):
+            try:
+                data = await _download_background_bytes(session, url)
+                return _prepare_background(_decode_background_image(data))
+            except Exception as exc:
+                if attempt < attempt_total:
+                    logger.warning(
+                        f"服务器卡片背景请求失败，尝试 {attempt}/{attempt_total}，"
+                        f"URL {url}，异常: {exc}；继续重试"
+                    )
+                else:
+                    logger.warning(
+                        f"服务器卡片背景请求失败，尝试 {attempt}/{attempt_total}，"
+                        f"URL {url}，异常: {exc}；使用纯色背景"
+                    )
+    return _make_solid_background()
 
 
 async def get_card_background() -> Image.Image:
@@ -313,13 +317,7 @@ async def get_card_background() -> Image.Image:
         now = time.monotonic()
         if _background_cache is not None and now - _background_cache_at < BACKGROUND_CACHE_TTL:
             return _background_cache.copy()
-        try:
-            refreshed = await _fetch_background()
-        except Exception as exc:
-            logger.warning(f"刷新服务器卡片背景失败，使用本地回退: {exc}")
-            if _background_cache is not None:
-                return _background_cache.copy()
-            return _make_gradient_background()
+        refreshed = await _fetch_background()
         _background_cache = refreshed.convert("RGB").resize(CANVAS_SIZE)
         _background_cache_at = time.monotonic()
         return _background_cache.copy()
@@ -399,8 +397,8 @@ async def generate_server_info_image(
     try:
         background = await get_card_background()
     except Exception as exc:
-        logger.warning(f"读取卡片背景失败，使用本地渐变: {exc}")
-        background = _make_gradient_background()
+        logger.warning(f"读取卡片背景失败，使用纯色背景: {exc}")
+        background = _make_solid_background()
 
     canvas = background.convert("RGBA")
     overlay = Image.new("RGBA", CANVAS_SIZE, (0, 0, 0, 0))

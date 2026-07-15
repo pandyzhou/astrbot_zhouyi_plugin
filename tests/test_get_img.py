@@ -41,13 +41,24 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, response):
-        self.response = response
+    def __init__(self, responses):
+        self.responses = list(responses) if isinstance(responses, (list, tuple)) else [responses]
         self.calls = []
+        self.enter_count = 0
+
+    async def __aenter__(self):
+        self.enter_count += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
     def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        return self.response
+        response = self.responses[len(self.calls) - 1]
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def encode_image(image: Image.Image, image_format: str) -> bytes:
@@ -60,6 +71,15 @@ def decode_card(value: str) -> Image.Image:
     with Image.open(io.BytesIO(base64.b64decode(value))) as image:
         image.load()
         return image.copy()
+
+
+def background_response(color: tuple[int, int, int]) -> FakeResponse:
+    data = encode_image(Image.new("RGB", (800, 440), color), "PNG")
+    return FakeResponse(
+        status=200,
+        headers={"Content-Length": str(len(data))},
+        chunks=(data,),
+    )
 
 
 class GetImgPureFunctionTests(unittest.TestCase):
@@ -220,7 +240,7 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(icon.tobytes(), expected_bytes)
 
     async def test_online_and_offline_cards_are_800x440_png(self):
-        background = get_img._make_gradient_background()
+        background = get_img._make_solid_background()
         with patch.object(
             get_img, "get_card_background", AsyncMock(return_value=background)
         ) as get_background:
@@ -261,7 +281,7 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             get_img,
             "get_card_background",
-            AsyncMock(return_value=get_img._make_gradient_background()),
+            AsyncMock(return_value=get_img._make_solid_background()),
         ):
             value = await get_img.generate_server_info_image(
                 ["玩家" + str(index) + "名字" * 30 for index in range(80)],
@@ -292,40 +312,155 @@ class GetImgAsyncTests(unittest.IsolatedAsyncioTestCase):
         result.putpixel((0, 0), (0, 0, 0))
         self.assertEqual(second.getpixel((0, 0)), (255, 0, 0))
 
-    async def test_concurrent_refresh_downloads_once(self):
-        calls = 0
+    async def test_background_first_attempt_success(self):
+        session = FakeSession(background_response((12, 34, 56)))
+        with (
+            patch.object(get_img.random, "shuffle", side_effect=lambda urls: None),
+            patch.object(get_img.aiohttp, "ClientSession", return_value=session) as client_session,
+        ):
+            result = await get_img._fetch_background()
 
-        async def fake_fetch():
-            nonlocal calls
-            calls += 1
-            await asyncio.sleep(0.02)
-            return Image.new("RGB", (800, 440), "blue")
+        client_session.assert_called_once_with(timeout=get_img._BACKGROUND_TIMEOUT)
+        self.assertEqual(session.enter_count, 1)
+        self.assertEqual([url for url, _ in session.calls], [get_img.BACKGROUND_URLS[0]])
+        self.assertEqual(result.getpixel((0, 0)), (12, 34, 56))
 
-        with patch.object(get_img, "_fetch_background", side_effect=fake_fetch):
+    async def test_background_succeeds_on_fourth_attempt_with_unique_urls(self):
+        session = FakeSession(
+            [
+                RuntimeError("first"),
+                RuntimeError("second"),
+                RuntimeError("third"),
+                background_response((21, 43, 65)),
+            ]
+        )
+        with (
+            patch.object(get_img.random, "shuffle", side_effect=lambda urls: None),
+            patch.object(get_img.aiohttp, "ClientSession", return_value=session) as client_session,
+            patch.object(get_img.logger, "warning") as warning,
+        ):
+            result = await get_img._fetch_background()
+
+        client_session.assert_called_once_with(timeout=get_img._BACKGROUND_TIMEOUT)
+        requested_urls = [url for url, _ in session.calls]
+        self.assertEqual(requested_urls, list(get_img.BACKGROUND_URLS))
+        self.assertEqual(len(set(requested_urls)), 4)
+        self.assertEqual(warning.call_count, 3)
+        self.assertEqual(result.getpixel((0, 0)), (21, 43, 65))
+
+    async def test_background_four_failures_use_solid_color(self):
+        session = FakeSession([RuntimeError(f"failure-{index}") for index in range(1, 5)])
+        with (
+            patch.object(get_img.random, "shuffle", side_effect=lambda urls: None),
+            patch.object(get_img.aiohttp, "ClientSession", return_value=session),
+            patch.object(get_img.logger, "warning"),
+        ):
+            result = await get_img._fetch_background()
+
+        self.assertEqual(result.size, get_img.CANVAS_SIZE)
+        self.assertEqual(result.mode, "RGB")
+        self.assertEqual(result.getpixel((0, 0)), get_img.BACKGROUND_FALLBACK_COLOR)
+        self.assertEqual(result.getpixel((799, 439)), get_img.BACKGROUND_FALLBACK_COLOR)
+
+    async def test_background_failure_logs_attempt_url_and_retry_state(self):
+        errors = [RuntimeError(f"problem-{index}") for index in range(1, 5)]
+        session = FakeSession(errors)
+        with (
+            patch.object(get_img.random, "shuffle", side_effect=lambda urls: None),
+            patch.object(get_img.aiohttp, "ClientSession", return_value=session),
+            patch.object(get_img.logger, "warning") as warning,
+        ):
+            await get_img._fetch_background()
+
+        messages = [call.args[0] for call in warning.call_args_list]
+        self.assertEqual(len(messages), 4)
+        for index, (url, error) in enumerate(zip(get_img.BACKGROUND_URLS, errors), start=1):
+            self.assertIn(f"尝试 {index}/4", messages[index - 1])
+            self.assertIn(f"URL {url}", messages[index - 1])
+            self.assertIn(str(error), messages[index - 1])
+            expected_state = "继续重试" if index < 4 else "使用纯色背景"
+            self.assertIn(expected_state, messages[index - 1])
+
+    async def test_solid_fallback_is_cached_for_sixty_seconds(self):
+        session = FakeSession([RuntimeError("down")] * 4)
+        with (
+            patch.object(get_img.random, "shuffle", side_effect=lambda urls: None),
+            patch.object(get_img.aiohttp, "ClientSession", return_value=session) as client_session,
+            patch.object(get_img.logger, "warning"),
+            patch.object(get_img.time, "monotonic", return_value=100.0),
+        ):
+            first = await get_img.get_card_background()
+            second = await get_img.get_card_background()
+
+        client_session.assert_called_once_with(timeout=get_img._BACKGROUND_TIMEOUT)
+        self.assertEqual(len(session.calls), 4)
+        self.assertEqual(first.getpixel((0, 0)), get_img.BACKGROUND_FALLBACK_COLOR)
+        self.assertEqual(second.getpixel((0, 0)), get_img.BACKGROUND_FALLBACK_COLOR)
+        self.assertIsNot(first, second)
+
+    async def test_expired_cache_is_not_reused_and_retries_api(self):
+        get_img._background_cache = Image.new("RGB", get_img.CANVAS_SIZE, "green")
+        get_img._background_cache_at = 0.0
+        session = FakeSession([RuntimeError("down")] * 4)
+        with (
+            patch.object(get_img.random, "shuffle", side_effect=lambda urls: None),
+            patch.object(get_img.aiohttp, "ClientSession", return_value=session),
+            patch.object(get_img.logger, "warning"),
+            patch.object(get_img.time, "monotonic", return_value=1000.0),
+        ):
+            result = await get_img.get_card_background()
+
+        self.assertEqual(len(session.calls), 4)
+        self.assertEqual(result.getpixel((0, 0)), get_img.BACKGROUND_FALLBACK_COLOR)
+        self.assertNotEqual(result.getpixel((0, 0)), (0, 128, 0))
+
+    async def test_concurrent_waiters_share_one_four_attempt_round(self):
+        session = FakeSession([RuntimeError("down")] * 4)
+        with (
+            patch.object(get_img.random, "shuffle", side_effect=lambda urls: None),
+            patch.object(get_img.aiohttp, "ClientSession", return_value=session) as client_session,
+            patch.object(get_img.logger, "warning"),
+        ):
             results = await asyncio.gather(
                 *(get_img.get_card_background() for _ in range(8))
             )
-        self.assertEqual(calls, 1)
+
+        client_session.assert_called_once_with(timeout=get_img._BACKGROUND_TIMEOUT)
+        self.assertEqual(len(session.calls), 4)
         self.assertEqual(len(results), 8)
-        self.assertTrue(all(image.getpixel((0, 0)) == (0, 0, 255) for image in results))
+        self.assertTrue(
+            all(
+                image.getpixel((0, 0)) == get_img.BACKGROUND_FALLBACK_COLOR
+                for image in results
+            )
+        )
 
-    async def test_refresh_failure_uses_stale_cache_or_gradient(self):
-        get_img._background_cache = Image.new("RGB", (800, 440), "green")
-        get_img._background_cache_at = 0.0
+    async def test_generate_card_background_exception_uses_solid_color(self):
         with (
-            patch.object(get_img.time, "monotonic", return_value=1000.0),
-            patch.object(get_img, "_fetch_background", AsyncMock(side_effect=RuntimeError("down"))),
+            patch.object(
+                get_img,
+                "get_card_background",
+                AsyncMock(side_effect=RuntimeError("unexpected")),
+            ),
+            patch.object(
+                get_img,
+                "_make_solid_background",
+                wraps=get_img._make_solid_background,
+            ) as solid_background,
+            patch.object(get_img.logger, "warning"),
         ):
-            stale = await get_img.get_card_background()
-        self.assertEqual(stale.getpixel((0, 0)), (0, 128, 0))
+            value = await get_img.generate_server_info_image(
+                [],
+                None,
+                "离线服务器",
+                0,
+                0,
+                "未知",
+                is_online=False,
+            )
 
-        get_img._reset_background_cache_for_tests()
-        with patch.object(
-            get_img, "_fetch_background", AsyncMock(side_effect=RuntimeError("down"))
-        ):
-            fallback = await get_img.get_card_background()
-        self.assertEqual(fallback.size, (800, 440))
-        self.assertEqual(fallback.mode, "RGB")
+        solid_background.assert_called_once_with()
+        self.assertEqual(decode_card(value).size, get_img.CANVAS_SIZE)
 
     async def test_download_rejects_non_2xx_and_oversized_content(self):
         non_2xx = FakeSession(FakeResponse(status=503))

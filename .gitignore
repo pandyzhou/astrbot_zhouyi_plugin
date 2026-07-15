@@ -3,10 +3,7 @@
 *.py[cod]
 /temp/
 /P22Mackinac字体.zip
-/.agents/skills/find-skills/
-/.agents/skills/tdd/
-/.agents/skills/ui-ux-pro-max/
-/.agents/skills/vercel-react-best-practices/
-/AGENTS.md
+/.agents/
 /data/
+/resource/msyh.ttf
 /skills-lock.json
