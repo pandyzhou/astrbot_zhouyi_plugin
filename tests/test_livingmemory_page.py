@@ -97,6 +97,8 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
 
     def test_recall_page_workbench_contracts(self):
         recall = (APP_ROOT / "src" / "features" / "memory" / "RecallPage.tsx").read_text(encoding="utf-8")
+        recall_sessions = (APP_ROOT / "src" / "features" / "memory" / "recallSessions.ts").read_text(encoding="utf-8")
+        memory_types = (APP_ROOT / "src" / "features" / "memory" / "types.ts").read_text(encoding="utf-8")
         styles = (APP_ROOT / "src" / "styles.css").read_text(encoding="utf-8")
 
         for class_name in (
@@ -115,6 +117,39 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("<WorkshopPanel title={t('hybridRetrieval')}>", recall)
         self.assertIn("<WorkshopPanel title={t('results')}>", recall)
         self.assertNotIn("description=", recall)
+        self.assertRegex(
+            recall,
+            re.compile(r"import \{[^}]*\bSelectField\b[^}]*\} from '@pandyzhou/astrbot-mc-ui';"),
+        )
+        self.assertIn("useCachedQuery<StatsData>", recall)
+        self.assertIn("queryKeys.memoryOverviewStats", recall)
+        self.assertIn("() => memoryGet<StatsData>('stats')", recall)
+        self.assertIn("export interface RecallSession", memory_types)
+        self.assertIn("recall_sessions?: RecallSession[]", memory_types)
+        self.assertIn("sessions?: Record<string, number>", memory_types)
+        self.assertIn("recent_sessions?: Array<", memory_types)
+        self.assertIn("statsQuery.data?.recall_sessions", recall)
+        self.assertNotIn("statsQuery.data?.sessions", recall)
+        self.assertNotIn("statsQuery.data.sessions", recall)
+        self.assertNotIn("recent_sessions", recall)
+        self.assertIn("buildRecallSessionOptions", recall)
+        self.assertIn("value: session.session_id", recall_sessions)
+        self.assertIn("`${displayName}（${groupId}）`", recall_sessions)
+        self.assertIn("`${groupChatLabel} ${groupId}`", recall_sessions)
+        self.assertNotIn("message_count", recall_sessions)
+        self.assertIn("session_id: session || undefined", recall)
+        self.assertRegex(
+            recall,
+            re.compile(
+                r"<SelectField\s+.*?id=\"recall-session\".*?label=\{t\('session'\)\}.*?"
+                r"value=\{session\}.*?onChange=\{setSession\}",
+                re.DOTALL,
+            ),
+        )
+        self.assertNotRegex(
+            recall,
+            re.compile(r"<input\b[^>]*\bvalue=\{session\}", re.DOTALL),
+        )
         self.assertRegex(
             recall,
             re.compile(
@@ -163,6 +198,8 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
 
     def test_graph_interaction_contracts(self):
         graph = (APP_ROOT / "src" / "features" / "memory" / "GraphPage.tsx").read_text(encoding="utf-8")
+        canvas = (APP_ROOT / "src" / "features" / "memory" / "CytoscapeGraphCanvas.tsx").read_text(encoding="utf-8")
+        layout = (APP_ROOT / "src" / "features" / "memory" / "graphCytoscape.ts").read_text(encoding="utf-8")
         styles = (APP_ROOT / "src" / "styles.css").read_text(encoding="utf-8")
         i18n = (APP_ROOT / "src" / "i18n.ts").read_text(encoding="utf-8")
         package_sources = "\n".join(
@@ -170,52 +207,59 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
             for path in (PLUGIN_ROOT / "web" / "package.json", APP_ROOT / "package.json")
         )
 
-        self.assertIn("function InteractiveGraphCanvas", graph)
-        self.assertIn("createGraphSimulation(nodes, allEdges, WIDTH, HEIGHT)", graph)
-        self.assertIn("addEventListener('wheel'", graph)
-        self.assertIn("passive: false", graph)
-        self.assertIn("removeEventListener('wheel'", graph)
-        self.assertNotIn("onWheel=", graph)
+        self.assertIn("CytoscapeGraphCanvas", graph)
+        self.assertIn("visibleEdges={visibleEdges}", graph)
+        self.assertIn("graphCanvasRef.current?.reflow()", graph)
+        self.assertIn('role="toolbar"', graph)
         for contract in (
-            "normalizeWheelDelta",
-            "zoomAtPoint",
-            "getScreenCTM",
-            ".inverse()",
-            "kind: 'pan'",
-            "kind: 'node'",
-            "setPointerCapture",
-            "onPointerCancel",
-            "onLostPointerCapture",
-            "pinGraphNode",
-            "moveGraphNode",
+            "cytoscape({",
+            "buildGraphModel",
+            "createFcoseLayout",
+            "userPanningEnabled: true",
+            "userZoomingEnabled: true",
+            "cy.on('free', 'node'",
+            "lockGraphNode",
             "releaseGraphNode",
-            "reflowGraphSimulation",
-            "t('reflowGraph')",
-            "graph-node--dimmed",
-            "graph-node--dragging",
-            "graph-edge--dimmed",
-            "graph-edge--hovered",
-            "graph-canvas--panning",
+            "graph-edge--hidden",
+            "graph-focus-node",
+            "onClick={() => onSelectNodeRef.current(node.id)}",
+            "ResizeObserver",
+            "MutationObserver",
+            "cy.destroy()",
         ):
-            self.assertIn(contract, graph)
+            self.assertIn(contract, canvas)
+
+        for contract in (
+            "quality: 'default'",
+            "randomize: false",
+            "animate: options.animate ?? false",
+            "nodeDimensionsIncludeLabels: true",
+            "idealEdgeLength: safeIdealEdgeLength",
+            "nodeRepulsion: safeNodeRepulsion",
+            "MAX_DYNAMIC_GRAPH_NODES",
+        ):
+            self.assertIn(contract, layout)
 
         for class_name in (
-            "graph-node--dimmed",
-            "graph-node--dragging",
-            "graph-edge--dimmed",
-            "graph-edge--hovered",
-            "graph-canvas--panning",
+            "graph-cytoscape-viewport",
+            "graph-focus-layer",
+            "graph-focus-node",
         ):
             self.assertIn(f".{class_name}", styles)
+        self.assertIn("cytoscape-graph-canvas", canvas)
         self.assertIn("overscroll-behavior: contain", styles)
         self.assertIn("touch-action: none", styles)
+        self.assertIn("pointer-events: none", styles)
         self.assertIn("@media (prefers-reduced-motion: reduce)", styles)
-        self.assertRegex(styles, re.compile(r"prefers-reduced-motion: reduce.*?\.graph-node,\s*\.graph-edge\s*\{\s*transition: none;", re.DOTALL))
+        self.assertRegex(styles, re.compile(r"prefers-reduced-motion: reduce.*?\.graph-focus-node\s*\{\s*transition: none;", re.DOTALL))
 
         self.assertEqual(i18n.count("reflowGraph:"), 3)
+        self.assertEqual(i18n.count("panLeft:"), 3)
         self.assertIn("reflowGraph: '重新布局'", i18n)
         self.assertIn("reflowGraph: 'Reflow layout'", i18n)
         self.assertIn("reflowGraph: 'Перестроить граф'", i18n)
+        self.assertRegex(package_sources, re.compile(r'"cytoscape"\s*:\s*"\^3\.34\.0"'))
+        self.assertRegex(package_sources, re.compile(r'"cytoscape-fcose"\s*:\s*"\^2\.2\.0"'))
         self.assertNotRegex(package_sources, re.compile(r'"(?:d3(?:-[^"]*)?|force-graph(?:-[^"]*)?)"\s*:'))
 
     def test_page_headings_do_not_include_subtitles_after_h1(self):
@@ -270,9 +314,8 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
                 "source_updates": "features/sources/SourceUpdatesPage.tsx",
             }.items()
         }
-        for name in ("servers", "trends", "settings", "memory_config", "overview", "memories", "graph", "source_updates"):
+        for name in ("servers", "trends", "settings", "memory_config", "overview", "memories", "graph", "recall", "source_updates"):
             self.assertIn("useCachedQuery", pages[name], name)
-        self.assertNotIn("useCachedQuery", pages["recall"])
         self.assertNotIn("setData(null)", pages["servers"])
         self.assertNotIn("setData(null)", pages["trends"])
         self.assertIn("if (!cachedData || dirty || saving || pendingPreview) return", pages["settings"])

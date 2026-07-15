@@ -1,332 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DataState, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
 import { memoryGet, memoryPost } from '../../api/client';
 import { useI18n } from '../../i18n';
 import { queryCache } from '../../store/queryCacheCore';
 import { queryKeys } from '../../store/queryKeys';
 import { useCachedQuery } from '../../store/useCachedQuery';
-import { displayImportance, MemoryDetailDrawer } from './MemoryDetailDrawer';
 import {
-  clampGraphPan,
-  createGraphSimulation,
-  moveGraphNode,
-  normalizeWheelDelta,
-  pinGraphNode,
-  reflowGraphSimulation,
-  releaseGraphNode,
-  settleGraphSimulation,
-  shouldContinueGraphSimulation,
-  stepGraphSimulation,
-  zoomAtPoint,
-  type GraphPoint,
-  type GraphView,
-} from './graphPhysics';
-import type { GraphEdge, GraphMemory, GraphNode, GraphPayload, MemoryDetail } from './types';
-
-const WIDTH = 1000;
-const HEIGHT = 640;
-const DEFAULT_GRAPH_VIEW: GraphView = { zoom: 1, pan: { x: 0, y: 0 } };
-const RELATION_COLORS = ['#68b65b', '#d79a68', '#72a8d7', '#c982c9', '#d7ca68', '#7fc9b5', '#d77968', '#9ea6d9'];
-
-type PointerInteraction =
-  | { kind: 'pan'; pointerId: number; start: GraphPoint; startPan: GraphPoint }
-  | { kind: 'node'; pointerId: number; nodeId: number; offset: GraphPoint; startClient: GraphPoint; moved: boolean };
-
-interface InteractiveGraphCanvasProps {
-  nodes: GraphNode[];
-  allEdges: GraphEdge[];
-  visibleEdges: GraphEdge[];
-  selectedNodeId: number | null;
-  selectedMemoryId: number | null;
-  highlightedNodeIds: ReadonlySet<number>;
-  relationColors: ReadonlyMap<string, string>;
-  view: GraphView;
-  onViewChange: (view: GraphView) => void;
-  layoutRevision: number;
-  onSelectNode: (nodeId: number) => void;
-  ariaLabel: string;
-}
-
-function shortLabel(value: string) {
-  return value.length > 16 ? `${value.slice(0, 15)}…` : value;
-}
-
-function clientPointInSvg(element: SVGGraphicsElement | null, clientX: number, clientY: number): GraphPoint | null {
-  const screenMatrix = element?.getScreenCTM();
-  if (!screenMatrix) return null;
-  const point = new DOMPoint(clientX, clientY).matrixTransform(screenMatrix.inverse());
-  return { x: point.x, y: point.y };
-}
-
-function usePrefersReducedMotion() {
-  const [reducedMotion, setReducedMotion] = useState(() => typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
-
-  useEffect(() => {
-    const media = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const handleChange = (event: MediaQueryListEvent) => setReducedMotion(event.matches);
-    setReducedMotion(media.matches);
-    media.addEventListener('change', handleChange);
-    return () => media.removeEventListener('change', handleChange);
-  }, []);
-
-  return reducedMotion;
-}
-
-function InteractiveGraphCanvas({
-  nodes,
-  allEdges,
-  visibleEdges,
-  selectedNodeId,
-  selectedMemoryId,
-  highlightedNodeIds,
-  relationColors,
-  view,
-  onViewChange,
-  layoutRevision,
-  onSelectNode,
-  ariaLabel,
-}: InteractiveGraphCanvasProps) {
-  const simulation = useMemo(() => createGraphSimulation(nodes, allEdges, WIDTH, HEIGHT), [nodes, allEdges]);
-  const [, setFrameVersion] = useState(0);
-  const [hoveredNodeId, setHoveredNodeId] = useState<number | null>(null);
-  const [draggingNodeId, setDraggingNodeId] = useState<number | null>(null);
-  const [isPanning, setIsPanning] = useState(false);
-  const reducedMotion = usePrefersReducedMotion();
-  const canvasRef = useRef<HTMLDivElement>(null);
-  const svgRef = useRef<SVGSVGElement>(null);
-  const sceneRef = useRef<SVGGElement>(null);
-  const viewRef = useRef(view);
-  const interactionRef = useRef<PointerInteraction | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
-  const previousSimulationRef = useRef(simulation);
-  const previousLayoutRevisionRef = useRef(layoutRevision);
-  viewRef.current = view;
-
-  const paint = useCallback(() => setFrameVersion((current) => current + 1), []);
-  const cancelAnimation = useCallback(() => {
-    if (animationFrameRef.current === null) return;
-    window.cancelAnimationFrame(animationFrameRef.current);
-    animationFrameRef.current = null;
-  }, []);
-  const commitView = useCallback((nextView: GraphView) => {
-    viewRef.current = nextView;
-    onViewChange(nextView);
-  }, [onViewChange]);
-  const startAnimation = useCallback(() => {
-    if (reducedMotion || document.hidden || animationFrameRef.current !== null || !shouldContinueGraphSimulation(simulation)) return;
-    const tick = () => {
-      animationFrameRef.current = null;
-      if (reducedMotion || document.hidden) return;
-      const result = stepGraphSimulation(simulation);
-      paint();
-      if (result.shouldContinue) animationFrameRef.current = window.requestAnimationFrame(tick);
-    };
-    animationFrameRef.current = window.requestAnimationFrame(tick);
-  }, [paint, reducedMotion, simulation]);
-  const settleReducedMotion = useCallback(() => {
-    settleGraphSimulation(simulation, 240);
-    paint();
-  }, [paint, simulation]);
-
-  useEffect(() => {
-    cancelAnimation();
-    const simulationChanged = previousSimulationRef.current !== simulation;
-    const layoutChanged = previousLayoutRevisionRef.current !== layoutRevision;
-    previousSimulationRef.current = simulation;
-    previousLayoutRevisionRef.current = layoutRevision;
-    if (layoutChanged && !simulationChanged) reflowGraphSimulation(simulation);
-    if (reducedMotion) settleReducedMotion();
-    else {
-      paint();
-      startAnimation();
-    }
-    return cancelAnimation;
-  }, [cancelAnimation, layoutRevision, paint, reducedMotion, settleReducedMotion, simulation, startAnimation]);
-
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        cancelAnimation();
-        return;
-      }
-      if (!reducedMotion && shouldContinueGraphSimulation(simulation)) startAnimation();
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [cancelAnimation, reducedMotion, simulation, startAnimation]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return undefined;
-    const handleWheel = (event: WheelEvent) => {
-      event.preventDefault();
-      const anchor = clientPointInSvg(svgRef.current, event.clientX, event.clientY);
-      if (!anchor) return;
-      const wheelDelta = normalizeWheelDelta(event.deltaY, event.deltaMode, canvas.clientHeight);
-      commitView(zoomAtPoint(viewRef.current, anchor, { wheelDelta }, WIDTH, HEIGHT));
-    };
-    canvas.addEventListener('wheel', handleWheel, { passive: false });
-    return () => canvas.removeEventListener('wheel', handleWheel);
-  }, [commitView]);
-
-  useEffect(() => {
-    setHoveredNodeId(null);
-    setDraggingNodeId(null);
-    setIsPanning(false);
-    interactionRef.current = null;
-    return () => {
-      cancelAnimation();
-      const interaction = interactionRef.current;
-      if (interaction?.kind === 'node') releaseGraphNode(simulation, interaction.nodeId);
-      if (interaction && canvasRef.current?.hasPointerCapture(interaction.pointerId)) {
-        canvasRef.current.releasePointerCapture(interaction.pointerId);
-      }
-      interactionRef.current = null;
-    };
-  }, [cancelAnimation, simulation]);
-
-  const finishInteraction = useCallback((pointerId: number, allowSelection: boolean) => {
-    const interaction = interactionRef.current;
-    if (!interaction || interaction.pointerId !== pointerId) return;
-    interactionRef.current = null;
-    if (interaction.kind === 'node') {
-      releaseGraphNode(simulation, interaction.nodeId);
-      setDraggingNodeId(null);
-      if (reducedMotion) settleReducedMotion();
-      else startAnimation();
-      if (allowSelection && !interaction.moved) onSelectNode(interaction.nodeId);
-    } else {
-      setIsPanning(false);
-    }
-    const canvas = canvasRef.current;
-    if (canvas?.hasPointerCapture(pointerId)) canvas.releasePointerCapture(pointerId);
-  }, [onSelectNode, reducedMotion, settleReducedMotion, simulation, startAnimation]);
-
-  const handleCanvasPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!event.isPrimary || event.button !== 0 || (event.target as Element).closest('.graph-node')) return;
-    const start = clientPointInSvg(svgRef.current, event.clientX, event.clientY);
-    if (!start) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    interactionRef.current = { kind: 'pan', pointerId: event.pointerId, start, startPan: { ...viewRef.current.pan } };
-    setIsPanning(true);
-  };
-
-  const handleNodePointerDown = (event: ReactPointerEvent<SVGGElement>, nodeId: number) => {
-    if (!event.isPrimary || event.button !== 0) return;
-    event.stopPropagation();
-    event.preventDefault();
-    event.currentTarget.focus();
-    const graphPoint = clientPointInSvg(sceneRef.current, event.clientX, event.clientY);
-    const physicsNode = simulation.nodes.find((item) => item.node.id === nodeId);
-    const canvas = canvasRef.current;
-    if (!graphPoint || !physicsNode || !canvas) return;
-    canvas.setPointerCapture(event.pointerId);
-    interactionRef.current = {
-      kind: 'node',
-      pointerId: event.pointerId,
-      nodeId,
-      offset: { x: graphPoint.x - physicsNode.x, y: graphPoint.y - physicsNode.y },
-      startClient: { x: event.clientX, y: event.clientY },
-      moved: false,
-    };
-    pinGraphNode(simulation, nodeId, physicsNode.x, physicsNode.y);
-    setDraggingNodeId(nodeId);
-    paint();
-    if (!reducedMotion) startAnimation();
-  };
-
-  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const interaction = interactionRef.current;
-    if (!interaction || interaction.pointerId !== event.pointerId) return;
-    event.preventDefault();
-    if (interaction.kind === 'pan') {
-      const point = clientPointInSvg(svgRef.current, event.clientX, event.clientY);
-      if (!point) return;
-      commitView({
-        ...viewRef.current,
-        pan: clampGraphPan({
-          x: interaction.startPan.x + point.x - interaction.start.x,
-          y: interaction.startPan.y + point.y - interaction.start.y,
-        }),
-      });
-      return;
-    }
-    const graphPoint = clientPointInSvg(sceneRef.current, event.clientX, event.clientY);
-    if (!graphPoint) return;
-    if (!interaction.moved && Math.hypot(event.clientX - interaction.startClient.x, event.clientY - interaction.startClient.y) >= 5) {
-      interaction.moved = true;
-    }
-    moveGraphNode(simulation, interaction.nodeId, graphPoint.x - interaction.offset.x, graphPoint.y - interaction.offset.y);
-    paint();
-  };
-
-  const hoverNeighborhood = useMemo(() => {
-    const neighbors = new Set<number>();
-    const edges = new Set<GraphEdge>();
-    if (hoveredNodeId === null) return { neighbors, edges };
-    for (const edge of visibleEdges) {
-      if (edge.source !== hoveredNodeId && edge.target !== hoveredNodeId) continue;
-      edges.add(edge);
-      neighbors.add(edge.source === hoveredNodeId ? edge.target : edge.source);
-    }
-    return { neighbors, edges };
-  }, [hoveredNodeId, visibleEdges]);
-  const nodeById = new Map(simulation.nodes.map((item) => [item.node.id, item]));
-  const sceneTransform = `translate(${WIDTH / 2 + view.pan.x} ${HEIGHT / 2 + view.pan.y}) scale(${view.zoom}) translate(${-WIDTH / 2} ${-HEIGHT / 2})`;
-
-  return (
-    <div
-      ref={canvasRef}
-      className={`graph-canvas${isPanning ? ' graph-canvas--panning' : ''}`}
-      role="application"
-      tabIndex={0}
-      aria-label={ariaLabel}
-      onKeyDown={(event) => {
-        if (event.key === 'ArrowLeft') { event.preventDefault(); commitView({ ...viewRef.current, pan: clampGraphPan({ x: viewRef.current.pan.x - 48, y: viewRef.current.pan.y }) }); }
-        if (event.key === 'ArrowRight') { event.preventDefault(); commitView({ ...viewRef.current, pan: clampGraphPan({ x: viewRef.current.pan.x + 48, y: viewRef.current.pan.y }) }); }
-        if (event.key === 'ArrowUp') { event.preventDefault(); commitView({ ...viewRef.current, pan: clampGraphPan({ x: viewRef.current.pan.x, y: viewRef.current.pan.y - 48 }) }); }
-        if (event.key === 'ArrowDown') { event.preventDefault(); commitView({ ...viewRef.current, pan: clampGraphPan({ x: viewRef.current.pan.x, y: viewRef.current.pan.y + 48 }) }); }
-        if (event.key === '+' || event.key === '=') { event.preventDefault(); commitView(zoomAtPoint(viewRef.current, { x: WIDTH / 2, y: HEIGHT / 2 }, { nextZoom: viewRef.current.zoom + 0.15 }, WIDTH, HEIGHT)); }
-        if (event.key === '-') { event.preventDefault(); commitView(zoomAtPoint(viewRef.current, { x: WIDTH / 2, y: HEIGHT / 2 }, { nextZoom: viewRef.current.zoom - 0.15 }, WIDTH, HEIGHT)); }
-        if (event.key === '0') { event.preventDefault(); commitView(DEFAULT_GRAPH_VIEW); }
-      }}
-      onPointerDown={handleCanvasPointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={(event) => finishInteraction(event.pointerId, true)}
-      onPointerCancel={(event) => finishInteraction(event.pointerId, false)}
-      onLostPointerCapture={(event) => finishInteraction(event.pointerId, false)}
-    >
-      <svg ref={svgRef} viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="group" aria-label={ariaLabel}>
-        <g ref={sceneRef} transform={sceneTransform}>
-          {visibleEdges.map((edge, index) => {
-            const source = nodeById.get(Number(edge.source));
-            const target = nodeById.get(Number(edge.target));
-            if (!source || !target) return null;
-            const selectionRelated = selectedNodeId === null && selectedMemoryId === null
-              ? true
-              : selectedNodeId !== null
-                ? edge.source === selectedNodeId || edge.target === selectedNodeId
-                : edge.memory_id === selectedMemoryId;
-            const hoverRelated = hoveredNodeId !== null && hoverNeighborhood.edges.has(edge);
-            const hoverDimmed = hoveredNodeId !== null && !hoverRelated;
-            const relation = edge.relation_type || 'related';
-            const className = `graph-edge${selectionRelated ? ' graph-edge--related' : ''}${hoverRelated ? ' graph-edge--hovered' : ''}${hoverDimmed ? ' graph-edge--dimmed' : ''}`;
-            return <line className={className} key={edge.id ?? `${edge.source}-${edge.target}-${index}`} x1={source.x} y1={source.y} x2={target.x} y2={target.y} style={{ stroke: relationColors.get(relation) }}><title>{relation}</title></line>;
-          })}
-          {simulation.nodes.map(({ node, x, y, radius }) => {
-            const highlighted = highlightedNodeIds.has(node.id) || node.highlighted;
-            const selected = selectedNodeId === node.id;
-            const dragging = draggingNodeId === node.id;
-            const preservedDuringHover = hoveredNodeId === null || hoveredNodeId === node.id || hoverNeighborhood.neighbors.has(node.id) || selected || highlighted;
-            const className = `graph-node${highlighted ? ' graph-node--highlighted' : ''}${selected ? ' graph-node--selected' : ''}${dragging ? ' graph-node--dragging' : ''}${preservedDuringHover ? '' : ' graph-node--dimmed'}`;
-            return <g className={className} key={node.id} role="button" tabIndex={0} aria-label={`${node.label || node.id}, ${node.type || 'unknown'}`} transform={`translate(${x} ${y})`} onPointerDown={(event) => handleNodePointerDown(event, node.id)} onPointerEnter={() => setHoveredNodeId(node.id)} onPointerLeave={() => setHoveredNodeId((current) => current === node.id ? null : current)} onFocus={() => setHoveredNodeId(node.id)} onBlur={() => setHoveredNodeId((current) => current === node.id ? null : current)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); onSelectNode(node.id); } }}><circle r={Math.max(radius, 22)} /><text y="4">{shortLabel(node.label || `#${node.id}`)}</text><title>{node.label || node.id}</title></g>;
-          })}
-        </g>
-      </svg>
-    </div>
-  );
-}
+  CytoscapeGraphCanvas,
+  type CytoscapeGraphCanvasHandle,
+} from './CytoscapeGraphCanvas';
+import { GRAPH_RELATION_COLORS } from './graphCytoscape';
+import { displayImportance, MemoryDetailDrawer } from './MemoryDetailDrawer';
+import type { GraphMemory, GraphPayload, GraphNode, MemoryDetail } from './types';
 
 export default function GraphPage() {
   const { t } = useI18n();
@@ -355,11 +40,11 @@ export default function GraphPage() {
   const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null);
   const [selectedMemoryId, setSelectedMemoryId] = useState<number | null>(null);
   const [activeRelations, setActiveRelations] = useState<Set<string> | null>(null);
-  const [view, setView] = useState<GraphView>(DEFAULT_GRAPH_VIEW);
-  const [layoutRevision, setLayoutRevision] = useState(0);
+  const [graphZoom, setGraphZoom] = useState(1);
   const [detail, setDetail] = useState<MemoryDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
+  const graphCanvasRef = useRef<CytoscapeGraphCanvasHandle>(null);
   const viewModeRef = useRef<'overview' | 'custom'>('overview');
   const appliedOverviewKeyRef = useRef(initialOverview ? '\u0000' : '');
   viewModeRef.current = viewMode;
@@ -369,7 +54,7 @@ export default function GraphPage() {
     setSelectedNodeId(null);
     setSelectedMemoryId(next?.memory_id ?? null);
     setActiveRelations(null);
-    setView(DEFAULT_GRAPH_VIEW);
+    setGraphZoom(1);
   }, []);
 
   useEffect(() => {
@@ -419,15 +104,28 @@ export default function GraphPage() {
 
   const nodes = data?.snapshot.nodes ?? [];
   const allEdges = data?.snapshot.edges ?? [];
-  const relationTypes = useMemo(() => [...new Set((data?.snapshot.edges ?? []).map((edge) => edge.relation_type || 'related'))].sort(), [data]);
-  const relationColors = useMemo(() => new Map(relationTypes.map((relation, index) => [relation, RELATION_COLORS[index % RELATION_COLORS.length]])), [relationTypes]);
-  const visibleEdges = useMemo(() => (data?.snapshot.edges ?? []).filter((edge) => !activeRelations || activeRelations.has(edge.relation_type || 'related')), [activeRelations, data]);
+  const relationTypes = useMemo(
+    () => [...new Set((data?.snapshot.edges ?? []).map((edge) => edge.relation_type || 'related'))].sort(),
+    [data],
+  );
+  const relationColors = useMemo(
+    () => new Map(relationTypes.map((relation, index) => [relation, GRAPH_RELATION_COLORS[index % GRAPH_RELATION_COLORS.length]])),
+    [relationTypes],
+  );
+  const visibleEdges = useMemo(
+    () => (data?.snapshot.edges ?? []).filter((edge) => !activeRelations || activeRelations.has(edge.relation_type || 'related')),
+    [activeRelations, data],
+  );
   const selectedNode = data?.snapshot.nodes.find((node) => node.id === selectedNodeId) ?? null;
 
   const memoryMap = useMemo(() => {
     const map = new Map<number, GraphMemory>();
-    for (const item of [...(data?.snapshot.memories ?? []), ...(data?.top_memories ?? [])]) map.set(item.memory_id, { ...map.get(item.memory_id), ...item });
-    for (const item of data?.retrieval.items ?? []) map.set(item.memory_id, { ...map.get(item.memory_id), memory_id: item.memory_id, content: item.content, retrieval: item });
+    for (const item of [...(data?.snapshot.memories ?? []), ...(data?.top_memories ?? [])]) {
+      map.set(item.memory_id, { ...map.get(item.memory_id), ...item });
+    }
+    for (const item of data?.retrieval.items ?? []) {
+      map.set(item.memory_id, { ...map.get(item.memory_id), memory_id: item.memory_id, content: item.content, retrieval: item });
+    }
     return map;
   }, [data]);
   const memories = [...memoryMap.values()];
@@ -451,9 +149,6 @@ export default function GraphPage() {
     setSelectedMemoryId(nextMemoryId);
     setSelectedNodeId(null);
   };
-  const resetView = () => setView(DEFAULT_GRAPH_VIEW);
-  const changeZoom = (delta: number) => setView((current) => zoomAtPoint(current, { x: WIDTH / 2, y: HEIGHT / 2 }, { nextZoom: Number((current.zoom + delta).toFixed(2)) }, WIDTH, HEIGHT));
-  const movePan = (x: number, y: number) => setView((current) => ({ ...current, pan: clampGraphPan({ x: current.pan.x + x, y: current.pan.y + y }) }));
 
   const openFullDetail = async (nextMemoryId: number) => {
     setDetail(null);
@@ -471,7 +166,8 @@ export default function GraphPage() {
   const toggleRelation = (relation: string) => {
     setActiveRelations((current) => {
       const next = new Set(current ?? relationTypes);
-      if (next.has(relation)) next.delete(relation); else next.add(relation);
+      if (next.has(relation)) next.delete(relation);
+      else next.add(relation);
       return next;
     });
   };
@@ -498,19 +194,20 @@ export default function GraphPage() {
       {data && displayError ? <p className="inline-feedback inline-feedback--error" role="alert">{displayError instanceof Error ? displayError.message : String(displayError)}</p> : null}
       {loading ? <DataState state="loading" title={t('loading')} message={t('graphSnapshot')} /> : !data && displayError ? <DataState state="error" title={t('operationFailed')} message={displayError instanceof Error ? displayError.message : String(displayError)} action={viewMode === 'overview' ? <button className="wf-button" type="button" onClick={overview}>{t('retry')}</button> : undefined} /> : !data?.enabled ? <DataState state="empty" title={t('disabled')} message={t('memoryUnavailable')} /> : !nodes.length ? <DataState state="empty" title={t('graphEmpty')} message={t('graphSnapshot')} /> : (
         <div className="graph-layout">
-          <WorkshopPanel title={`${data.mode} · ${data.summary.visible_node_count} ${t('nodes')}`} description={`${data.summary.visible_edge_count} ${t('edges')} · ${data.summary.visible_memory_count} ${t('memoriesLabel')}`}>
-            <div className="graph-view-controls" aria-label={t('graphControls')}>
-              <button className="wf-button" type="button" aria-label={t('zoomOut')} onClick={() => changeZoom(-0.15)}>−</button>
-              <output aria-live="polite">{Math.round(view.zoom * 100)}%</output>
-              <button className="wf-button" type="button" aria-label={t('zoomIn')} onClick={() => changeZoom(0.15)}>+</button>
-              <button className="wf-button" type="button" onClick={() => movePan(-48, 0)}>←</button>
-              <button className="wf-button" type="button" onClick={() => movePan(0, -48)}>↑</button>
-              <button className="wf-button" type="button" onClick={() => movePan(0, 48)}>↓</button>
-              <button className="wf-button" type="button" onClick={() => movePan(48, 0)}>→</button>
-              <button className="wf-button" type="button" onClick={resetView}>{t('resetView')}</button>
-              <button className="wf-button" type="button" onClick={() => setLayoutRevision((current) => current + 1)}>{t('reflowGraph')}</button>
+          <WorkshopPanel title={`${data.mode} · ${data.summary.visible_node_count} ${t('nodes')}`} description={`${visibleEdges.length} ${t('edges')} · ${data.summary.visible_memory_count} ${t('memoriesLabel')}`}>
+            <div className="graph-view-controls" role="toolbar" aria-label={t('graphControls')}>
+              <button className="wf-button" type="button" aria-label={t('zoomOut')} onClick={() => graphCanvasRef.current?.zoomOut()}>−</button>
+              <output aria-live="polite">{Math.round(graphZoom * 100)}%</output>
+              <button className="wf-button" type="button" aria-label={t('zoomIn')} onClick={() => graphCanvasRef.current?.zoomIn()}>+</button>
+              <button className="wf-button" type="button" aria-label={t('panLeft')} onClick={() => graphCanvasRef.current?.panBy(-48, 0)}>←</button>
+              <button className="wf-button" type="button" aria-label={t('panUp')} onClick={() => graphCanvasRef.current?.panBy(0, -48)}>↑</button>
+              <button className="wf-button" type="button" aria-label={t('panDown')} onClick={() => graphCanvasRef.current?.panBy(0, 48)}>↓</button>
+              <button className="wf-button" type="button" aria-label={t('panRight')} onClick={() => graphCanvasRef.current?.panBy(48, 0)}>→</button>
+              <button className="wf-button" type="button" onClick={() => graphCanvasRef.current?.reset()}>{t('resetView')}</button>
+              <button className="wf-button" type="button" onClick={() => graphCanvasRef.current?.reflow()}>{t('reflowGraph')}</button>
             </div>
-            <InteractiveGraphCanvas
+            <CytoscapeGraphCanvas
+              ref={graphCanvasRef}
               nodes={nodes}
               allEdges={allEdges}
               visibleEdges={visibleEdges}
@@ -518,11 +215,10 @@ export default function GraphPage() {
               selectedMemoryId={selectedMemoryId}
               highlightedNodeIds={highlightedNodeIds}
               relationColors={relationColors}
-              view={view}
-              onViewChange={setView}
-              layoutRevision={layoutRevision}
               onSelectNode={selectNode}
+              onZoomChange={setGraphZoom}
               ariaLabel={`${t('graph')}. ${t('graphKeyboardHint')}`}
+              nodeAriaLabel={(node) => `${node.label || node.id}, ${node.type || t('unknown')}`}
             />
             <div className="graph-legend" aria-label={t('legend')}>
               {relationTypes.map((relation) => <button className="legend-item" type="button" key={relation} aria-pressed={!activeRelations || activeRelations.has(relation)} onClick={() => toggleRelation(relation)}><span style={{ background: relationColors.get(relation) }} />{relation} <strong>{data.summary.relation_breakdown[relation] ?? 0}</strong></button>)}

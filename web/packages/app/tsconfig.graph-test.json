@@ -10,8 +10,11 @@
     "types": ["node"]
   },
   "include": [
+    "src/types/cytoscape-fcose.d.ts",
     "src/features/memory/types.ts",
-    "src/features/memory/graphPhysics.ts",
-    "src/features/memory/graphPhysics.test.ts"
+    "src/features/memory/graphCytoscape.ts",
+    "src/features/memory/graphCytoscape.test.ts",
+    "src/features/memory/recallSessions.ts",
+    "src/features/memory/recallSessions.test.ts"
   ]
 }

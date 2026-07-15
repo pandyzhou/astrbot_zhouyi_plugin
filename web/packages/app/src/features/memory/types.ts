@@ -161,6 +161,13 @@ export interface MemoryDetail extends MemoryMetadata {
   graph_context?: MemoryGraphContext | null;
 }
 
+export interface RecallSession {
+  session_id: string;
+  group_id: string;
+  display_name?: string | null;
+  message_count: number;
+}
+
 export interface StatsData {
   total_memories?: number;
   status_breakdown?: Record<string, number>;
@@ -170,6 +177,8 @@ export interface StatsData {
   atom_count?: number;
   atom_breakdown?: Record<string, number>;
   importance_distribution?: Record<string, number>;
+  recall_sessions?: RecallSession[];
+  sessions?: Record<string, number>;
   recent_sessions?: Array<{ session_id: string; message_count: number; last_active?: string }>;
 }
 

@@ -1,9 +1,12 @@
-import { useState } from 'react';
-import { DataState, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
+import { useMemo, useState } from 'react';
+import { DataState, SelectField, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
 import { memoryGet, memoryPost } from '../../api/client';
 import { useI18n } from '../../i18n';
+import { queryKeys } from '../../store/queryKeys';
+import { useCachedQuery } from '../../store/useCachedQuery';
 import { displayImportance, MemoryDetailDrawer } from './MemoryDetailDrawer';
-import type { MemoryDetail, RecallData, RecallItem } from './types';
+import { buildRecallSessionOptions } from './recallSessions';
+import type { MemoryDetail, RecallData, RecallItem, StatsData } from './types';
 
 function formatRawScore(value: unknown) {
   const score = Number(value);
@@ -19,6 +22,10 @@ function formatScorePercentage(item: RecallItem) {
 
 export function RecallPage() {
   const { t } = useI18n();
+  const statsQuery = useCachedQuery<StatsData>(
+    queryKeys.memoryOverviewStats,
+    () => memoryGet<StatsData>('stats'),
+  );
   const [query, setQuery] = useState('');
   const [session, setSession] = useState('');
   const [k, setK] = useState(5);
@@ -29,6 +36,10 @@ export function RecallPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
   const [selectedResult, setSelectedResult] = useState<RecallItem | null>(null);
+  const sessionOptions = useMemo(
+    () => [{ value: '', label: t('all') }, ...buildRecallSessionOptions(statsQuery.data?.recall_sessions, t('groupChat'))],
+    [statsQuery.data?.recall_sessions, t],
+  );
 
   const run = async () => {
     setDetailError('');
@@ -85,7 +96,14 @@ export function RecallPage() {
             </label>
             <div className="recall-options">
               <label className="wf-label">k<input className="wf-input" type="number" min="1" max="50" value={k} onChange={(event) => setK(Math.max(1, Math.min(50, Number(event.target.value) || 1)))} /></label>
-              <label className="wf-label">{t('session')}<input className="wf-input" value={session} onChange={(event) => setSession(event.target.value)} /></label>
+              <SelectField
+                id="recall-session"
+                label={t('session')}
+                options={sessionOptions}
+                value={session}
+                onChange={setSession}
+                disabled={statsQuery.isInitialLoading || statsQuery.isRefreshing}
+              />
               <p id="recall-keyboard-hint" className="recall-keyboard-hint">{t('keyboardHint')}</p>
               <button className="wf-button wf-button--primary recall-run-button" disabled={loading || !query.trim()}>{loading ? t('processing') : t('run')}</button>
             </div>

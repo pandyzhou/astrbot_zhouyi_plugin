@@ -8,10 +8,13 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "test:memory-config": "rm -rf ../../../temp/memory-config-tests && tsc -p tsconfig.memory-config-test.json && NODE_PATH=../../../web/node_modules node --test ../../../temp/memory-config-tests/features/settings/memoryConfigSchema.test.js ../../../temp/memory-config-tests/store/workshopStore.test.js",
-    "test:graph": "rm -rf ../../../temp/graph-tests && tsc -p tsconfig.graph-test.json && NODE_PATH=../../../web/node_modules node --test ../../../temp/graph-tests/features/memory/graphPhysics.test.js"
+    "test:graph": "rm -rf ../../../temp/graph-tests && tsc -p tsconfig.graph-test.json && NODE_PATH=../../../web/node_modules node --test ../../../temp/graph-tests/features/memory/graphCytoscape.test.js",
+    "test:recall": "rm -rf ../../../temp/graph-tests && tsc -p tsconfig.graph-test.json && NODE_PATH=../../../web/node_modules node --test ../../../temp/graph-tests/features/memory/recallSessions.test.js"
   },
   "dependencies": {
     "@pandyzhou/astrbot-mc-ui": "0.1.0",
+    "cytoscape": "^3.34.0",
+    "cytoscape-fcose": "^2.2.0",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "react-router-dom": "7.18.1",

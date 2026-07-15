@@ -4,6 +4,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ASTRBOT_ROOT = Path(__file__).resolve().parents[4]
 if str(ASTRBOT_ROOT) not in sys.path:
@@ -100,6 +101,17 @@ class ZhouyiDashboardApiTests(unittest.IsolatedAsyncioTestCase):
         for suffix, _, methods, _ in MEMORY_ROUTE_DESCRIPTORS:
             self.assertIn((f"{MEMORY_V1_PREFIX}{suffix}", methods), registered)
             self.assertIn((f"{PAGE_API_PREFIX}{suffix}", methods), registered)
+
+    async def test_stats_handler_receives_plugin_context(self):
+        plugin = _Plugin()
+        api = ZhouyiDashboardApi(plugin, _MemoryService())
+
+        self.assertIs(api._memory_components["get_stats"].context, plugin.context)
+
+    async def test_stats_handler_accepts_plugin_without_context_attribute(self):
+        api = ZhouyiDashboardApi(SimpleNamespace(), _MemoryService())
+
+        self.assertIsNone(api._memory_components["get_stats"].context)
 
     async def test_memory_config_routes_are_narrow_and_have_no_legacy_alias(self):
         plugin = _Plugin()

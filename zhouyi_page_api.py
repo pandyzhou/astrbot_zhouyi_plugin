@@ -69,7 +69,7 @@ class ZhouyiDashboardApi:
 
                 utils = PageApiUtils()
                 self._memory_components = {
-                    "get_stats": StatsHandler(utils),
+                    "get_stats": StatsHandler(utils, getattr(plugin, "context", None)),
                     "list_memories": MemoryPageHandler(utils),
                     "get_memory_detail": MemoryPageHandler(utils),
                     "update_memory": MemoryPageHandler(utils),
