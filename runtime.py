@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -29,9 +30,11 @@ class PluginRuntime:
         self.plugin = plugin
         self.context = context
         self.config = config
+        self.runtime_id = uuid.uuid4().hex
         self.memory: Any | None = None
         self.memory_enabled = False
         self.memory_error: str | None = None
+        self.memory_config_api: Any | None = None
         self.page_api: Any | None = None
         self.standalone_service: Any | None = None
         self.standalone_task: asyncio.Task[Any] | None = None
@@ -112,6 +115,18 @@ class PluginRuntime:
     def _register_page_api(self) -> None:
         """优先使用统一 Facade；文件暂缺时兼容现有 MC 页面。"""
         try:
+            from .memory_config_api import MemoryConfigApi
+
+            self.memory_config_api = MemoryConfigApi(
+                self.config,
+                self.context,
+                self.runtime_id,
+            )
+        except Exception:
+            self.memory_config_api = None
+            logger.error("长期记忆配置 Page API 初始化失败", exc_info=True)
+
+        try:
             from .zhouyi_page_api import ZhouyiDashboardApi
         except ImportError:
             try:
@@ -126,7 +141,11 @@ class PluginRuntime:
             return
 
         try:
-            self.page_api = ZhouyiDashboardApi(self.plugin, self.memory)
+            self.page_api = ZhouyiDashboardApi(
+                self.plugin,
+                self.memory,
+                memory_config_api=self.memory_config_api,
+            )
             self.page_api.register_routes()
         except Exception:
             self.page_api = None

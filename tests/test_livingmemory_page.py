@@ -38,6 +38,7 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertNotIn("t('language')", app)
         for name in ("OverviewPage.tsx", "MemoriesPage.tsx", "RecallPage.tsx", "GraphPage.tsx"):
             self.assertTrue((APP_ROOT / "src" / "features" / "memory" / name).is_file())
+        self.assertTrue((APP_ROOT / "src" / "features" / "settings" / "MemoryConfigPage.tsx").is_file())
 
     def test_page_headings_do_not_include_subtitles_after_h1(self):
         page_sources = [
@@ -72,6 +73,8 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("useSyncExternalStore", hook)
         for key_factory in ("mcServers", "mcSettings", "mcTrends", "memoryList", "memoryGraphOverview"):
             self.assertIn(f"function {key_factory}", keys)
+        self.assertIn("MEMORY_CONFIG_QUERY_PREFIX", keys)
+        self.assertIn("memoryConfig", keys)
         self.assertIn("SOURCE_UPDATES_QUERY_PREFIX", keys)
         self.assertIn("sourceUpdates", keys)
 
@@ -81,6 +84,7 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
                 "servers": "features/servers/ServersPage.tsx",
                 "trends": "features/trends/TrendsPage.tsx",
                 "settings": "features/settings/SettingsPage.tsx",
+                "memory_config": "features/settings/MemoryConfigPage.tsx",
                 "overview": "features/memory/OverviewPage.tsx",
                 "memories": "features/memory/MemoriesPage.tsx",
                 "graph": "features/memory/GraphPage.tsx",
@@ -88,7 +92,7 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
                 "source_updates": "features/sources/SourceUpdatesPage.tsx",
             }.items()
         }
-        for name in ("servers", "trends", "settings", "overview", "memories", "graph", "source_updates"):
+        for name in ("servers", "trends", "settings", "memory_config", "overview", "memories", "graph", "source_updates"):
             self.assertIn("useCachedQuery", pages[name], name)
         self.assertNotIn("useCachedQuery", pages["recall"])
         self.assertNotIn("setData(null)", pages["servers"])
@@ -96,6 +100,16 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("if (!cachedData || dirty || saving || pendingPreview) return", pages["settings"])
         self.assertIn("MEMORY_LIST_QUERY_PREFIX", pages["memories"])
         self.assertIn("MEMORY_GRAPH_QUERY_PREFIX", pages["memories"])
+
+    def test_trend_filters_are_kept_in_workshop_store(self):
+        trends = (APP_ROOT / "src" / "features" / "trends" / "TrendsPage.tsx").read_text(encoding="utf-8")
+        store = (APP_ROOT / "src" / "store" / "workshopStore.ts").read_text(encoding="utf-8")
+
+        self.assertIn("trendFiltersByGroup: Record<string, TrendFiltersState>", store)
+        self.assertIn("setTrendFilters: (groupId: string, filters: TrendFiltersState)", store)
+        self.assertIn("state.trendFiltersByGroup[groupId]", trends)
+        self.assertIn("setTrendFilters(groupId", trends)
+        self.assertNotIn("useState<TrendFilters>", trends)
 
     def test_source_updates_page_contracts(self):
         source_page_path = APP_ROOT / "src" / "features" / "sources" / "SourceUpdatesPage.tsx"
@@ -116,6 +130,10 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertNotIn('!standalone ? <NavLink to="/sources/updates">', app)
         self.assertIn('<Route path="/sources/updates" element={<SourceUpdatesPage />} />', app)
         self.assertNotIn('!standalone ? <Route path="/sources/updates"', app)
+        self.assertIn('<NavLink to="/settings/memory">', app)
+        self.assertIn('<Route path="/settings/memory" element={<MemoryConfigPage', app)
+        self.assertNotIn('memoryAvailable ? <NavLink to="/settings/memory"', app)
+        self.assertNotIn('standalone ? <Route path="/settings/memory"', app)
         self.assertIn("const standalone = !window.AstrBotPluginPage; const memoryAvailable = !standalone && Boolean(bootstrap?.capabilities.memory.available)", app)
         self.assertIn('{memoryAvailable ? <><NavLink to="/memory/overview">', app)
         self.assertIn('{memoryAvailable ? <><Route path="/memory/overview"', app)
@@ -160,6 +178,79 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", styles)
         self.assertIn("@media (max-width: 900px)", styles)
         self.assertIn("grid-template-columns: 1fr", styles)
+
+    def test_memory_config_page_contracts(self):
+        settings_root = APP_ROOT / "src" / "features" / "settings"
+        page = (settings_root / "MemoryConfigPage.tsx").read_text(encoding="utf-8")
+        schema = (settings_root / "memoryConfigSchema.ts").read_text(encoding="utf-8")
+        client = (APP_ROOT / "src" / "api" / "client.ts").read_text(encoding="utf-8")
+        mock_client = (APP_ROOT / "src" / "api" / "mockClient.ts").read_text(encoding="utf-8")
+        types = (APP_ROOT / "src" / "api" / "types.ts").read_text(encoding="utf-8")
+        keys = (APP_ROOT / "src" / "store" / "queryKeys.ts").read_text(encoding="utf-8")
+        schema_test = (settings_root / "memoryConfigSchema.test.ts").read_text(encoding="utf-8")
+        app_package = (APP_ROOT / "package.json").read_text(encoding="utf-8")
+
+        self.assertIn("parseMemoryConfigSchema", page)
+        self.assertIn("createMemoryConfigDraft", page)
+        self.assertIn("validateMemoryConfigDraft", page)
+        self.assertIn("convertMemoryConfigDraft", page)
+        self.assertIn("beforeunload", page)
+        self.assertIn("expected_revision: data.revision", page)
+        self.assertIn("queryCache.invalidate(queryKeyPrefixes.memory)", page)
+        self.assertIn("config: result.config", page)
+        self.assertIn("values: result.config", page)
+        self.assertIn("runtime_id: result.runtime_id ?? data.runtime_id", page)
+        self.assertIn("reload_status: result.reload_status ?? data.reload_status", page)
+        self.assertIn("reload_failed: result.reload_failed ?? data.reload_failed", page)
+        self.assertIn("result.old_runtime_id || data.runtime_id", page)
+        self.assertIn("loaded.runtime_id !== oldRuntimeId", page)
+        self.assertIn("revisionMatches(loaded.revision, expectedRevision)", page)
+        self.assertIn("memoryConfigEquals(loaded.config, expectedConfig)", page)
+        self.assertIn("loaded.reload_failed || loaded.reload_status === 'failed'", page)
+        self.assertIn("配置已保存，但自动重载插件失败，请手动重载插件", page)
+        self.assertIn("result.revision,\n        result.config,", page)
+        self.assertIn("已被其他请求修改", page)
+        self.assertIn(r"revision\s+conflict", page)
+        self.assertIn("版本冲突", page)
+        self.assertIn("重新加载并保留草稿", page)
+        self.assertIn("if (!preserveDraft) setDraft", page)
+        self.assertIn("applyLoadedData(loaded, preserveDraft)", page)
+
+        for helper in (
+            "deepClone",
+            "getAtPath",
+            "setAtPath",
+            "countMemoryConfigChanges",
+            "convertMemoryConfigDraft",
+            "validateMemoryConfigDraft",
+            "memoryConfigEquals",
+        ):
+            self.assertIn(f"function {helper}", schema)
+        self.assertIn("Object.keys(left).sort()", schema)
+        self.assertIn("memoryConfigEquals(value, right[index])", schema)
+        self.assertIn("深比较忽略对象 key 顺序", schema_test)
+        self.assertIn("AstrBot 默认", schema)
+        self.assertIn("当前不可用", schema)
+        self.assertIn("config: MemoryConfigObject", types)
+        self.assertIn("config: raw.config as MemoryConfigData['config']", client)
+        self.assertIn("reload_status: memoryReloadStatus(raw.reload_status)", client)
+        self.assertIn("reload_failed: raw.reload_failed === true", client)
+        self.assertIn("message: stringOrNull(raw.message) ?? undefined", client)
+        self.assertIn("保存响应缺少规范化 config", client)
+        self.assertIn("'/page/v1/config/memory'", client)
+        self.assertIn("mutationKey: 'memory-config:save'", client)
+        self.assertIn("/page/v1/config/memory", mock_client)
+        self.assertIn("bot_language: 'zh'", mock_client)
+        self.assertIn("provider_settings", mock_client)
+        self.assertIn("recall_engine", mock_client)
+        self.assertIn("config: clone(memoryConfigValues)", mock_client)
+        self.assertNotIn("bot_language: 'zh-CN'", mock_client)
+        self.assertNotIn("providers: { llm_provider_id", mock_client)
+        self.assertNotIn("retrieval: {", mock_client)
+        self.assertNotIn("storage: {", mock_client)
+        self.assertIn('"test:memory-config"', app_package)
+        self.assertIn("../../../temp/memory-config-tests", app_package)
+        self.assertIn("MEMORY_CONFIG_QUERY_PREFIX = ['config', 'memory']", keys)
 
     def test_api_client_uses_v1_namespaces(self):
         client = (APP_ROOT / "src" / "api" / "client.ts").read_text(encoding="utf-8")
@@ -221,8 +312,18 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("onNavigationLockChange?.(dirty || saving)", settings)
         self.assertIn("onNavigationLockChange?.(false)", settings)
         self.assertIn("useState(false)", app)
-        self.assertIn("disabled={loading || groups.length === 0 || settingsNavigationLocked}", app)
+        self.assertIn("const navigationLocked = settingsNavigationLocked || memoryConfigNavigationLocked", app)
+        self.assertIn("disabled={loading || groups.length === 0 || navigationLocked}", app)
         self.assertIn("<SettingsPage onNavigationLockChange={setSettingsNavigationLocked} />", app)
+        self.assertIn("<MemoryConfigPage onNavigationLockChange={setMemoryConfigNavigationLocked} />", app)
+        self.assertIn("window.addEventListener('hashchange', handleHashChange)", app)
+        self.assertIn("window.removeEventListener('hashchange', handleHashChange)", app)
+        self.assertIn("approvedHashRef", app)
+        self.assertIn("restoringHashRef", app)
+        self.assertIn("window.location.hash = acceptedHashRef.current", app)
+        self.assertIn("approved.expiresAt >= Date.now()", app)
+        self.assertIn("event.preventDefault()", app)
+        self.assertIn("onClickCapture={handleNavigationClick}", app)
 
         self.assertIn("const scopeRef = useRef<SettingsScope>('global')", settings)
         self.assertIn("useCachedQuery<SettingsData>", settings)

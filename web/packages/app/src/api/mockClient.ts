@@ -2,6 +2,10 @@ import type {
   ApiEnvelope,
   CleanupCandidate,
   GroupRuntimeSettingKey,
+  MemoryConfigData,
+  MemoryConfigMutationInput,
+  MemoryConfigObject,
+  MemoryConfigSaveData,
   RuntimeSettingKey,
   RuntimeSettings,
   SettingsData,
@@ -59,6 +63,89 @@ const now = () => Math.floor(Date.now() / 1000);
 const bucketNow = () => Math.floor(now() / 3600) * 3600;
 const hoursAgo = (hours: number) => now() - hours * 3600;
 let sourceUpdatesCheckedAt = now() - 120;
+let memoryConfigRevision = 1;
+let memoryRuntimeSequence = 1;
+let memoryRuntimeId = 'mock-memory-runtime-1';
+let pendingMemoryRuntime: { activateAt: number; runtimeId: string } | null = null;
+let memoryConfigValues: MemoryConfigObject = {
+  enabled: true,
+  bot_language: 'zh',
+  provider_settings: { embedding_provider_id: 'embedding-main', llm_provider_id: '' },
+  recall_engine: { top_k: 5, importance_weight: 1, fallback_to_vector: true },
+};
+const memoryConfigSchema: MemoryConfigData['schema'] = {
+  memory: {
+    type: 'object',
+    description: '长期记忆',
+    items: {
+      enabled: { type: 'bool', description: '启用长期记忆', default: true },
+      bot_language: { type: 'string', description: '机器人回复语言', options: ['zh', 'en', 'ru'], default: 'zh' },
+      provider_settings: {
+        type: 'object', description: '模型提供商', items: {
+          embedding_provider_id: { type: 'string', description: 'Embedding 模型 ID', provider_type: 'embedding', default: '' },
+          llm_provider_id: { type: 'string', description: 'LLM 模型 ID', _special: 'select_provider', default: '' },
+        },
+      },
+      recall_engine: {
+        type: 'object', description: '记忆召回', items: {
+          top_k: { type: 'int', description: '单次召回数量', default: 5 },
+          importance_weight: { type: 'float', description: '重要性权重', default: 1 },
+          fallback_to_vector: { type: 'bool', description: '降级到纯向量检索', default: true },
+        },
+      },
+    },
+  },
+};
+
+function configObject(value: MemoryConfigObject[string]): MemoryConfigObject {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as MemoryConfigObject : {};
+}
+
+function normalizeMockMemoryConfig(config: MemoryConfigObject): MemoryConfigObject {
+  const providerSettings = configObject(config.provider_settings);
+  const recallEngine = configObject(config.recall_engine);
+  const language = typeof config.bot_language === 'string' && ['zh', 'en', 'ru'].includes(config.bot_language)
+    ? config.bot_language
+    : 'zh';
+  return {
+    enabled: config.enabled === true,
+    bot_language: language,
+    provider_settings: {
+      embedding_provider_id: typeof providerSettings.embedding_provider_id === 'string' ? providerSettings.embedding_provider_id : '',
+      llm_provider_id: typeof providerSettings.llm_provider_id === 'string' ? providerSettings.llm_provider_id : '',
+    },
+    recall_engine: {
+      top_k: typeof recallEngine.top_k === 'number' ? Math.max(0, Math.round(recallEngine.top_k)) : 5,
+      importance_weight: typeof recallEngine.importance_weight === 'number' ? recallEngine.importance_weight : 1,
+      fallback_to_vector: recallEngine.fallback_to_vector !== false,
+    },
+  };
+}
+
+function memoryConfigData(): MemoryConfigData {
+  if (pendingMemoryRuntime && Date.now() >= pendingMemoryRuntime.activateAt) {
+    memoryRuntimeId = pendingMemoryRuntime.runtimeId;
+    pendingMemoryRuntime = null;
+  }
+  return {
+    schema: clone(memoryConfigSchema),
+    config: clone(memoryConfigValues),
+    values: clone(memoryConfigValues),
+    revision: `mock-memory-${memoryConfigRevision}`,
+    runtime_id: memoryRuntimeId,
+    runtime_generation: memoryRuntimeSequence,
+    reload_status: pendingMemoryRuntime ? 'scheduled' : 'idle',
+    reload_failed: false,
+    providers: {
+      llm: [{ id: 'llm-main', label: 'Mock LLM', model: 'mock-chat', type: 'llm' }],
+      embedding: [{ id: 'embedding-main', label: 'Mock Embedding', model: 'mock-embed', type: 'embedding' }],
+    },
+    constraints: {
+      'recall_engine.top_k': { min: 0, max: 50, step: 1 },
+      'recall_engine.importance_weight': { min: 0, max: 10, step: 0.1 },
+    },
+  };
+}
 
 function sourceUpdatesData(force = false): SourceUpdatesData {
   if (force) sourceUpdatesCheckedAt = now();
@@ -364,6 +451,33 @@ export async function mockRequest<T>(
   signal?: AbortSignal,
 ): Promise<ApiEnvelope<T>> {
   await wait(signal);
+
+  if (method === 'GET' && endpoint === '/page/v1/config/memory') {
+    return ok(memoryConfigData()) as ApiEnvelope<T>;
+  }
+
+  if (method === 'POST' && endpoint === '/page/v1/config/memory') {
+    const input = body as MemoryConfigMutationInput;
+    if (input.expected_revision !== `mock-memory-${memoryConfigRevision}`) {
+      return fail('MEMORY_CONFIG_REVISION_CONFLICT', '记忆配置已被其他操作更新，请重新加载后审查更改') as ApiEnvelope<T>;
+    }
+    const oldRuntimeId = memoryRuntimeId;
+    memoryConfigValues = normalizeMockMemoryConfig(input.config);
+    memoryConfigRevision += 1;
+    const nextRuntimeId = `mock-memory-runtime-${++memoryRuntimeSequence}`;
+    pendingMemoryRuntime = { activateAt: Date.now() + 1_300, runtimeId: nextRuntimeId };
+    const result: MemoryConfigSaveData = {
+      config: clone(memoryConfigValues),
+      revision: `mock-memory-${memoryConfigRevision}`,
+      old_runtime_id: oldRuntimeId,
+      reload_scheduled: true,
+      reload_pending: true,
+      reload_status: 'scheduled',
+      reload_failed: false,
+      manual_reload_required: false,
+    };
+    return ok(result) as ApiEnvelope<T>;
+  }
 
   if (method === 'GET' && endpoint === '/page/v1/sources/updates') {
     return ok(sourceUpdatesData()) as ApiEnvelope<T>;

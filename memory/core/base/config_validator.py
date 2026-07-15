@@ -3,7 +3,7 @@ config_validator.py - 配置验证模块
 提供配置验证和默认值管理功能。
 """
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -52,7 +52,14 @@ class RecallEngineConfig(BaseModel):
         default=1.0, ge=0.0, le=10.0, description="重要性权重"
     )
     fallback_to_vector: bool = Field(default=True, description="是否启用向量检索回退")
-    injection_method: str = Field(
+    injection_method: Literal[
+        "extra_user_content",
+        "user_message_before",
+        "user_message_after",
+        "fake_tool_call",
+        "fake_tool_call_deepseek_v4",
+        "system_prompt",
+    ] = Field(
         default="extra_user_content",
         description=(
             "记忆注入方式: "
@@ -159,6 +166,13 @@ class MigrationSettings(BaseModel):
     create_backup: bool = Field(default=True, description="迁移前是否创建备份")
 
 
+class BackupSettings(BaseModel):
+    """定期备份设置"""
+
+    enabled: bool = Field(default=True, description="是否启用每日自动备份")
+    keep_days: int = Field(default=7, ge=1, le=3650, description="备份保留天数")
+
+
 class IndexRebuildSettings(BaseModel):
     """索引重建设置"""
 
@@ -246,6 +260,11 @@ class GraphMemoryConfig(BaseModel):
 class MemoryConfig(BaseModel):
     """完整插件配置"""
 
+    enabled: bool = Field(default=True, description="是否启用长期记忆")
+    bot_language: Literal["zh", "en", "ru"] = Field(
+        default="zh", description="机器人回复语言"
+    )
+    provider_settings: ProviderConfig = Field(default_factory=ProviderConfig)
     session_manager: SessionManagerConfig = Field(default_factory=SessionManagerConfig)
     recall_engine: RecallEngineConfig = Field(default_factory=RecallEngineConfig)
     reflection_engine: ReflectionEngineConfig = Field(
@@ -256,7 +275,6 @@ class MemoryConfig(BaseModel):
         default_factory=ForgettingAgentConfig
     )
     filtering_settings: FilteringConfig = Field(default_factory=FilteringConfig)
-    provider_settings: ProviderConfig = Field(default_factory=ProviderConfig)
     migration_settings: MigrationSettings = Field(default_factory=MigrationSettings)
     index_rebuild_settings: IndexRebuildSettings = Field(
         default_factory=IndexRebuildSettings
@@ -268,6 +286,7 @@ class MemoryConfig(BaseModel):
     importance_decay: ImportanceDecayConfig = Field(
         default_factory=ImportanceDecayConfig, description="重要性衰减配置"
     )
+    backup_settings: BackupSettings = Field(default_factory=BackupSettings)
 
     model_config = {"extra": "allow"}  # 允许额外字段，向前兼容
 

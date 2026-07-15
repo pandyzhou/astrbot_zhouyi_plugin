@@ -18,6 +18,7 @@ from .web_api import (
 PAGE_V1_PREFIX = f"{PAGE_API_PREFIX}/v1"
 MC_V1_PREFIX = f"{PAGE_V1_PREFIX}/mc"
 MEMORY_V1_PREFIX = f"{PAGE_V1_PREFIX}/memory"
+CONFIG_V1_PREFIX = f"{PAGE_V1_PREFIX}/config"
 SOURCES_V1_PREFIX = f"{PAGE_V1_PREFIX}/sources"
 
 MemoryHandler = Callable[[], Awaitable[Any]]
@@ -45,11 +46,14 @@ class ZhouyiDashboardApi:
         plugin: Any,
         memory_service: Any,
         source_update_monitor: SourceUpdateMonitor | None = None,
+        *,
+        memory_config_api: Any | None = None,
     ) -> None:
         self.plugin = plugin
         self.memory_service = memory_service
         self.mc_api = McManagerWebApi(plugin)
         self.source_update_monitor = source_update_monitor or get_source_update_monitor()
+        self.memory_config_api = memory_config_api
         self._memory_route_handlers: dict[str, MemoryHandler] = {}
         self._memory_components: dict[str, Any] = {}
         if memory_service is not None:
@@ -109,6 +113,20 @@ class ZhouyiDashboardApi:
             )
             register(f"{MEMORY_V1_PREFIX}{suffix}", handler, list(methods), description)
             register(f"{PAGE_API_PREFIX}{suffix}", handler, list(methods), f"Legacy {description}")
+
+        if self.memory_config_api is not None:
+            register(
+                f"{CONFIG_V1_PREFIX}/memory",
+                self.memory_config_api.get_memory_config,
+                ["GET"],
+                "Zhouyi Dashboard memory config",
+            )
+            register(
+                f"{CONFIG_V1_PREFIX}/memory",
+                self.memory_config_api.post_memory_config,
+                ["POST"],
+                "Zhouyi Dashboard memory config update",
+            )
 
         register(
             f"{SOURCES_V1_PREFIX}/updates",

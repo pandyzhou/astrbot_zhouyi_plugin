@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, type FormEvent } from 'react';
 import { DataState, SelectField, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
 import { apiClient } from '../../api/client';
 import type { ServerRecord, ServersData, SettingsData, TrendsData } from '../../api/types';
@@ -6,16 +6,8 @@ import { formatNumber } from '../../format';
 import { queryCache } from '../../store/queryCacheCore';
 import { queryKeys } from '../../store/queryKeys';
 import { useCachedQuery } from '../../store/useCachedQuery';
-import { useWorkshopStore } from '../../store/workshopStore';
+import { useWorkshopStore, type TrendFiltersState } from '../../store/workshopStore';
 import { TrendChart } from './TrendChart';
-
-interface TrendFilters {
-  groupId: string;
-  serverId: string;
-  hours: number;
-  hoursInput: string;
-  settingsReady: boolean;
-}
 
 function validateGroup<T extends { group_id: string }>(value: T, groupId: string, label: string): T {
   if (value.group_id !== groupId) throw new Error(`${label}响应不属于当前群组，请重试。`);
@@ -64,32 +56,34 @@ export function TrendsPage() {
   const serversData = serversQuery.data?.group_id === groupId ? serversQuery.data : undefined;
   const settingsData = settingsQuery.data?.group_id === groupId ? settingsQuery.data : undefined;
 
-  const [filters, setFilters] = useState<TrendFilters>({
-    groupId,
-    serverId: 'all',
-    hours: 24,
-    hoursInput: '24',
-    settingsReady: false,
-  });
+  const filters = useWorkshopStore((state) => state.trendFiltersByGroup[groupId]);
+  const setTrendFilters = useWorkshopStore((state) => state.setTrendFilters);
 
   useEffect(() => {
-    if (!settingsData) return;
-    setFilters((current) => {
-      if (current.groupId === groupId && current.settingsReady) return current;
-      const defaultHours = settingsData.effective.default_trend_hours;
-      return {
-        groupId,
-        serverId: 'all',
-        hours: defaultHours,
-        hoursInput: String(defaultHours),
-        settingsReady: true,
-      };
+    if (!settingsData || filters?.settingsReady) return;
+    const defaultHours = settingsData.effective.default_trend_hours;
+    setTrendFilters(groupId, {
+      serverId: filters?.serverId ?? 'all',
+      hours: filters?.hours ?? defaultHours,
+      hoursInput: filters?.hoursInput ?? String(defaultHours),
+      settingsReady: true,
     });
-  }, [groupId, settingsData]);
+  }, [filters, groupId, setTrendFilters, settingsData]);
 
-  const filtersReady = filters.groupId === groupId && filters.settingsReady;
+  const filtersReady = Boolean(filters?.settingsReady);
   const serverId = filtersReady ? filters.serverId : 'all';
   const hours = filtersReady ? filters.hours : 24;
+  useEffect(() => {
+    if (!filters?.settingsReady || !serversData || filters.serverId === 'all') return;
+    if (serversData.servers.some((server) => server.id === filters.serverId)) return;
+    setTrendFilters(groupId, { ...filters, serverId: 'all' });
+  }, [filters, groupId, serversData, setTrendFilters]);
+
+  function updateFilters(changes: Partial<TrendFiltersState>) {
+    if (!filtersReady || !filters) return;
+    setTrendFilters(groupId, { ...filters, ...changes });
+  }
+
   const trendKey = queryKeys.mcTrends(groupId, serverId === 'all' ? undefined : serverId, hours);
   const trendsQuery = useCachedQuery<TrendsData>(trendKey, async () => (
     validateGroup(
@@ -109,18 +103,18 @@ export function TrendsPage() {
     if (!filtersReady) return;
     const parsed = Number(filters.hoursInput);
     const next = Number.isFinite(parsed) ? Math.max(1, Math.min(168, Math.round(parsed))) : 24;
-    setFilters((current) => ({ ...current, hoursInput: String(next), hours: next }));
+    updateFilters({ hoursInput: String(next), hours: next });
     if (next === hours) void trendsQuery.refresh().catch(() => undefined);
   }
 
   function useQuickHours(value: number) {
     if (!filtersReady) return;
-    setFilters((current) => ({ ...current, hoursInput: String(value), hours: value }));
+    updateFilters({ hoursInput: String(value), hours: value });
   }
 
   function selectServer(value: string) {
     if (!filtersReady) return;
-    setFilters((current) => ({ ...current, serverId: value }));
+    updateFilters({ serverId: value });
   }
 
   const initialLoading = settingsQuery.isInitialLoading || (filtersReady && trendsQuery.isInitialLoading);
@@ -169,7 +163,7 @@ export function TrendsPage() {
               inputMode="numeric"
               value={filtersReady ? filters.hoursInput : ''}
               disabled={!filtersReady}
-              onChange={(event) => setFilters((current) => ({ ...current, hoursInput: event.target.value }))}
+              onChange={(event) => updateFilters({ hoursInput: event.target.value })}
             />
           </label>
           <button className="wf-button wf-button--primary" type="submit" disabled={!filtersReady}>查询趋势</button>

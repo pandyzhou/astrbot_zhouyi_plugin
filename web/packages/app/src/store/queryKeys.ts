@@ -9,6 +9,7 @@ export const MEMORY_QUERY_PREFIX = ['memory'] as const;
 export const MEMORY_OVERVIEW_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'overview'] as const;
 export const MEMORY_LIST_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'list'] as const;
 export const MEMORY_GRAPH_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'graph'] as const;
+export const MEMORY_CONFIG_QUERY_PREFIX = ['config', 'memory'] as const;
 
 export const SOURCE_UPDATES_QUERY_PREFIX = ['sources', 'updates'] as const;
 
@@ -21,6 +22,7 @@ export const queryKeyPrefixes = Object.freeze({
   memoryOverview: MEMORY_OVERVIEW_QUERY_PREFIX,
   memoryList: MEMORY_LIST_QUERY_PREFIX,
   memoryGraph: MEMORY_GRAPH_QUERY_PREFIX,
+  memoryConfig: MEMORY_CONFIG_QUERY_PREFIX,
   sourceUpdates: SOURCE_UPDATES_QUERY_PREFIX,
 });
 
@@ -49,6 +51,7 @@ export function mcTrends(groupId: string, server: string | undefined, hours: num
 
 export const memoryOverviewStats = [...MEMORY_OVERVIEW_QUERY_PREFIX, 'stats'] as const;
 export const memoryOverviewBackups = [...MEMORY_OVERVIEW_QUERY_PREFIX, 'backups'] as const;
+export const memoryConfig = MEMORY_CONFIG_QUERY_PREFIX;
 export const sourceUpdates = SOURCE_UPDATES_QUERY_PREFIX;
 
 export function memoryList(filters: MemoryListQueryParams): QueryKey {
@@ -81,5 +84,6 @@ export const queryKeys = Object.freeze({
   memoryOverviewBackups,
   memoryList,
   memoryGraphOverview,
+  memoryConfig,
   sourceUpdates,
 });

@@ -337,6 +337,87 @@ export interface SettingsSaveData {
   };
 }
 
+export type MemoryConfigValue = null | boolean | number | string | MemoryConfigValue[] | { [key: string]: MemoryConfigValue };
+export type MemoryConfigObject = { [key: string]: MemoryConfigValue };
+export type MemoryConfigRevision = string;
+export type MemoryConfigReloadStatus = 'idle' | 'scheduled' | 'running' | 'failed';
+
+export interface MemoryConfigSchemaNode {
+  type?: 'object' | 'boolean' | 'bool' | 'string' | 'integer' | 'number' | 'int' | 'float';
+  title?: string;
+  label?: string;
+  description?: string;
+  hint?: string;
+  default?: MemoryConfigValue;
+  options?: unknown[] | Record<string, unknown>;
+  enum?: unknown[];
+  properties?: Record<string, MemoryConfigSchemaNode>;
+  items?: Record<string, MemoryConfigSchemaNode>;
+  _special?: string;
+  minimum?: number;
+  maximum?: number;
+  min?: number;
+  max?: number;
+  step?: number;
+  unit?: string;
+  provider_type?: 'llm' | 'embedding';
+  [key: string]: unknown;
+}
+
+export interface MemoryProviderOption {
+  id: string;
+  label?: string;
+  model?: string;
+  type?: string;
+}
+
+export interface MemoryProviderOptions {
+  llm: MemoryProviderOption[];
+  embedding: MemoryProviderOption[];
+}
+
+export interface MemoryFieldConstraint {
+  min?: number;
+  max?: number;
+  exclusive_min?: number;
+  exclusive_max?: number;
+  step?: number;
+  unit?: string;
+  required?: boolean;
+  pattern?: string;
+}
+
+export interface MemoryConfigData {
+  schema: MemoryConfigSchemaNode | Record<string, MemoryConfigSchemaNode>;
+  config: MemoryConfigObject;
+  values?: MemoryConfigObject;
+  revision: MemoryConfigRevision;
+  runtime_id: string;
+  runtime_generation?: number;
+  reload_status?: MemoryConfigReloadStatus;
+  reload_failed?: boolean;
+  providers: MemoryProviderOptions;
+  constraints: Record<string, MemoryFieldConstraint | Record<string, unknown>>;
+}
+
+export interface MemoryConfigMutationInput {
+  config: MemoryConfigObject;
+  expected_revision: MemoryConfigRevision;
+}
+
+export interface MemoryConfigSaveData {
+  config: MemoryConfigObject;
+  revision: MemoryConfigRevision;
+  old_runtime_id: string;
+  runtime_id?: string;
+  reload_scheduled: boolean;
+  reload_pending: boolean;
+  reload_status?: MemoryConfigReloadStatus;
+  reload_failed?: boolean;
+  manual_reload_required: boolean;
+  message?: string;
+}
+
 export type SourceUpdateStatus = 'current' | 'new_version' | 'new_commits' | 'changed' | 'unavailable';
 
 export interface SourceUpdateBaseline {

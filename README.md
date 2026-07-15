@@ -18,7 +18,7 @@
 - 每台服务器默认保留最多 10000 个趋势采样点，可在 WebUI 调整
 - 清理长期未查询成功且没有近期趋势记录的服务器
 - 提供 AstrBot Plugin Page 和独立 HTTPS WebUI
-- WebUI 支持服务器增删改查、运行配置、可选自动状态刷新和交互式趋势图
+- WebUI 支持服务器增删改查、运行配置、长期记忆配置、可选自动状态刷新和交互式趋势图
 - 提供 `mcmod_search` LLM 工具，搜索 MC百科中的模组、整合包、物品/方块和教程
 - 可选启用长期记忆 Memory，自动总结会话并通过 BM25、向量和图记忆进行长期召回
 - 提供 `recall_long_term_memory` 与可选的 `memorize_long_term_memory` Agent 工具
@@ -112,7 +112,7 @@ pip install -r requirements.txt
 - `recall_long_term_memory`：主动检索长期记忆，默认开启
 - `memorize_long_term_memory`：主动写入长期记忆，默认关闭
 
-页面入口由统一 `ZhouyiDashboardApi` 注册，长期记忆与 Minecraft 共用根插件页面命名空间；旧独立插件必须保持停用。
+页面入口由统一 `ZhouyiDashboardApi` 注册，长期记忆与 Minecraft 共用根插件页面命名空间；旧独立插件必须保持停用。Zhouyi Dashboard 的“记忆配置”页由 `_conf_schema.json` 驱动，可在 AstrBot 内嵌页和独立 HTTPS 页面中读取、校验并保存完整 Memory 配置；保存后插件会安全重载以应用新配置。
 
 ## MC百科 LLM 搜索工具
 
@@ -244,8 +244,9 @@ https://<AstrBot 主机>:35020/
 - 支持键盘导航的自定义下拉框
 - 全局默认与群组覆盖的运行配置页
 - 来源更新监控与手动刷新
+- 完整长期记忆配置管理与保存后插件重载
 
-Memory 页面仍仅在 AstrBot 内嵌 Plugin Page 中提供，不开放给独立 HTTPS 页面。
+Memory 概览、记忆管理、召回测试和知识图谱等内容页面及其数据 API 仍仅在 AstrBot 内嵌 Plugin Page 中提供；记忆配置页及固定配置 API 已开放给独立 HTTPS 页面。
 
 独立页面不会向浏览器暴露新的 API 密钥。它要求浏览器已经登录 AstrBot Dashboard，并通过白名单代理转发受支持的管理请求。
 
@@ -364,8 +365,7 @@ SQLite 启用了：
 │   └── packages/
 │       ├── app/                # React 管理界面
 │       └── ui/                 # 共用 UI 组件
-├── pages/mc-manager/           # Minecraft WebUI 生产构建产物
-├── pages/zhouyi-dashboard/      # 周易统一插件页面
+├── pages/zhouyi-dashboard/      # Zhouyi Dashboard 生产构建产物
 └── tests/                      # 存储、API、生命周期和根集成测试
 ```
 
@@ -409,7 +409,7 @@ npm run dev
 
 ```text
 web/packages/ui/dist/
-pages/mc-manager/
+pages/zhouyi-dashboard/
 ```
 
 ## 常见问题

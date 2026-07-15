@@ -15,6 +15,10 @@ import type {
   CleanupData,
   DeleteServerData,
   DeleteServerInput,
+  MemoryConfigData,
+  MemoryConfigMutationInput,
+  MemoryConfigSaveData,
+  MemoryProviderOption,
   RefreshStatusData,
   RefreshStatusInput,
   ServerMutationData,
@@ -233,6 +237,81 @@ function normalizeSourceUpdates(value: unknown): SourceUpdatesData {
   };
 }
 
+function normalizeProviderOptions(value: unknown): MemoryProviderOption[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const raw = objectOrEmpty(item);
+    const id = stringOrNull(raw.id);
+    if (!id) return [];
+    return [{
+      id,
+      label: stringOrNull(raw.label) ?? undefined,
+      model: stringOrNull(raw.model) ?? undefined,
+      type: stringOrNull(raw.type) ?? undefined,
+    }];
+  });
+}
+
+function memoryReloadStatus(value: unknown): MemoryConfigData['reload_status'] {
+  return value === 'idle' || value === 'scheduled' || value === 'running' || value === 'failed'
+    ? value
+    : undefined;
+}
+
+function normalizeMemoryConfig(value: unknown): MemoryConfigData {
+  const raw = objectOrEmpty(value);
+  const providerRaw = objectOrEmpty(raw.providers ?? raw.provider_options);
+  const configRaw = objectOrEmpty(raw.config ?? raw.values);
+  const schemaRaw = objectOrEmpty(raw.schema);
+  const constraintsRaw = objectOrEmpty(raw.constraints);
+  const revision = stringOrNull(raw.revision);
+  if (!revision) {
+    throw new ApiClientError('INVALID_MEMORY_CONFIG', '记忆配置响应缺少有效 revision');
+  }
+  return {
+    schema: schemaRaw,
+    config: configRaw as MemoryConfigData['config'],
+    values: configRaw as MemoryConfigData['values'],
+    revision,
+    runtime_id: stringOrNull(raw.runtime_id) ?? '',
+    runtime_generation: numberOrNull(raw.runtime_generation) ?? undefined,
+    reload_status: memoryReloadStatus(raw.reload_status),
+    reload_failed: raw.reload_failed === true,
+    providers: {
+      llm: normalizeProviderOptions(providerRaw.llm ?? providerRaw.llm_providers),
+      embedding: normalizeProviderOptions(providerRaw.embedding ?? providerRaw.embedding_providers),
+    },
+    constraints: constraintsRaw as MemoryConfigData['constraints'],
+  };
+}
+
+function isRawObject(value: unknown): value is RawObject {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizeMemoryConfigSave(value: unknown): MemoryConfigSaveData {
+  const raw = objectOrEmpty(value);
+  const revision = stringOrNull(raw.revision);
+  if (!revision) {
+    throw new ApiClientError('INVALID_MEMORY_CONFIG_SAVE', '保存响应缺少有效 revision');
+  }
+  if (!isRawObject(raw.config)) {
+    throw new ApiClientError('INVALID_MEMORY_CONFIG_SAVE', '保存响应缺少规范化 config');
+  }
+  return {
+    config: raw.config as MemoryConfigData['config'],
+    revision,
+    old_runtime_id: stringOrNull(raw.old_runtime_id) ?? stringOrNull(raw.previous_runtime_id) ?? '',
+    runtime_id: stringOrNull(raw.runtime_id) ?? undefined,
+    reload_scheduled: raw.reload_scheduled === true,
+    reload_pending: raw.reload_pending === true,
+    reload_status: memoryReloadStatus(raw.reload_status),
+    reload_failed: raw.reload_failed === true,
+    manual_reload_required: raw.manual_reload_required === true,
+    message: stringOrNull(raw.message) ?? undefined,
+  };
+}
+
 function validateGroupResponse<T extends { group_id: string }>(value: T, expectedGroupId: string, label: string): T {
   if (value.group_id !== expectedGroupId) {
     throw new ApiClientError('GROUP_MISMATCH', `${label}响应不属于当前群组，请重试。`);
@@ -395,6 +474,17 @@ export const apiClient = {
       }),
     };
   },
+  memoryConfig: async (signal?: AbortSignal): Promise<MemoryConfigData> => normalizeMemoryConfig(
+    await request<unknown>('/page/v1/config/memory', { signal }),
+  ),
+  saveMemoryConfig: async (input: MemoryConfigMutationInput, signal?: AbortSignal): Promise<MemoryConfigSaveData> => normalizeMemoryConfigSave(
+    await request<unknown>('/page/v1/config/memory', {
+      method: 'POST',
+      body: input,
+      signal,
+      mutationKey: 'memory-config:save',
+    }),
+  ),
   sourceUpdates: async (signal?: AbortSignal): Promise<SourceUpdatesData> => normalizeSourceUpdates(
     await request<unknown>('/page/v1/sources/updates', { signal }),
   ),

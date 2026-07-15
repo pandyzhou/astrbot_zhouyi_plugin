@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "ignoreDeprecations": "6.0",
+    "noEmit": false,
+    "outDir": "../../../temp/memory-config-tests",
+    "rootDir": "src",
+    "types": ["node"]
+  },
+  "include": [
+    "src/api/types.ts",
+    "src/features/settings/memoryConfigSchema.ts",
+    "src/features/settings/memoryConfigSchema.test.ts",
+    "src/store/workshopStore.ts",
+    "src/store/workshopStore.test.ts"
+  ]
+}

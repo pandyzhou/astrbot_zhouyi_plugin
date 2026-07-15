@@ -11,6 +11,7 @@ if str(ASTRBOT_ROOT) not in sys.path:
 
 from data.plugins.astrbot_zhouyi_plugin.web_api import PAGE_API_PREFIX
 from data.plugins.astrbot_zhouyi_plugin.zhouyi_page_api import (
+    CONFIG_V1_PREFIX,
     MC_V1_PREFIX,
     MEMORY_ROUTE_DESCRIPTORS,
     MEMORY_V1_PREFIX,
@@ -42,6 +43,14 @@ class _MemoryService:
 
     async def get_stats(self):
         return {"status": "ok", "data": {"total_memories": 3}}
+
+
+class _MemoryConfigApi:
+    async def get_memory_config(self):
+        return None
+
+    async def post_memory_config(self):
+        return None
 
 
 class _SourceUpdateMonitor:
@@ -91,6 +100,21 @@ class ZhouyiDashboardApiTests(unittest.IsolatedAsyncioTestCase):
         for suffix, _, methods, _ in MEMORY_ROUTE_DESCRIPTORS:
             self.assertIn((f"{MEMORY_V1_PREFIX}{suffix}", methods), registered)
             self.assertIn((f"{PAGE_API_PREFIX}{suffix}", methods), registered)
+
+    async def test_memory_config_routes_are_narrow_and_have_no_legacy_alias(self):
+        plugin = _Plugin()
+        api = ZhouyiDashboardApi(
+            plugin,
+            None,
+            memory_config_api=_MemoryConfigApi(),
+        )
+        api.register_routes()
+        registered = {(path, tuple(methods)) for path, _, methods, _ in plugin.context.routes}
+
+        self.assertIn((f"{CONFIG_V1_PREFIX}/memory", ("GET",)), registered)
+        self.assertIn((f"{CONFIG_V1_PREFIX}/memory", ("POST",)), registered)
+        self.assertNotIn((f"{PAGE_API_PREFIX}/config/memory", ("GET",)), registered)
+        self.assertNotIn((f"{PAGE_API_PREFIX}/config/memory", ("POST",)), registered)
 
     async def test_source_update_handlers_use_existing_api_envelope(self):
         monitor = _SourceUpdateMonitor()

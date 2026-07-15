@@ -1,5 +1,13 @@
 # AGENTS.md
 
+## Technical terminology in user-facing communication
+
+- Prefer established frontend/backend engineering terminology over vague natural-language descriptions. On first use, write `中文术语（English term）` and briefly define it; subsequent replies may use the Chinese term alone.
+- Describe loss of component-local selections after route navigation as `跨路由状态丢失（cross-route state loss）`. Describe retaining them while the SPA remains open as `跨路由状态保留（cross-route state preservation）`.
+- When moving state out of an unmounted page component, call the technique `状态提升（state lifting）`; when stored in Zustand or another application-wide store, call it `全局客户端状态管理（global client state management）`.
+- Reserve `状态持久化（state persistence）` for state that survives a browser refresh, process restart, or a new session through URL parameters, Web Storage, IndexedDB, or server-side storage. Do not call in-memory Zustand state persistence.
+- For failures, prefer terms such as `根因（root cause）`, `触发条件（trigger condition）`, `失败点（failure point）`, `调用链（call path）`, `输入校验（input validation）`, and `降级路径（fallback path）`, and tie conclusions to logs or code evidence.
+
 ## Verification commands
 
 - Keep this repository under AstrBot's `data/plugins/` tree; tests import it as `data.plugins.astrbot_zhouyi_plugin`. Use AstrBot's interpreter, not system Python:
@@ -19,14 +27,16 @@
   PYTHONPYCACHEPREFIX="$PWD/temp/pycache" \
   /data/astrbot/.local/share/uv/tools/astrbot/bin/python \
   -m compileall -q main.py runtime.py web_api.py standalone_web.py \
-  zhouyi_page_api.py source_update_monitor.py memory script tests
+  zhouyi_page_api.py memory_config_api.py source_update_monitor.py memory script tests
   ```
 - The npm workspace root is `web/`; Node must be `>=20.19.0`. Use the lockfile and verify in this order:
-  ```bash
-  npm ci --prefix web
-  npm run typecheck --prefix web
-  npm run build --prefix web
-  ```
+```bash
+npm install --prefix web
+npm run typecheck --prefix web
+npm run test:memory-config --prefix web
+npm run build --prefix web
+```
+
   The root scripts intentionally build/typecheck `@pandyzhou/astrbot-mc-ui` before `@pandyzhou/astrbot-mc-app`; the app consumes the UI package's generated `dist` exports.
 - Query-cache tests use Node's built-in test runner and have no npm script:
   ```bash
@@ -49,10 +59,11 @@
   - `/page/v1/mc/*` delegates to `web_api.McManagerWebApi`.
   - `/page/v1/memory/*` delegates to Memory page handlers.
   - `/page/v1/sources/updates` and `/page/v1/sources/updates/refresh` use `source_update_monitor.py` and have no legacy aliases.
+  - `/page/v1/config/memory` reads and saves schema-driven Memory configuration independently of Memory service availability and has no legacy alias.
   - Legacy `/page/*` aliases remain only for the existing MC and Memory compatibility routes.
 - MC endpoint changes usually require coordinated edits in `web_api.py`, `zhouyi_page_api.py`, `standalone_web.py`, frontend types/client, and proxy tests. Memory endpoint changes require the facade, `memory/core/page_api_modules`, frontend Memory types/client, and Page API tests. Source-monitor changes require the monitor, facade, frontend types/client/mock/page, and source/route/standalone tests.
-- The standalone HTTPS UI serves the same React build. Its exact proxy allowlist is `GET /v1/bootstrap`; MC routes `GET /v1/mc/servers`, `POST /v1/mc/servers/add`, `POST /v1/mc/servers/update`, `POST /v1/mc/servers/delete`, `POST /v1/mc/status`, `GET /v1/mc/settings`, `POST /v1/mc/settings/preview`, `POST /v1/mc/settings`, `GET /v1/mc/trends`, `GET /v1/mc/cleanup`, and `POST /v1/mc/cleanup`; plus source-update routes `GET /v1/sources/updates` and `POST /v1/sources/updates/refresh`. Memory navigation and APIs remain intentionally embedded-only.
-- New Dashboard features should support the standalone HTTPS page by default; Memory is the current explicit exception.
+- The standalone HTTPS UI serves the same React build. Its exact proxy allowlist is `GET /v1/bootstrap`; MC routes `GET /v1/mc/servers`, `POST /v1/mc/servers/add`, `POST /v1/mc/servers/update`, `POST /v1/mc/servers/delete`, `POST /v1/mc/status`, `GET /v1/mc/settings`, `POST /v1/mc/settings/preview`, `POST /v1/mc/settings`, `GET /v1/mc/trends`, `GET /v1/mc/cleanup`, and `POST /v1/mc/cleanup`; source-update routes `GET /v1/sources/updates` and `POST /v1/sources/updates/refresh`; and Memory configuration routes `GET /v1/config/memory` and `POST /v1/config/memory`. Memory content navigation and `/v1/memory/*` data APIs remain intentionally embedded-only.
+- New Dashboard features should support the standalone HTTPS page by default. The current explicit exception is Memory content/data access; Memory configuration is standalone-supported.
 - Standalone mode requires the AstrBot Dashboard JWT cookie and configured HTTPS certificate/key. POST `Origin` must exactly match `DEFAULT_PUBLIC_ORIGIN`. Forward the JWT cookie only to the fixed local AstrBot upstream on explicitly allowed routes; never forward API keys, arbitrary routes, dynamic upstream targets, or filesystem paths.
 
 ## Migration and persistence invariants

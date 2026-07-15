@@ -193,6 +193,115 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_memory_config_routes_are_explicitly_allowlisted(self):
+        seen: list[tuple[str, str, object | None]] = []
+
+        async def upstream_handler(request: web.Request) -> web.Response:
+            body = await request.json() if request.method == "POST" else None
+            seen.append((request.method, request.path, body))
+            return web.json_response({"ok": True}, status=202 if body else 200)
+
+        upstream = await self._start_upstream(upstream_handler)
+        _, client = await self._start_service(upstream_base_url=str(upstream.make_url("/")))
+        cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
+        post_headers = {
+            **cookie,
+            "Origin": "https://standalone.example:35020",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
+        get_response = await client.get(
+            f"{PUBLIC_API_PREFIX}/v1/config/memory",
+            headers=cookie,
+        )
+        post_response = await client.post(
+            f"{PUBLIC_API_PREFIX}/v1/config/memory",
+            json={"config": {}, "expected_revision": "revision"},
+            headers=post_headers,
+        )
+
+        self.assertEqual([get_response.status, post_response.status], [200, 202])
+        self.assertEqual(
+            seen,
+            [
+                (
+                    "GET",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/v1/config/memory",
+                    None,
+                ),
+                (
+                    "POST",
+                    "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page/v1/config/memory",
+                    {"config": {}, "expected_revision": "revision"},
+                ),
+            ],
+        )
+
+    async def test_memory_config_post_preserves_security_boundaries(self):
+        upstream_calls = 0
+
+        async def upstream_handler(request: web.Request) -> web.Response:
+            nonlocal upstream_calls
+            upstream_calls += 1
+            return web.json_response({"ok": True})
+
+        upstream = await self._start_upstream(upstream_handler)
+        _, client = await self._start_service(upstream_base_url=str(upstream.make_url("/")))
+        path = f"{PUBLIC_API_PREFIX}/v1/config/memory"
+        cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
+        valid_origin = "https://standalone.example:35020"
+
+        missing_cookie = await client.post(
+            path,
+            json={},
+            headers={"Origin": valid_origin, "Sec-Fetch-Site": "same-origin"},
+        )
+        wrong_origin = await client.post(
+            path,
+            json={},
+            headers={
+                **cookie,
+                "Origin": "https://evil.example",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        cross_site = await client.post(
+            path,
+            json={},
+            headers={
+                **cookie,
+                "Origin": valid_origin,
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+        non_json = await client.post(
+            path,
+            data="{}",
+            headers={
+                **cookie,
+                "Origin": valid_origin,
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "text/plain",
+            },
+        )
+        oversized = await client.post(
+            path,
+            data=b"x" * (standalone_web_module.MAX_REQUEST_BODY + 1),
+            headers={
+                **cookie,
+                "Origin": valid_origin,
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "application/json",
+            },
+        )
+
+        responses = [missing_cookie, wrong_origin, cross_site, non_json, oversized]
+        self.assertEqual(
+            [response.status for response in responses],
+            [401, 403, 403, 415, 413],
+        )
+        self.assertEqual(upstream_calls, 0)
+
     async def test_cross_origin_post_is_forbidden(self):
         _, client = await self._start_service()
         response = await client.post(
@@ -422,6 +531,14 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
             f"{PUBLIC_API_PREFIX}/v1/memory/stats",
             headers=cookie,
         )
+        config_root_response = await client.get(
+            f"{PUBLIC_API_PREFIX}/v1/config",
+            headers=cookie,
+        )
+        config_other_response = await client.get(
+            f"{PUBLIC_API_PREFIX}/v1/config/memory/extra",
+            headers=cookie,
+        )
         source_root_response = await client.get(
             f"{PUBLIC_API_PREFIX}/v1/sources",
             headers=cookie,
@@ -441,6 +558,8 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(memory_response.status, 404)
+        self.assertEqual(config_root_response.status, 404)
+        self.assertEqual(config_other_response.status, 404)
         self.assertEqual(source_root_response.status, 404)
         self.assertEqual(source_other_response.status, 404)
         self.assertEqual(wrong_get_response.status, 405)

@@ -20,6 +20,8 @@ MAX_REQUEST_BODY = 64 * 1024
 
 _ALLOWED_API_ROUTES = (
     ("GET", "/v1/bootstrap"),
+    ("GET", "/v1/config/memory"),
+    ("POST", "/v1/config/memory"),
     ("GET", "/v1/mc/servers"),
     ("POST", "/v1/mc/servers/add"),
     ("POST", "/v1/mc/servers/update"),
@@ -84,7 +86,7 @@ async def _security_middleware(
 
 
 class StandaloneWebService:
-    """为 Zhouyi Dashboard 提供独立 HTTPS 服务，仅转发 MC 与来源更新 API。"""
+    """为 Zhouyi Dashboard 提供独立 HTTPS 服务，仅转发显式白名单 API。"""
 
     def __init__(
         self,

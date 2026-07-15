@@ -141,7 +141,7 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             plugin = MyPlugin(context, config=None)
             await asyncio.gather(trend_started.wait(), standalone_started.wait())
-            self.assertEqual(len(context.registered_web_apis), 47)
+            self.assertEqual(len(context.registered_web_apis), 49)
             trend_task = plugin.runtime.trend_task
             standalone_task = plugin.runtime.standalone_task
             self.assertIsNotNone(trend_task)

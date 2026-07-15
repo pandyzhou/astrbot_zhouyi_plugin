@@ -365,7 +365,19 @@ class MainMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             plugin = MyPlugin(
                 context, config={"memory": {"enabled": True}}
             )
-            self.assertEqual(len(context.registered_web_apis), 47)
+            self.assertEqual(len(context.registered_web_apis), 49)
+            registered = {
+                (route, tuple(methods))
+                for route, _, methods, _ in context.registered_web_apis
+            }
+            self.assertIn(
+                ("/astrbot_zhouyi_plugin/page/v1/config/memory", ("GET",)),
+                registered,
+            )
+            self.assertIn(
+                ("/astrbot_zhouyi_plugin/page/v1/config/memory", ("POST",)),
+                registered,
+            )
             self.assertIsNone(plugin.runtime.memory)
             self.assertIsNotNone(plugin.runtime.standalone_task)
             self.assertIsNotNone(plugin.runtime.trend_task)
