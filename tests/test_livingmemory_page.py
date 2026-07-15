@@ -95,6 +95,129 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
             ),
         )
 
+    def test_recall_page_workbench_contracts(self):
+        recall = (APP_ROOT / "src" / "features" / "memory" / "RecallPage.tsx").read_text(encoding="utf-8")
+        styles = (APP_ROOT / "src" / "styles.css").read_text(encoding="utf-8")
+
+        for class_name in (
+            "recall-workspace",
+            "recall-options",
+            "recall-run-button",
+            "recall-result-summary",
+            "recall-result-card",
+            "recall-result-layout",
+            "recall-result-score",
+            "recall-score-disclosure",
+        ):
+            self.assertIn(class_name, recall)
+            self.assertIn(f".{class_name}", styles)
+
+        self.assertIn("<WorkshopPanel title={t('hybridRetrieval')}>", recall)
+        self.assertIn("<WorkshopPanel title={t('results')}>", recall)
+        self.assertNotIn("description=", recall)
+        self.assertRegex(
+            recall,
+            re.compile(
+                r"<textarea.*?rows=\{5\}.*?required.*?aria-describedby=\"recall-keyboard-hint\"",
+                re.DOTALL,
+            ),
+        )
+        self.assertIn('<p id="recall-keyboard-hint" className="recall-keyboard-hint">{t(\'keyboardHint\')}</p>', recall)
+        self.assertIn("action={<button className=\"wf-button\" type=\"button\" onClick={() => void run()}>{t('retry')}</button>}", recall)
+        self.assertIn("setDetailError('');\n    if (!query.trim()) return", recall)
+        self.assertIn("const explicitPercentage = Number(item.score_percentage)", recall)
+        self.assertIn("const similarityPercentage = Number(item.similarity_score) * 100", recall)
+        self.assertIn("Number.isFinite(explicitPercentage) ? explicitPercentage : similarityPercentage", recall)
+
+        self.assertRegex(
+            styles,
+            re.compile(
+                r"\.recall-workspace \{.*?display: grid;.*?width: min\(1180px, 100%\);.*?margin-inline: auto;",
+                re.DOTALL,
+            ),
+        )
+        self.assertIn("grid-template-columns: minmax(0, 1fr) minmax(250px, 300px)", styles)
+        self.assertRegex(
+            styles,
+            re.compile(
+                r"\.recall-query textarea \{.*?min-height: 180px;.*?resize: vertical;.*?line-height: 1\.6;",
+                re.DOTALL,
+            ),
+        )
+        self.assertRegex(
+            styles,
+            re.compile(r"@media \(max-width: 900px\) \{.*?\.recall-form \{ grid-template-columns: 1fr; \}", re.DOTALL),
+        )
+        self.assertRegex(
+            styles,
+            re.compile(r"@media \(max-width: 760px\) \{.*?\.recall-result-layout \{ grid-template-columns: 1fr; \}", re.DOTALL),
+        )
+        self.assertRegex(
+            styles,
+            re.compile(
+                r"@media \(max-width: 560px\) \{.*?\.recall-result-summary \{ grid-template-columns: 1fr; \}"
+                r".*?\.recall-result-actions \.wf-button \{ width: 100%; \}",
+                re.DOTALL,
+            ),
+        )
+
+    def test_graph_interaction_contracts(self):
+        graph = (APP_ROOT / "src" / "features" / "memory" / "GraphPage.tsx").read_text(encoding="utf-8")
+        styles = (APP_ROOT / "src" / "styles.css").read_text(encoding="utf-8")
+        i18n = (APP_ROOT / "src" / "i18n.ts").read_text(encoding="utf-8")
+        package_sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (PLUGIN_ROOT / "web" / "package.json", APP_ROOT / "package.json")
+        )
+
+        self.assertIn("function InteractiveGraphCanvas", graph)
+        self.assertIn("createGraphSimulation(nodes, allEdges, WIDTH, HEIGHT)", graph)
+        self.assertIn("addEventListener('wheel'", graph)
+        self.assertIn("passive: false", graph)
+        self.assertIn("removeEventListener('wheel'", graph)
+        self.assertNotIn("onWheel=", graph)
+        for contract in (
+            "normalizeWheelDelta",
+            "zoomAtPoint",
+            "getScreenCTM",
+            ".inverse()",
+            "kind: 'pan'",
+            "kind: 'node'",
+            "setPointerCapture",
+            "onPointerCancel",
+            "onLostPointerCapture",
+            "pinGraphNode",
+            "moveGraphNode",
+            "releaseGraphNode",
+            "reflowGraphSimulation",
+            "t('reflowGraph')",
+            "graph-node--dimmed",
+            "graph-node--dragging",
+            "graph-edge--dimmed",
+            "graph-edge--hovered",
+            "graph-canvas--panning",
+        ):
+            self.assertIn(contract, graph)
+
+        for class_name in (
+            "graph-node--dimmed",
+            "graph-node--dragging",
+            "graph-edge--dimmed",
+            "graph-edge--hovered",
+            "graph-canvas--panning",
+        ):
+            self.assertIn(f".{class_name}", styles)
+        self.assertIn("overscroll-behavior: contain", styles)
+        self.assertIn("touch-action: none", styles)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", styles)
+        self.assertRegex(styles, re.compile(r"prefers-reduced-motion: reduce.*?\.graph-node,\s*\.graph-edge\s*\{\s*transition: none;", re.DOTALL))
+
+        self.assertEqual(i18n.count("reflowGraph:"), 3)
+        self.assertIn("reflowGraph: '重新布局'", i18n)
+        self.assertIn("reflowGraph: 'Reflow layout'", i18n)
+        self.assertIn("reflowGraph: 'Перестроить граф'", i18n)
+        self.assertNotRegex(package_sources, re.compile(r'"(?:d3(?:-[^"]*)?|force-graph(?:-[^"]*)?)"\s*:'))
+
     def test_page_headings_do_not_include_subtitles_after_h1(self):
         page_sources = [
             path

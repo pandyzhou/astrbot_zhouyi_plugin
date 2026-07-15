@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "ignoreDeprecations": "6.0",
+    "noEmit": false,
+    "outDir": "../../../temp/graph-tests",
+    "rootDir": "src",
+    "types": ["node"]
+  },
+  "include": [
+    "src/features/memory/types.ts",
+    "src/features/memory/graphPhysics.ts",
+    "src/features/memory/graphPhysics.test.ts"
+  ]
+}

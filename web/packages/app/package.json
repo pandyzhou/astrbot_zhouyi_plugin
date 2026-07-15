@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test:memory-config": "rm -rf ../../../temp/memory-config-tests && tsc -p tsconfig.memory-config-test.json && NODE_PATH=../../../web/node_modules node --test ../../../temp/memory-config-tests/features/settings/memoryConfigSchema.test.js ../../../temp/memory-config-tests/store/workshopStore.test.js"
+    "test:memory-config": "rm -rf ../../../temp/memory-config-tests && tsc -p tsconfig.memory-config-test.json && NODE_PATH=../../../web/node_modules node --test ../../../temp/memory-config-tests/features/settings/memoryConfigSchema.test.js ../../../temp/memory-config-tests/store/workshopStore.test.js",
+    "test:graph": "rm -rf ../../../temp/graph-tests && tsc -p tsconfig.graph-test.json && NODE_PATH=../../../web/node_modules node --test ../../../temp/graph-tests/features/memory/graphPhysics.test.js"
   },
   "dependencies": {
     "@pandyzhou/astrbot-mc-ui": "0.1.0",
