@@ -23,6 +23,20 @@ from data.plugins.astrbot_zhouyi_plugin.standalone_web import (
 )
 
 
+MEMORY_API_ROUTES = (
+    ("GET", "/v1/memory/stats"),
+    ("GET", "/v1/memory/backups"),
+    ("GET", "/v1/memory/memories"),
+    ("GET", "/v1/memory/memories/detail"),
+    ("POST", "/v1/memory/memories/update"),
+    ("POST", "/v1/memory/memories/batch-delete"),
+    ("POST", "/v1/memory/memories/batch-update"),
+    ("POST", "/v1/memory/recall/test"),
+    ("GET", "/v1/memory/graph/overview"),
+    ("POST", "/v1/memory/graph/query"),
+)
+
+
 class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         temp_root = PLUGIN_ROOT / "temp"
@@ -237,7 +251,58 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_memory_config_post_preserves_security_boundaries(self):
+    async def test_memory_routes_proxy_exact_paths_queries_and_bodies(self):
+        seen: list[tuple[str, str, str, bytes]] = []
+
+        async def upstream_handler(request: web.Request) -> web.Response:
+            seen.append(
+                (
+                    request.method,
+                    request.path,
+                    request.query_string,
+                    await request.read(),
+                )
+            )
+            return web.json_response({"ok": True})
+
+        upstream = await self._start_upstream(upstream_handler)
+        _, client = await self._start_service(upstream_base_url=str(upstream.make_url("/")))
+        cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
+        post_headers = {
+            **cookie,
+            "Origin": "https://standalone.example:35020",
+            "Sec-Fetch-Site": "same-origin",
+            "Content-Type": "application/json",
+        }
+
+        expected: list[tuple[str, str, str, bytes]] = []
+        for index, (method, suffix) in enumerate(MEMORY_API_ROUTES):
+            upstream_path = (
+                "/api/v1/plugins/extensions/astrbot_zhouyi_plugin/page" + suffix
+            )
+            if method == "GET":
+                query = f"marker={index}&scope=all"
+                response = await client.get(
+                    f"{PUBLIC_API_PREFIX}{suffix}?{query}",
+                    headers=cookie,
+                )
+                expected.append((method, upstream_path, query, b""))
+            else:
+                body = json.dumps(
+                    {"route": suffix, "index": index},
+                    separators=(",", ":"),
+                ).encode()
+                response = await client.post(
+                    f"{PUBLIC_API_PREFIX}{suffix}",
+                    data=body,
+                    headers=post_headers,
+                )
+                expected.append((method, upstream_path, "", body))
+            self.assertEqual(response.status, 200, suffix)
+
+        self.assertEqual(seen, expected)
+
+    async def test_memory_post_preserves_security_boundaries(self):
         upstream_calls = 0
 
         async def upstream_handler(request: web.Request) -> web.Response:
@@ -247,14 +312,25 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
 
         upstream = await self._start_upstream(upstream_handler)
         _, client = await self._start_service(upstream_base_url=str(upstream.make_url("/")))
-        path = f"{PUBLIC_API_PREFIX}/v1/config/memory"
+        path = f"{PUBLIC_API_PREFIX}/v1/memory/recall/test"
         cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
         valid_origin = "https://standalone.example:35020"
+        valid_headers = {
+            **cookie,
+            "Origin": valid_origin,
+            "Sec-Fetch-Site": "same-origin",
+        }
 
+        valid = await client.post(path, json={"query": "hello"}, headers=valid_headers)
         missing_cookie = await client.post(
             path,
             json={},
             headers={"Origin": valid_origin, "Sec-Fetch-Site": "same-origin"},
+        )
+        missing_origin = await client.post(
+            path,
+            json={},
+            headers={**cookie, "Sec-Fetch-Site": "same-origin"},
         )
         wrong_origin = await client.post(
             path,
@@ -278,9 +354,7 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
             path,
             data="{}",
             headers={
-                **cookie,
-                "Origin": valid_origin,
-                "Sec-Fetch-Site": "same-origin",
+                **valid_headers,
                 "Content-Type": "text/plain",
             },
         )
@@ -288,19 +362,36 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
             path,
             data=b"x" * (standalone_web_module.MAX_REQUEST_BODY + 1),
             headers={
-                **cookie,
-                "Origin": valid_origin,
-                "Sec-Fetch-Site": "same-origin",
+                **valid_headers,
                 "Content-Type": "application/json",
             },
         )
 
-        responses = [missing_cookie, wrong_origin, cross_site, non_json, oversized]
+        rejected = [
+            missing_cookie,
+            missing_origin,
+            wrong_origin,
+            cross_site,
+            non_json,
+            oversized,
+        ]
+        self.assertEqual(valid.status, 200)
         self.assertEqual(
-            [response.status for response in responses],
-            [401, 403, 403, 415, 413],
+            [response.status for response in rejected],
+            [401, 403, 403, 403, 415, 413],
         )
-        self.assertEqual(upstream_calls, 0)
+        self.assertEqual(
+            [(await response.json())["data"]["code"] for response in rejected],
+            [
+                "AUTH_REQUIRED",
+                "ORIGIN_FORBIDDEN",
+                "ORIGIN_FORBIDDEN",
+                "FETCH_SITE_FORBIDDEN",
+                "INVALID_CONTENT_TYPE",
+                "REQUEST_TOO_LARGE",
+            ],
+        )
+        self.assertEqual(upstream_calls, 1)
 
     async def test_cross_origin_post_is_forbidden(self):
         _, client = await self._start_service()
@@ -518,7 +609,7 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(upstream_calls, 0)
 
-    async def test_memory_other_source_routes_and_wrong_methods_remain_closed(self):
+    async def test_memory_unlisted_suffixes_wrong_methods_and_legacy_paths_stay_closed(self):
         _, client = await self._start_service()
         cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
         post_headers = {
@@ -527,10 +618,52 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
             "Sec-Fetch-Site": "same-origin",
         }
 
-        memory_response = await client.get(
-            f"{PUBLIC_API_PREFIX}/v1/memory/stats",
-            headers=cookie,
+        async def request(method: str, suffix: str):
+            if method == "POST":
+                return await client.post(
+                    f"{PUBLIC_API_PREFIX}{suffix}",
+                    json={},
+                    headers=post_headers,
+                )
+            return await client.get(
+                f"{PUBLIC_API_PREFIX}{suffix}",
+                headers=cookie,
+            )
+
+        unlisted = [
+            await request("GET", "/v1/memory"),
+            await request("GET", "/v1/memory/unknown"),
+            await request("GET", "/v1/memory/stats/extra"),
+            await request("POST", "/v1/memory/graph/query/extra"),
+        ]
+        self.assertEqual([response.status for response in unlisted], [404] * 4)
+
+        wrong_methods = []
+        legacy_paths = []
+        for method, suffix in MEMORY_API_ROUTES:
+            wrong_method = "POST" if method == "GET" else "GET"
+            wrong_methods.append(await request(wrong_method, suffix))
+            legacy_suffix = suffix.removeprefix("/v1/memory")
+            legacy_paths.append(await request(method, legacy_suffix))
+
+        self.assertEqual(
+            [response.status for response in wrong_methods],
+            [405] * len(MEMORY_API_ROUTES),
         )
+        self.assertEqual(
+            [response.status for response in legacy_paths],
+            [404] * len(MEMORY_API_ROUTES),
+        )
+
+    async def test_other_unlisted_routes_and_wrong_methods_remain_closed(self):
+        _, client = await self._start_service()
+        cookie = {"Cookie": "astrbot_dashboard_jwt=token"}
+        post_headers = {
+            **cookie,
+            "Origin": "https://standalone.example:35020",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
         config_root_response = await client.get(
             f"{PUBLIC_API_PREFIX}/v1/config",
             headers=cookie,
@@ -557,7 +690,6 @@ class StandaloneWebTests(unittest.IsolatedAsyncioTestCase):
             headers=post_headers,
         )
 
-        self.assertEqual(memory_response.status, 404)
         self.assertEqual(config_root_response.status, 404)
         self.assertEqual(config_other_response.status, 404)
         self.assertEqual(source_root_response.status, 404)

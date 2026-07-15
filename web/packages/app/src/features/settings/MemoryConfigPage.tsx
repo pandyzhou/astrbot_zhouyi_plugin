@@ -388,7 +388,6 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
         </div>
       </header>
 
-      <p className="settings-context">配置由后端 Schema 动态生成；保存后可能短暂重载整个插件。</p>
       {feedback ? (
         <div
           className={`memory-config-toast${feedback.kind === 'warning' ? ' memory-config-toast--warning' : ''}`}

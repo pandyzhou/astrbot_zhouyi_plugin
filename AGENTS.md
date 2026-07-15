@@ -39,9 +39,9 @@
 - `/page/v1/config/memory` 由独立的 `MemoryConfigApi` 注册，不依赖 Memory 服务是否启用、迁移成功或完成初始化，并且没有旧 `/page/*` alias。
 - 旧 `/page/*` alias 只保留现有 MC、Memory 内容和 bootstrap 兼容路由；来源更新与 Memory 配置不得新增 legacy alias。
 - MC 契约变更通常要同步 `web_api.py`、facade、standalone allowlist、前端 types/client 和代理测试；Memory 内容契约还要同步 `memory/core/page_api_modules`，配置契约则同步 Schema、Pydantic 模型、配置 API 和前端 Schema parser。
-- `standalone_web.py::_ALLOWED_API_ROUTES` 是独立页唯一代理白名单；它开放 bootstrap、MC、来源更新和 Memory 配置，但明确不开放 `/v1/memory/*` 内容 API。
-- React 也强制 `memoryAvailable = !standalone && capability.available`；Memory 概览、管理、召回和图谱仅内嵌可见，记忆配置页在 standalone 中仍可见。
-- 独立服务默认监听 `0.0.0.0:35020`，静态目录是 `pages/zhouyi-dashboard/`；缺少 Dashboard 证书/私钥只会使独立服务启动失败。
+- `standalone_web.py::_ALLOWED_API_ROUTES` 是独立页唯一代理白名单；它精确开放 bootstrap、MC、来源更新、Memory 内容和 Memory 配置所需 API，新增路由仍必须显式加入固定白名单。
+- React 的 Memory capability 不再按 standalone 隐藏；独立页与 AstrBot 内嵌页均可使用 Memory 概览、管理、召回测试、知识图谱和记忆配置。
+- 两个入口共用同一套路由和 `pages/zhouyi-dashboard/` 构建产物；独立服务默认监听 `0.0.0.0:35020`，缺少 Dashboard 证书/私钥只会使独立服务启动失败。
 - 独立代理要求 `astrbot_dashboard_jwt` Cookie；POST 还要求 `Origin === DEFAULT_PUBLIC_ORIGIN`、可选 `Sec-Fetch-Site` 为 `same-origin`、JSON 且请求体不超过 64 KiB。
 - 代理目标固定为本机 AstrBot Dashboard；转发原始 `Cookie`、可选 `Accept` 和 POST `Content-Type`，明确不转发 `Authorization` 或 `X-API-Key`。
 

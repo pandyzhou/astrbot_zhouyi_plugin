@@ -17,8 +17,8 @@
 - 自动迁移旧版 JSON 数据，无需重新添加服务器
 - 每台服务器默认保留最多 10000 个趋势采样点，可在 WebUI 调整
 - 清理长期未查询成功且没有近期趋势记录的服务器
-- 提供 AstrBot Plugin Page 和独立 HTTPS WebUI
-- WebUI 支持服务器增删改查、运行配置、长期记忆配置、可选自动状态刷新和交互式趋势图
+- 提供以独立 HTTPS WebUI 为主、AstrBot Plugin Page 兼容保留的双入口管理界面
+- WebUI 支持服务器增删改查、运行配置、Memory 概览统计、记忆编辑管理、召回测试、知识图谱、记忆配置、可选自动状态刷新和交互式趋势图
 - 提供 `mcmod_search` LLM 工具，搜索 MC百科中的模组、整合包、物品/方块和教程
 - 可选启用长期记忆 Memory，自动总结会话并通过 BM25、向量和图记忆进行长期召回
 - 提供 `recall_long_term_memory` 与可选的 `memorize_long_term_memory` Agent 工具
@@ -112,7 +112,7 @@ pip install -r requirements.txt
 - `recall_long_term_memory`：主动检索长期记忆，默认开启
 - `memorize_long_term_memory`：主动写入长期记忆，默认关闭
 
-页面入口由统一 `ZhouyiDashboardApi` 注册，长期记忆与 Minecraft 共用根插件页面命名空间；旧独立插件必须保持停用。Zhouyi Dashboard 的“记忆配置”页由 `_conf_schema.json` 驱动，可在 AstrBot 内嵌页和独立 HTTPS 页面中读取、校验并保存完整 Memory 配置；保存后插件会安全重载以应用新配置。
+页面入口由统一 `ZhouyiDashboardApi` 注册，长期记忆与 Minecraft 共用根插件页面命名空间；旧独立插件必须保持停用。独立 HTTPS 页面和 AstrBot 内嵌页共用同一路由与 React 构建产物，均完整支持 Memory 概览统计、记忆编辑管理、召回测试、知识图谱和记忆配置。“记忆配置”页由 `_conf_schema.json` 驱动，可读取、校验并保存完整 Memory 配置；保存后插件会安全重载以应用新配置。
 
 ## MC百科 LLM 搜索工具
 
@@ -218,15 +218,11 @@ pip install -r requirements.txt
 
 ## Web 管理界面
 
-插件提供两种入口，使用同一套后端 API 和数据。
+插件提供两个入口，共用同一套路由、React 构建产物、后端 API 和数据。独立 HTTPS WebUI 是主入口，AstrBot Plugin Page 作为兼容/备用入口保留。
 
-### AstrBot Plugin Page
+### 独立 HTTPS WebUI（主入口）
 
-在 AstrBot Dashboard 的插件页面中打开 Minecraft 管理界面。该入口复用 AstrBot 页面桥接和登录状态。
-
-### 独立 HTTPS 页面
-
-插件启动时默认监听：
+先登录同一主机上的 AstrBot Dashboard，再打开：
 
 ```text
 https://<AstrBot 主机>:35020/
@@ -244,11 +240,19 @@ https://<AstrBot 主机>:35020/
 - 支持键盘导航的自定义下拉框
 - 全局默认与群组覆盖的运行配置页
 - 来源更新监控与手动刷新
-- 完整长期记忆配置管理与保存后插件重载
+- Memory 概览统计
+- 记忆编辑管理
+- 召回测试
+- 知识图谱
+- 完整 Memory 配置管理与保存后插件重载
 
-Memory 概览、记忆管理、召回测试和知识图谱等内容页面及其数据 API 仍仅在 AstrBot 内嵌 Plugin Page 中提供；记忆配置页及固定配置 API 已开放给独立 HTTPS 页面。
+独立页面完整支持 Memory 内容和配置。它是供 AstrBot Dashboard 管理员使用的全局管理页，不是群成员自助页面。
 
-独立页面不会向浏览器暴露新的 API 密钥。它要求浏览器已经登录 AstrBot Dashboard，并通过白名单代理转发受支持的管理请求。
+### AstrBot Plugin Page（兼容/备用入口）
+
+在 AstrBot Dashboard 中进入 `插件 -> astrbot_zhouyi_plugin -> Pages -> zhouyi-dashboard`。该入口复用 AstrBot 页面桥接和登录状态，功能与独立页面使用相同的路由和构建产物。
+
+独立页面不会向浏览器暴露新的 API 密钥。它要求浏览器已经登录同一主机的 AstrBot Dashboard，并通过固定白名单代理转发受支持的管理请求；POST 写操作还会执行同源校验。
 
 ### 独立页面配置要求
 
@@ -440,13 +444,12 @@ Minecraft 状态协议返回的是服务器提供的玩家 sample，服务器可
 
 ## 安全说明
 
-- 独立页面只代理白名单中的插件 API
-- POST 请求强制使用 JSON，并限制请求体大小
-- 写操作检查 `Origin` 和 `Sec-Fetch-Site`
-- 要求有效的 AstrBot Dashboard 登录 Cookie
+- 独立页面只代理固定白名单中精确列出的插件 API，包括页面所需的 Memory 内容与配置 API
+- 要求有效的 AstrBot Dashboard 登录 Cookie；这是 Dashboard 管理员级全局管理页，不是群成员自助页
+- POST 请求强制使用 JSON、限制请求体大小，并通过 `Origin` 和 `Sec-Fetch-Site` 执行同源校验
+- 代理不转发 `Authorization` 或 `X-API-Key`，浏览器端不暴露或保存新的 AstrBot API key
 - 静态文件服务拒绝路径穿越和符号链接逃逸
 - 响应包含 CSP、`X-Frame-Options` 等安全头
-- 浏览器端不保存新的 AstrBot 密钥
 
 ## 支持平台
 

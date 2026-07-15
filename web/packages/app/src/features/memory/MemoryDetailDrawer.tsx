@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { DataState } from '@pandyzhou/astrbot-mc-ui';
 import { memoryPost } from '../../api/client';
 import { useI18n } from '../../i18n';
@@ -83,6 +84,8 @@ export function MemoryDetailDrawer({
 
   useEffect(() => {
     previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
     const focusTimer = window.setTimeout(() => closeButtonRef.current?.focus(), 0);
     const onKeyDown = (event: KeyboardEvent) => {
       const openDialog = document.querySelector<HTMLDialogElement>('dialog[open]');
@@ -93,7 +96,7 @@ export function MemoryDetailDrawer({
         return;
       }
       if (event.key !== 'Tab' || !drawerRef.current || !drawerRef.current.contains(document.activeElement)) return;
-      const focusable = [...drawerRef.current.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])')];
+      const focusable = [...drawerRef.current.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, [href], [tabindex]:not([tabindex="-1"])')];
       if (!focusable.length) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
@@ -109,6 +112,7 @@ export function MemoryDetailDrawer({
     return () => {
       window.clearTimeout(focusTimer);
       document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = previousBodyOverflow;
       previousFocusRef.current?.focus();
     };
   }, []);
@@ -164,59 +168,94 @@ export function MemoryDetailDrawer({
   const topics = detail?.topics ?? metadata.topics ?? [];
   const history = detail?.update_history ?? metadata.update_history ?? [];
   const graph = detail?.graph_context;
+  const memoryType = detail?.memory_type ?? metadata.memory_type ?? 'GENERAL';
+  const memoryStatus = detail?.status ?? metadata.status ?? 'active';
+  const memoryImportance = displayImportance(detail?.importance ?? metadata.importance).toFixed(1);
+  const showActions = Boolean(detail && !loading && (editing || allowEdit || allowDelete));
 
-  return (
+  return createPortal(
     <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
-      <aside ref={drawerRef} className="memory-drawer" role="dialog" aria-modal="true" aria-labelledby="memory-detail-title" aria-busy={busy}>
-        <header>
-          <h2 id="memory-detail-title">{t('details')} {detail ? `#${detail.memory_id}` : ''}</h2>
-          <button ref={closeButtonRef} className="wf-button" type="button" disabled={busy} onClick={onClose}>{t('close')}</button>
-        </header>
-        {loading || !detail ? <DataState state="loading" title={t('loading')} message={t('memoryDetail')} /> : editing ? (
-          <form className="drawer-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
-            {error ? <p className="inline-feedback inline-feedback--error" role="alert">{error}</p> : null}
-            <label className="wf-label">{t('content')}<textarea className="wf-input" rows={8} value={content} required onChange={(event) => setContent(event.target.value)} /></label>
-            <label className="wf-label">{t('importance')} (0–10)<input className="wf-input" type="number" min="0" max="10" step="0.1" value={importance} onChange={(event) => setImportance(event.target.value)} /></label>
-            <label className="wf-label">{t('type')}<input className="wf-input" value={type} onChange={(event) => setType(event.target.value)} /></label>
-            <label className="wf-label">{t('status')}<select className="wf-input" value={status} onChange={(event) => setStatus(event.target.value)}><option value="active">active</option><option value="archived">archived</option><option value="deleted">deleted</option></select></label>
-            <label className="wf-label">{t('reason')}<input className="wf-input" value={reason} onChange={(event) => setReason(event.target.value)} /></label>
-            <div className="form-actions">
-              <button className="wf-button" type="button" disabled={saving} onClick={() => setEditing(false)}>{t('cancel')}</button>
-              <button className="wf-button wf-button--primary" disabled={saving || !content.trim()}>{saving ? t('saving') : t('save')}</button>
-            </div>
-          </form>
-        ) : (
-          <div className="detail-stack">
-            {error ? <p className="inline-feedback inline-feedback--error" role="alert">{error}</p> : null}
-            <p className="memory-detail-content">{detail.text}</p>
-            <dl className="detail-grid">
-              <div><dt>{t('type')}</dt><dd>{detail.memory_type ?? metadata.memory_type ?? 'GENERAL'}</dd></div>
-              <div><dt>{t('status')}</dt><dd>{detail.status ?? metadata.status ?? 'active'}</dd></div>
-              <div><dt>{t('importance')}</dt><dd>{displayImportance(detail.importance ?? metadata.importance).toFixed(1)}</dd></div>
-              <div><dt>{t('session')}</dt><dd>{detail.session_id ?? metadata.session_id ?? '—'}</dd></div>
-              <div><dt>{t('persona')}</dt><dd>{detail.persona_id ?? metadata.persona_id ?? '—'}</dd></div>
-              <div><dt>{t('created')}</dt><dd>{formatMemoryTime(detail.create_time ?? metadata.create_time ?? detail.created_at)}</dd></div>
-              <div><dt>{t('updated')}</dt><dd>{formatMemoryTime(detail.updated_at ?? metadata.updated_at)}</dd></div>
-              <div><dt>{t('lastAccess')}</dt><dd>{formatMemoryTime(detail.last_access_time ?? metadata.last_access_time)}</dd></div>
-            </dl>
-
-            {scoreBreakdown && Object.keys(scoreBreakdown).length ? <DetailSection title={t('scoreBreakdown')}><dl className="score-breakdown">{Object.entries(scoreBreakdown).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{Number(value).toFixed(6)}</dd></div>)}</dl></DetailSection> : null}
-            <DetailSection title={t('keyFacts')}><TagList items={keyFacts} empty={t('empty')} /></DetailSection>
-            <DetailSection title={t('topics')}><TagList items={topics} empty={t('empty')} /></DetailSection>
-            <DetailSection title={t('updateHistory')}>
-              {history.length ? <ol className="history-list">{[...history].reverse().map((item, index) => <li key={`${String(item.timestamp)}-${index}`}><strong>{item.description || item.field || t('updated')}</strong><time>{formatMemoryTime(item.timestamp)}</time>{item.description ? null : <p>{displayValue(item.old_value)} → {displayValue(item.new_value)}</p>}{item.reason ? <small>{t('reason')}: {item.reason}</small> : null}</li>)}</ol> : <p className="muted">{t('empty')}</p>}
-            </DetailSection>
-            <DetailSection title={t('graphContext')}>
-              {!graph ? <p className="muted">{t('empty')}</p> : <div className="graph-context"><p>{graph.nodes.length} {t('nodes')} · {graph.edges.length} {t('edges')} · {graph.entries.length} {t('entries')}</p><TagList items={graph.nodes.map((node) => node.label || `#${node.id}`)} empty={t('empty')} />{graph.entries.length ? <ul className="context-entry-list">{graph.entries.map((entry) => <li key={entry.id}><strong>{entry.entry_type ?? t('entry')}</strong><span>{entry.content || '—'}</span></li>)}</ul> : null}</div>}
-            </DetailSection>
-            {(allowEdit || allowDelete) ? <div className="form-actions drawer-danger-actions">
-              {allowDelete ? <button className="wf-button wf-button--danger" type="button" disabled={busy} onClick={() => onRequestDelete?.(detail)}>{deleting ? t('deleting') : t('delete')}</button> : null}
-              {allowEdit ? <button className="wf-button wf-button--primary" type="button" disabled={busy} onClick={() => setEditing(true)}>{t('edit')}</button> : null}
-            </div> : null}
+      <section ref={drawerRef} className="memory-drawer" role="dialog" aria-modal="true" aria-labelledby="memory-detail-title" aria-busy={busy}>
+        <header className="memory-drawer-header">
+          <div className="memory-drawer-heading">
+            <h2 id="memory-detail-title">{t('details')} {detail ? `#${detail.memory_id}` : ''}</h2>
+            {detail && !loading ? <dl className="memory-drawer-summary" aria-label={t('memoryDetail')}>
+              <div><dt>{t('type')}</dt><dd><span className="type-chip">{memoryType}</span></dd></div>
+              <div><dt>{t('status')}</dt><dd><span className={`status-chip status-chip--${memoryStatus}`}>{memoryStatus}</span></dd></div>
+              <div><dt>{t('importance')}</dt><dd>{memoryImportance}</dd></div>
+            </dl> : null}
           </div>
-        )}
-      </aside>
-    </div>
+          <button ref={closeButtonRef} className="wf-button memory-drawer-close" type="button" disabled={busy} onClick={onClose}>{t('close')}</button>
+        </header>
+
+        <div className="memory-drawer-body">
+          {loading || !detail ? <DataState state="loading" title={t('loading')} message={t('memoryDetail')} /> : editing ? (
+            <form id="memory-detail-form" className="drawer-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+              {error ? <p className="inline-feedback inline-feedback--error" role="alert">{error}</p> : null}
+              <label className="wf-label memory-drawer-content-field">{t('content')}<textarea className="wf-input memory-drawer-textarea" rows={14} value={content} required onChange={(event) => setContent(event.target.value)} /></label>
+              <div className="memory-drawer-field-grid">
+                <label className="wf-label">{t('importance')} (0–10)<input className="wf-input" type="number" min="0" max="10" step="0.1" value={importance} onChange={(event) => setImportance(event.target.value)} /></label>
+                <label className="wf-label">{t('type')}<input className="wf-input" value={type} onChange={(event) => setType(event.target.value)} /></label>
+                <label className="wf-label">{t('status')}<select className="wf-input" value={status} onChange={(event) => setStatus(event.target.value)}><option value="active">active</option><option value="archived">archived</option><option value="deleted">deleted</option></select></label>
+                <label className="wf-label">{t('reason')}<input className="wf-input" value={reason} onChange={(event) => setReason(event.target.value)} /></label>
+              </div>
+            </form>
+          ) : (
+            <div className="detail-stack">
+              {error ? <p className="inline-feedback inline-feedback--error" role="alert">{error}</p> : null}
+              <div className="memory-detail-layout">
+                <article className="memory-detail-main">
+                  <DetailSection title={t('content')}>
+                    <div className="memory-detail-content">{detail.text}</div>
+                  </DetailSection>
+                  <DetailSection title={t('keyFacts')}><TagList items={keyFacts} empty={t('empty')} /></DetailSection>
+                  <DetailSection title={t('topics')}><TagList items={topics} empty={t('empty')} /></DetailSection>
+                  {scoreBreakdown && Object.keys(scoreBreakdown).length ? <DetailSection title={t('scoreBreakdown')}><dl className="score-breakdown">{Object.entries(scoreBreakdown).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{Number(value).toFixed(6)}</dd></div>)}</dl></DetailSection> : null}
+                </article>
+
+                <aside className="memory-detail-sidebar" aria-label={t('memoryDetail')}>
+                  <DetailSection title={t('details')}>
+                    <dl className="detail-grid">
+                      <div><dt>{t('type')}</dt><dd>{memoryType}</dd></div>
+                      <div><dt>{t('status')}</dt><dd>{memoryStatus}</dd></div>
+                      <div><dt>{t('importance')}</dt><dd>{memoryImportance}</dd></div>
+                      <div><dt>{t('session')}</dt><dd>{detail.session_id ?? metadata.session_id ?? '—'}</dd></div>
+                      <div><dt>{t('persona')}</dt><dd>{detail.persona_id ?? metadata.persona_id ?? '—'}</dd></div>
+                      <div><dt>{t('created')}</dt><dd>{formatMemoryTime(detail.create_time ?? metadata.create_time ?? detail.created_at)}</dd></div>
+                      <div><dt>{t('updated')}</dt><dd>{formatMemoryTime(detail.updated_at ?? metadata.updated_at)}</dd></div>
+                      <div><dt>{t('lastAccess')}</dt><dd>{formatMemoryTime(detail.last_access_time ?? metadata.last_access_time)}</dd></div>
+                    </dl>
+                  </DetailSection>
+                  <details className="memory-detail-disclosure">
+                    <summary>{t('updateHistory')}</summary>
+                    <div className="memory-detail-disclosure-content">
+                      {history.length ? <ol className="history-list">{[...history].reverse().map((item, index) => <li key={`${String(item.timestamp)}-${index}`}><strong>{item.description || item.field || t('updated')}</strong><time>{formatMemoryTime(item.timestamp)}</time>{item.description ? null : <p>{displayValue(item.old_value)} → {displayValue(item.new_value)}</p>}{item.reason ? <small>{t('reason')}: {item.reason}</small> : null}</li>)}</ol> : <p className="muted">{t('empty')}</p>}
+                    </div>
+                  </details>
+                  <details className="memory-detail-disclosure">
+                    <summary>{t('graphContext')}</summary>
+                    <div className="memory-detail-disclosure-content">
+                      {!graph ? <p className="muted">{t('empty')}</p> : <div className="graph-context"><p>{graph.nodes.length} {t('nodes')} · {graph.edges.length} {t('edges')} · {graph.entries.length} {t('entries')}</p><TagList items={graph.nodes.map((node) => node.label || `#${node.id}`)} empty={t('empty')} />{graph.entries.length ? <ul className="context-entry-list">{graph.entries.map((entry) => <li key={entry.id}><strong>{entry.entry_type ?? t('entry')}</strong><span>{entry.content || '—'}</span></li>)}</ul> : null}</div>}
+                    </div>
+                  </details>
+                </aside>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {showActions ? <footer className="memory-drawer-actions">
+          {editing ? <>
+            <button className="wf-button" type="button" disabled={saving} onClick={() => setEditing(false)}>{t('cancel')}</button>
+            <button className="wf-button wf-button--primary" type="submit" form="memory-detail-form" disabled={saving || !content.trim()}>{saving ? t('saving') : t('save')}</button>
+          </> : <>
+            {detail && allowDelete ? <button className="wf-button wf-button--danger" type="button" disabled={busy} onClick={() => onRequestDelete?.(detail)}>{deleting ? t('deleting') : t('delete')}</button> : null}
+            {allowEdit ? <button className="wf-button wf-button--primary" type="button" disabled={busy} onClick={() => setEditing(true)}>{t('edit')}</button> : null}
+          </>}
+        </footer> : null}
+      </section>
+    </div>,
+    document.body,
   );
 }
 

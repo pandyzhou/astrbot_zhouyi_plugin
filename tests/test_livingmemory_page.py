@@ -40,6 +40,61 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
             self.assertTrue((APP_ROOT / "src" / "features" / "memory" / name).is_file())
         self.assertTrue((APP_ROOT / "src" / "features" / "settings" / "MemoryConfigPage.tsx").is_file())
 
+    def test_memory_detail_drawer_reading_workspace_contracts(self):
+        drawer = (APP_ROOT / "src" / "features" / "memory" / "MemoryDetailDrawer.tsx").read_text(encoding="utf-8")
+        styles = (APP_ROOT / "src" / "styles.css").read_text(encoding="utf-8")
+
+        for class_name in (
+            "memory-detail-layout",
+            "memory-detail-main",
+            "memory-detail-sidebar",
+            "memory-drawer-body",
+            "memory-drawer-actions",
+        ):
+            self.assertIn(class_name, drawer)
+            self.assertIn(f".{class_name}", styles)
+
+        self.assertIn('<article className="memory-detail-main">', drawer)
+        self.assertIn('<aside className="memory-detail-sidebar"', drawer)
+        self.assertIn('<details className="memory-detail-disclosure">', drawer)
+        self.assertIn("<summary>{t('updateHistory')}</summary>", drawer)
+        self.assertIn("<summary>{t('graphContext')}</summary>", drawer)
+        self.assertIn("createPortal(", drawer)
+        self.assertIn("document.body,", drawer)
+        self.assertIn("document.body.style.overflow = 'hidden'", drawer)
+        self.assertIn("document.body.style.overflow = previousBodyOverflow", drawer)
+        self.assertIn('role="dialog"', drawer)
+        self.assertIn('aria-modal="true"', drawer)
+        self.assertIn('aria-labelledby="memory-detail-title"', drawer)
+        self.assertIn('aria-busy={busy}', drawer)
+
+        self.assertIn("width: min(1120px, calc(100vw - 48px))", styles)
+        self.assertIn("height: calc(100dvh - 48px)", styles)
+        self.assertRegex(
+            styles,
+            re.compile(
+                r"\.memory-detail-content \{.*?max-width: 72ch;.*?font-size: 16px;.*?line-height: 1\.75;"
+                r".*?white-space: pre-wrap;.*?overflow-wrap: break-word;",
+                re.DOTALL,
+            ),
+        )
+        self.assertRegex(
+            styles,
+            re.compile(
+                r"@media \(max-width: 900px\) \{.*?\.memory-detail-layout \{ grid-template-columns: 1fr; \}",
+                re.DOTALL,
+            ),
+        )
+        self.assertRegex(
+            styles,
+            re.compile(
+                r"@media \(max-width: 560px\) \{.*?\.memory-drawer \{ width: 100vw; height: 100dvh;"
+                r".*?border: 0;.*?\.memory-drawer \.wf-button, \.memory-detail-disclosure summary"
+                r" \{ min-width: 44px; min-height: 44px; \}",
+                re.DOTALL,
+            ),
+        )
+
     def test_page_headings_do_not_include_subtitles_after_h1(self):
         page_sources = [
             path
@@ -98,6 +153,8 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertNotIn("setData(null)", pages["servers"])
         self.assertNotIn("setData(null)", pages["trends"])
         self.assertIn("if (!cachedData || dirty || saving || pendingPreview) return", pages["settings"])
+        self.assertNotIn("配置由后端 Schema 动态生成", pages["memory_config"])
+        self.assertNotIn("保存后可能短暂重载整个插件", pages["memory_config"])
         self.assertIn("MEMORY_LIST_QUERY_PREFIX", pages["memories"])
         self.assertIn("MEMORY_GRAPH_QUERY_PREFIX", pages["memories"])
 
@@ -134,7 +191,10 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn('<Route path="/settings/memory" element={<MemoryConfigPage', app)
         self.assertNotIn('memoryAvailable ? <NavLink to="/settings/memory"', app)
         self.assertNotIn('standalone ? <Route path="/settings/memory"', app)
-        self.assertIn("const standalone = !window.AstrBotPluginPage; const memoryAvailable = !standalone && Boolean(bootstrap?.capabilities.memory.available)", app)
+        self.assertIn("const standalone = !window.AstrBotPluginPage; const memoryAvailable = Boolean(bootstrap?.capabilities.memory.available)", app)
+        self.assertNotIn("memoryAvailable = !standalone &&", app)
+        self.assertIn("{!memoryAvailable && bootstrap?.capabilities.memory.enabled ?", app)
+        self.assertNotIn("{!standalone && !memoryAvailable && bootstrap?.capabilities.memory.enabled ?", app)
         self.assertIn('{memoryAvailable ? <><NavLink to="/memory/overview">', app)
         self.assertIn('{memoryAvailable ? <><Route path="/memory/overview"', app)
         self.assertIn("const defaultPath = memoryAvailable ? '/memory/overview' : '/mc/servers';", app)
