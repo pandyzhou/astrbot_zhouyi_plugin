@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { test } from 'node:test';
 import type { MemoryConfigObject, MemoryConfigSchemaNode } from '../../api/types';
 import {
@@ -46,7 +48,7 @@ function parsed() {
 
 test('解析顶层基础设置、对象分类和 provider 当前不可用选项', () => {
   const result = parsed();
-  assert.deepEqual(result.categories.map((category) => category.title), ['基础设置', '检索设置']);
+  assert.deepEqual(result.categories.map((category) => category.title), ['基础与模型', '会话与召回']);
   assert.deepEqual(result.categories[0]?.fields.map((field) => field.key), ['enabled', 'bot_language']);
   const provider = result.fields.find((field) => field.key === 'llm_provider_id');
   assert.equal(provider?.options[0]?.value, '');
@@ -69,9 +71,67 @@ test('兼容 AstrBot items、bool 和外层 memory 包装格式', () => {
     },
   };
   const result = parseMemoryConfigSchema(astrbotSchema, { enabled: true, retrieval: { top_k: 5 } }, { llm: [], embedding: [] }, {});
-  assert.deepEqual(result.categories.map((category) => category.title), ['基础设置', '检索设置']);
+  assert.deepEqual(result.categories.map((category) => category.title), ['基础与模型', '会话与召回']);
   assert.equal(result.fields.find((field) => field.key === 'enabled')?.kind, 'boolean');
   assert.equal(result.fields.find((field) => field.key === 'top_k')?.kind, 'integer');
+});
+
+test('按业务语义收敛为五个主要分类，并将未知区段归入其他设置', () => {
+  const groupedSchema: MemoryConfigSchemaNode = {
+    type: 'object',
+    properties: {
+      enabled: { type: 'boolean' },
+      provider_settings: { type: 'object', properties: { llm_provider_id: { type: 'string' } } },
+      session_manager: { type: 'object', properties: { max_sessions: { type: 'integer' } } },
+      reflection_engine: { type: 'object', properties: { summary_trigger_rounds: { type: 'integer' } } },
+      graph_memory: { type: 'object', properties: { enabled: { type: 'boolean' } } },
+      backup_settings: { type: 'object', properties: { enabled: { type: 'boolean' } } },
+      future_section: { type: 'object', properties: { enabled: { type: 'boolean' } } },
+    },
+  };
+  const groupedConfig: MemoryConfigObject = {
+    enabled: true,
+    provider_settings: { llm_provider_id: '' },
+    session_manager: { max_sessions: 100 },
+    reflection_engine: { summary_trigger_rounds: 10 },
+    graph_memory: { enabled: true },
+    backup_settings: { enabled: true },
+    future_section: { enabled: true },
+  };
+  const result = parseMemoryConfigSchema(groupedSchema, groupedConfig, { llm: [], embedding: [] }, {});
+
+  assert.deepEqual(result.categories.map((category) => category.title), [
+    '基础与模型',
+    '会话与召回',
+    '记忆处理',
+    '图记忆与权重',
+    '数据维护',
+    '其他设置',
+  ]);
+});
+
+test('完整 AstrBot Memory Schema 只生成五个主要分类', () => {
+  const fullSchema = JSON.parse(
+    readFileSync(resolve(process.cwd(), '../../../_conf_schema.json'), 'utf8'),
+  ) as Record<string, MemoryConfigSchemaNode>;
+  const result = parseMemoryConfigSchema(fullSchema.memory ?? fullSchema, {}, { llm: [], embedding: [] }, {});
+
+  assert.deepEqual(result.categories.map((category) => category.title), [
+    '基础与模型',
+    '会话与召回',
+    '记忆处理',
+    '图记忆与权重',
+    '数据维护',
+  ]);
+  assert.ok(result.fields.length > 30);
+  const injectionMethod = result.fields.find((field) => field.path.join('.') === 'recall_engine.injection_method');
+  assert.deepEqual(injectionMethod?.options.map((option) => option.value), [
+    'extra_user_content',
+    'user_message_before',
+    'user_message_after',
+    'fake_tool_call',
+  ]);
+  assert.doesNotMatch(injectionMethod?.hint ?? '', /已废弃|fake_tool_call_deepseek_v4|system_prompt/);
 });
 
 test('路径 set 为不可变更新且数字 draft 保留字符串', () => {

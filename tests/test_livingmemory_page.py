@@ -189,6 +189,7 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         keys = (APP_ROOT / "src" / "store" / "queryKeys.ts").read_text(encoding="utf-8")
         schema_test = (settings_root / "memoryConfigSchema.test.ts").read_text(encoding="utf-8")
         app_package = (APP_ROOT / "package.json").read_text(encoding="utf-8")
+        styles = (APP_ROOT / "src" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn("parseMemoryConfigSchema", page)
         self.assertIn("createMemoryConfigDraft", page)
@@ -215,6 +216,65 @@ class ZhouyiDashboardPageTests(unittest.TestCase):
         self.assertIn("重新加载并保留草稿", page)
         self.assertIn("if (!preserveDraft) setDraft", page)
         self.assertIn("applyLoadedData(loaded, preserveDraft)", page)
+        self.assertRegex(
+            page,
+            re.compile(
+                r"type FeedbackState =\s*"
+                r"\| \{ kind: 'progress'; message: string \}\s*"
+                r"\| \{ kind: 'success'; message: string \}\s*"
+                r"\| \{ kind: 'warning'; message: string \}",
+                re.DOTALL,
+            ),
+        )
+        self.assertIn("useState<FeedbackState | null>(null)", page)
+        self.assertRegex(
+            page,
+            re.compile(
+                r"const showFeedback = useCallback\(.*?clearFeedbackTimer\(\);\s*setFeedback\(nextFeedback\);",
+                re.DOTALL,
+            ),
+        )
+        self.assertIn("if (feedback?.kind !== 'success') return undefined", page)
+        self.assertIn("feedbackTimerRef.current = window.setTimeout(() => {", page)
+        self.assertIn("current === successFeedback ? null : current", page)
+        self.assertIn("}, 4_000);", page)
+        self.assertNotIn("5_000", page)
+        self.assertIn("showFeedback({ kind: 'progress', message: '正在保存记忆配置…' })", page)
+        self.assertIn("showFeedback({ kind: 'progress', message: '配置已保存，正在等待插件重载…' })", page)
+        self.assertIn("setFeedback((current) => current?.kind === 'warning' ? current : null)", page)
+
+        self.assertIn("role={feedback.kind === 'warning' ? 'alert' : 'status'}", page)
+        self.assertIn("aria-live={feedback.kind === 'warning' ? undefined : 'polite'}", page)
+        self.assertIn("feedback.kind === 'progress' ? '正在处理'", page)
+        self.assertIn("feedback.kind === 'success' ? '操作成功' : '需要处理'", page)
+        self.assertNotIn("操作完成", page)
+        self.assertIn("feedback.kind !== 'progress'", page)
+        self.assertIn('aria-label="关闭通知"', page)
+
+        for branch in (
+            r"if \(result\.manual_reload_required\).*?kind: 'warning'",
+            r"if \(!reloadResult\).*?kind: 'warning'",
+            r"if \(reloadResult\.reloadFailed\).*?kind: 'warning'",
+        ):
+            self.assertRegex(page, re.compile(branch, re.DOTALL))
+        self.assertIn("setError(messageOf(reason, '保存记忆配置失败'))", page)
+        self.assertIn("setError(`${messageOf(reason, '配置版本冲突')}", page)
+
+        self.assertNotIn('{feedback ? <p className="inline-feedback"', page)
+        self.assertNotIn("保存期间请勿重复提交或离开页面", page)
+        self.assertNotIn("插件重载期间，独立管理页和 Memory 数据接口可能短暂不可用", page)
+        self.assertIn(".memory-config-toast {", styles)
+        self.assertIn(".memory-config-toast--warning {", styles)
+        self.assertRegex(
+            styles,
+            re.compile(r"\.memory-config-toast--warning \{\s*border-color: var\(--wf-danger\);"),
+        )
+        self.assertIn(".memory-config-toast__close:focus-visible", styles)
+        self.assertRegex(
+            styles,
+            re.compile(r"\.memory-config-toast__close \{.*?min-height: 44px;", re.DOTALL),
+        )
+        self.assertIn(".page-stack,\n  .memory-config-toast {\n    animation: none;", styles)
 
         for helper in (
             "deepClone",

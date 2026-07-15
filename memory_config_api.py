@@ -26,6 +26,25 @@ _RELOAD_IDLE = "idle"
 _RELOAD_SCHEDULED = "scheduled"
 _RELOAD_RUNNING = "running"
 _RELOAD_FAILED = "failed"
+_LEGACY_INJECTION_OPTION_MAP = {
+    "fake_tool_call_deepseek_v4": "fake_tool_call",
+    "system_prompt": "extra_user_content",
+}
+
+
+def _normalize_memory_config(config: Any) -> Any:
+    normalized = copy.deepcopy(config)
+    if not isinstance(normalized, dict):
+        return normalized
+    recall_engine = normalized.get("recall_engine")
+    if not isinstance(recall_engine, dict):
+        return normalized
+    injection_method = recall_engine.get("injection_method")
+    if isinstance(injection_method, str):
+        canonical = _LEGACY_INJECTION_OPTION_MAP.get(injection_method)
+        if canonical is not None:
+            recall_engine["injection_method"] = canonical
+    return normalized
 
 
 class _MemoryConfigCoordinator:
@@ -357,11 +376,11 @@ class MemoryConfigApi:
 
     async def get_memory_config(self):
         try:
-            current = self._current_memory_config()
+            response_config = _normalize_memory_config(self._current_memory_config())
             payload = {
                 "schema": self._schema_for_response(),
-                "config": current,
-                "revision": self._revision(current),
+                "config": response_config,
+                "revision": self._revision(response_config),
                 "runtime_id": self._coordinator.active_runtime_id,
                 "runtime_generation": self._coordinator.active_generation,
                 "reload_status": self._coordinator.reload_state,
@@ -405,7 +424,7 @@ class MemoryConfigApi:
                     "expected_revision 必须是非空字符串",
                     code="INVALID_EXPECTED_REVISION",
                 )
-            submitted = payload["config"]
+            submitted = _normalize_memory_config(payload["config"])
             self._validate_schema_value(submitted, self._memory_schema, ())
             provider_options = self._provider_options()
             try:
@@ -430,7 +449,7 @@ class MemoryConfigApi:
                         },
                     )
                 active_config = self._active_config()
-                current = self._current_memory_config()
+                current = _normalize_memory_config(self._current_memory_config())
                 current_revision = self._revision(current)
                 if expected_revision != current_revision:
                     return error_response(

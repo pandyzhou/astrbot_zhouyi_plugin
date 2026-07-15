@@ -27,6 +27,11 @@ interface MemoryConfigPageProps {
   onNavigationLockChange?: (locked: boolean) => void;
 }
 
+type FeedbackState =
+  | { kind: 'progress'; message: string }
+  | { kind: 'success'; message: string }
+  | { kind: 'warning'; message: string };
+
 function messageOf(reason: unknown, fallback: string) {
   return reason instanceof Error ? reason.message || fallback : fallback;
 }
@@ -83,8 +88,9 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
   const [saving, setSaving] = useState(false);
   const [reloading, setReloading] = useState(false);
   const [revisionConflict, setRevisionConflict] = useState(false);
-  const [feedback, setFeedback] = useState('');
+  const [feedback, setFeedback] = useState<FeedbackState | null>(null);
   const [error, setError] = useState('');
+  const feedbackTimerRef = useRef<number | null>(null);
   const pollControllerRef = useRef<AbortController | null>(null);
 
   const memoryConfigQuery = useCachedQuery<MemoryConfigData>(queryKeys.memoryConfig, () => apiClient.memoryConfig());
@@ -103,6 +109,17 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
     ?? parsed.categories[0];
   const loading = !data && memoryConfigQuery.isInitialLoading;
   const loadError = !data && memoryConfigQuery.error ? messageOf(memoryConfigQuery.error, '读取记忆配置失败') : '';
+
+  const clearFeedbackTimer = useCallback(() => {
+    if (feedbackTimerRef.current === null) return;
+    window.clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = null;
+  }, []);
+
+  const showFeedback = useCallback((nextFeedback: FeedbackState | null) => {
+    clearFeedbackTimer();
+    setFeedback(nextFeedback);
+  }, [clearFeedbackTimer]);
 
   const applyLoadedData = useCallback((loaded: MemoryConfigData, preserveDraft = false) => {
     const nextParsed = parseMemoryConfigSchema(loaded.schema, loaded.config, loaded.providers, loaded.constraints);
@@ -133,14 +150,26 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [locked]);
 
+  useEffect(() => {
+    clearFeedbackTimer();
+    if (feedback?.kind !== 'success') return undefined;
+    const successFeedback = feedback;
+    feedbackTimerRef.current = window.setTimeout(() => {
+      feedbackTimerRef.current = null;
+      setFeedback((current) => current === successFeedback ? null : current);
+    }, 4_000);
+    return clearFeedbackTimer;
+  }, [clearFeedbackTimer, feedback]);
+
   useEffect(() => () => {
+    clearFeedbackTimer();
     pollControllerRef.current?.abort();
     onNavigationLockChange?.(false);
-  }, [onNavigationLockChange]);
+  }, [clearFeedbackTimer, onNavigationLockChange]);
 
   function updateField(field: MemoryConfigField, value: MemoryConfigValue) {
     setDraft((current) => current ? setAtPath(current, field.path, value) : current);
-    setFeedback('');
+    setFeedback((current) => current?.kind === 'warning' ? current : null);
     setError('');
   }
 
@@ -149,20 +178,25 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
     applyLoadedData(data);
     setRevisionConflict(false);
     setError('');
-    setFeedback('已取消未保存的更改。');
+    showFeedback({ kind: 'success', message: '已取消未保存的更改。' });
   }
 
   async function reloadConfig(preserveDraft = false) {
     if (!preserveDraft && dirty && !window.confirm('重新加载会丢弃当前未保存更改，确定继续吗？')) return;
     setReloading(true);
     setError('');
+    showFeedback({ kind: 'progress', message: '正在重新加载记忆配置…' });
     try {
       const loaded = await apiClient.memoryConfig();
       queryCache.set(queryKeys.memoryConfig, loaded);
       applyLoadedData(loaded, preserveDraft);
       setRevisionConflict(false);
-      setFeedback(preserveDraft ? '已读取最新版本，并保留当前草稿供审查。' : '已重新加载记忆配置。');
+      showFeedback({
+        kind: 'success',
+        message: preserveDraft ? '已读取最新版本，并保留当前草稿供审查。' : '已重新加载记忆配置。',
+      });
     } catch (reason) {
+      showFeedback(null);
       setError(messageOf(reason, '重新加载记忆配置失败'));
     } finally {
       setReloading(false);
@@ -201,7 +235,7 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
     const nextConfig = convertMemoryConfigDraft(draft, parsed.fields);
     setSaving(true);
     setError('');
-    setFeedback('正在保存记忆配置…');
+    showFeedback({ kind: 'progress', message: '正在保存记忆配置…' });
     const controller = new AbortController();
     pollControllerRef.current?.abort();
     pollControllerRef.current = controller;
@@ -224,18 +258,21 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
       if (result.manual_reload_required) {
         queryCache.set(queryKeys.memoryConfig, savedSnapshot);
         applyLoadedData(savedSnapshot);
-        setFeedback(result.message ?? '配置已保存，但当前环境要求手动重载插件后才会生效。');
+        showFeedback({
+          kind: 'warning',
+          message: result.message ?? '配置已保存，但当前环境要求手动重载插件后才会生效。',
+        });
         return;
       }
 
       if (!result.reload_scheduled && !result.reload_pending) {
         queryCache.set(queryKeys.memoryConfig, savedSnapshot);
         applyLoadedData(savedSnapshot);
-        setFeedback('记忆配置已保存。');
+        showFeedback({ kind: 'success', message: '记忆配置已保存。' });
         return;
       }
 
-      setFeedback('配置已保存，正在等待插件重载…');
+      showFeedback({ kind: 'progress', message: '配置已保存，正在等待插件重载…' });
       const reloadResult = await pollReload(
         result.revision,
         result.config,
@@ -245,16 +282,16 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
       if (!reloadResult) {
         queryCache.set(queryKeys.memoryConfig, savedSnapshot);
         applyLoadedData(savedSnapshot);
-        setFeedback('配置已保存，但在超时时间内无法确认插件已完成重载。');
+        showFeedback({ kind: 'warning', message: '配置已保存，但在超时时间内无法确认插件已完成重载。' });
         return;
       }
       queryCache.set(queryKeys.memoryConfig, reloadResult.loaded);
       applyLoadedData(reloadResult.loaded);
       if (reloadResult.reloadFailed) {
-        setFeedback('配置已保存，但自动重载插件失败，请手动重载插件。');
+        showFeedback({ kind: 'warning', message: '配置已保存，但自动重载插件失败，请手动重载插件。' });
         return;
       }
-      setFeedback('记忆配置已保存，插件已完成重载。');
+      showFeedback({ kind: 'success', message: '记忆配置已保存，插件已完成重载。' });
     } catch (reason) {
       if ((reason as Error).name === 'AbortError') return;
       if (isRevisionConflict(reason)) {
@@ -263,7 +300,7 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
       } else {
         setError(messageOf(reason, '保存记忆配置失败'));
       }
-      setFeedback('');
+      showFeedback(null);
     } finally {
       if (pollControllerRef.current === controller) pollControllerRef.current = null;
       setSaving(false);
@@ -352,8 +389,22 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
       </header>
 
       <p className="settings-context">配置由后端 Schema 动态生成；保存后可能短暂重载整个插件。</p>
-      <div className="wf-sr-only" aria-live="polite">{saving ? feedback : ''}</div>
-      {feedback ? <p className="inline-feedback" role="status">{feedback}</p> : null}
+      {feedback ? (
+        <div
+          className={`memory-config-toast${feedback.kind === 'warning' ? ' memory-config-toast--warning' : ''}`}
+          role={feedback.kind === 'warning' ? 'alert' : 'status'}
+          aria-live={feedback.kind === 'warning' ? undefined : 'polite'}
+          aria-atomic="true"
+        >
+          <div className="memory-config-toast__content">
+            <strong>{feedback.kind === 'progress' ? '正在处理' : feedback.kind === 'success' ? '操作成功' : '需要处理'}</strong>
+            <span>{feedback.message}</span>
+          </div>
+          {feedback.kind !== 'progress' ? (
+            <button className="memory-config-toast__close" type="button" aria-label="关闭通知" onClick={() => showFeedback(null)}>关闭</button>
+          ) : null}
+        </div>
+      ) : null}
       {error ? (
         <div className="inline-feedback inline-feedback--error" role="alert">
           <span>{error}</span>
@@ -402,7 +453,6 @@ export function MemoryConfigPage({ onNavigationLockChange }: MemoryConfigPagePro
                 <div><dt>字段校验</dt><dd>{Object.keys(validationErrors).length ? `${Object.keys(validationErrors).length} 项待修正` : '已通过'}</dd></div>
                 <div><dt>保存状态</dt><dd className="save-state">{saving ? '保存/重载中…' : dirty ? '待保存' : '已保存'}</dd></div>
               </dl>
-              <p className="risk-copy">保存期间请勿重复提交或离开页面。插件重载期间，独立管理页和 Memory 数据接口可能短暂不可用。</p>
               <div className="form-actions summary-actions">
                 <button className="wf-button" type="button" disabled={!dirty || saving} onClick={cancelChanges}>取消更改</button>
                 <button className="wf-button wf-button--primary" type="button" disabled={!dirty || saving || Boolean(Object.keys(validationErrors).length)} onClick={() => void saveConfig()}>

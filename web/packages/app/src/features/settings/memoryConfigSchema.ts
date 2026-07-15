@@ -35,6 +35,23 @@ export interface ParsedMemoryConfigSchema {
 export type MemoryConfigDraft = MemoryConfigObject;
 export type MemoryValidationErrors = Record<string, string>;
 
+interface MemoryConfigCategoryGroup {
+  key: string;
+  title: string;
+  sources: readonly string[];
+}
+
+const CATEGORY_GROUPS: readonly MemoryConfigCategoryGroup[] = [
+  { key: 'basics', title: '基础与模型', sources: ['basic', 'provider_settings'] },
+  { key: 'conversation-recall', title: '会话与召回', sources: ['session_manager', 'recall_engine', 'fusion_strategy', 'retrieval'] },
+  { key: 'memory-processing', title: '记忆处理', sources: ['reflection_engine', 'agent_tools', 'filtering_settings'] },
+  { key: 'graph-weighting', title: '图记忆与权重', sources: ['graph_memory', 'importance_decay'] },
+  { key: 'maintenance', title: '数据维护', sources: ['forgetting_agent', 'migration_settings', 'index_rebuild_settings', 'backup_settings'] },
+];
+const OTHER_CATEGORY_GROUP: MemoryConfigCategoryGroup = { key: 'other', title: '其他设置', sources: [] };
+const CATEGORY_GROUP_BY_SOURCE = new Map(
+  CATEGORY_GROUPS.flatMap((group) => group.sources.map((source) => [source, group] as const)),
+);
 const scalarTypes = new Set(['boolean', 'bool', 'string', 'integer', 'number', 'int', 'float']);
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -228,6 +245,21 @@ function collectObjectCategories(
   }
 }
 
+function consolidateCategories(categories: readonly MemoryConfigCategory[]): MemoryConfigCategory[] {
+  const grouped = new Map<string, MemoryConfigCategory>();
+  for (const category of categories) {
+    const source = category.key.split('.')[0] ?? category.key;
+    const group = CATEGORY_GROUP_BY_SOURCE.get(source) ?? OTHER_CATEGORY_GROUP;
+    const current = grouped.get(group.key);
+    if (current) current.fields.push(...category.fields);
+    else grouped.set(group.key, { key: group.key, title: group.title, fields: [...category.fields] });
+  }
+  return [...CATEGORY_GROUPS, OTHER_CATEGORY_GROUP].flatMap((group) => {
+    const category = grouped.get(group.key);
+    return category ? [category] : [];
+  });
+}
+
 export function parseMemoryConfigSchema(
   schema: MemoryConfigSchemaNode | Record<string, MemoryConfigSchemaNode>,
   config: MemoryConfigObject,
@@ -240,10 +272,11 @@ export function parseMemoryConfigSchema(
     const field = makeField(key, [key], node, config, providers, constraints);
     return field ? [field] : [];
   });
-  const categories: MemoryConfigCategory[] = basicFields.length
+  const schemaCategories: MemoryConfigCategory[] = basicFields.length
     ? [{ key: 'basic', title: '基础设置', fields: basicFields }]
     : [];
-  collectObjectCategories(properties, [], config, providers, constraints, categories);
+  collectObjectCategories(properties, [], config, providers, constraints, schemaCategories);
+  const categories = consolidateCategories(schemaCategories);
   return { categories, fields: categories.flatMap((category) => category.fields) };
 }
 

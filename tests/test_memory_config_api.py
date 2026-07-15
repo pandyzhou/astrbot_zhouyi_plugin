@@ -26,6 +26,7 @@ from data.plugins.astrbot_zhouyi_plugin.memory_config_api import (
     PLUGIN_NAME,
     MemoryConfigApi,
     PluginReloadAdapter,
+    _normalize_memory_config,
 )
 from data.plugins.astrbot_zhouyi_plugin.runtime import PluginRuntime
 
@@ -589,26 +590,150 @@ class MemoryConfigApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(payload["data"]["code"], expected_code)
 
-    async def test_deprecated_injection_options_remain_valid(self):
+    def test_legacy_injection_normalization_returns_deep_copy(self):
+        original = {
+            "recall_engine": {"injection_method": "system_prompt"},
+            "nested": {"preserved": True},
+        }
+
+        normalized = _normalize_memory_config(original)
+
+        self.assertEqual(
+            normalized["recall_engine"]["injection_method"], "extra_user_content"
+        )
+        self.assertEqual(original["recall_engine"]["injection_method"], "system_prompt")
+        self.assertIsNot(normalized, original)
+        self.assertIsNot(normalized["nested"], original["nested"])
+
+    async def test_get_normalizes_legacy_injection_options_without_side_effects(self):
+        self.config.save_config()
+        disk_before = self.config_path.read_bytes()
+        reloader = _Reloader()
         api = MemoryConfigApi(
             self.config,
             self.context,
-            "runtime-deprecated",
+            "runtime-legacy-get",
+            reloader=reloader,
+            reload_delay=0.01,
+        )
+        mappings = {
+            "fake_tool_call_deepseek_v4": "fake_tool_call",
+            "system_prompt": "extra_user_content",
+        }
+
+        for legacy, canonical in mappings.items():
+            with self.subTest(legacy=legacy):
+                self.config["memory"]["recall_engine"]["injection_method"] = legacy
+
+                data = await self._get(api)
+
+                self.assertEqual(
+                    data["config"]["recall_engine"]["injection_method"], canonical
+                )
+                self.assertEqual(data["revision"], api._revision(data["config"]))
+                self.assertEqual(
+                    self.config["memory"]["recall_engine"]["injection_method"], legacy
+                )
+                self.assertEqual(self.config_path.read_bytes(), disk_before)
+                self.assertEqual(reloader.calls, [])
+                self.assertEqual(api._coordinator.reload_state, "idle")
+
+    async def test_unrelated_save_lazily_migrates_legacy_injection_option(self):
+        self.config["memory"]["recall_engine"][
+            "injection_method"
+        ] = "fake_tool_call_deepseek_v4"
+        self.config.save_config()
+        disk_before = self.config_path.read_bytes()
+        api = MemoryConfigApi(
+            self.config,
+            self.context,
+            "runtime-legacy-migration",
+            reloader=_Reloader(supported=False),
+        )
+
+        current = await self._get(api)
+        self.assertEqual(
+            current["config"]["recall_engine"]["injection_method"], "fake_tool_call"
+        )
+        self.assertEqual(self.config_path.read_bytes(), disk_before)
+        updated = copy.deepcopy(current["config"])
+        updated["bot_language"] = "en"
+
+        status, payload = await self._call(
+            api.post_memory_config,
+            {"config": updated, "expected_revision": current["revision"]},
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(
+            payload["data"]["config"]["recall_engine"]["injection_method"],
+            "fake_tool_call",
+        )
+        self.assertEqual(
+            self.config["memory"]["recall_engine"]["injection_method"],
+            "fake_tool_call",
+        )
+        persisted = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(
+            persisted["memory"]["recall_engine"]["injection_method"],
+            "fake_tool_call",
+        )
+        self.assertEqual(payload["data"]["revision"], api._revision(payload["data"]["config"]))
+
+    async def test_legacy_client_post_normalizes_injection_options_before_validation(self):
+        api = MemoryConfigApi(
+            self.config,
+            self.context,
+            "runtime-legacy-post",
             reloader=_Reloader(supported=False),
         )
         current = await self._get(api)
-        for option in ("fake_tool_call_deepseek_v4", "system_prompt"):
-            updated = copy.deepcopy(current["config"])
-            updated["recall_engine"]["injection_method"] = option
-            status, payload = await self._call(
-                api.post_memory_config,
-                {"config": updated, "expected_revision": current["revision"]},
-            )
-            self.assertEqual(status, 202)
-            current = {"config": updated, "revision": payload["data"]["revision"]}
+        cases = (
+            ("fake_tool_call_deepseek_v4", "fake_tool_call", "en"),
+            ("system_prompt", "extra_user_content", "ru"),
+        )
+
+        for legacy, canonical, language in cases:
+            with self.subTest(legacy=legacy):
+                submitted = copy.deepcopy(current["config"])
+                submitted["recall_engine"]["injection_method"] = legacy
+                submitted["bot_language"] = language
+
+                status, payload = await self._call(
+                    api.post_memory_config,
+                    {
+                        "config": submitted,
+                        "expected_revision": current["revision"],
+                    },
+                )
+
+                self.assertEqual(status, 202)
+                saved = payload["data"]["config"]
+                self.assertEqual(saved["recall_engine"]["injection_method"], canonical)
+                self.assertEqual(
+                    self.config["memory"]["recall_engine"]["injection_method"],
+                    canonical,
+                )
+                persisted = json.loads(
+                    self.config_path.read_text(encoding="utf-8-sig")
+                )
+                self.assertEqual(
+                    persisted["memory"]["recall_engine"]["injection_method"],
+                    canonical,
+                )
+                self.assertEqual(payload["data"]["revision"], api._revision(saved))
+                current = await self._get(api)
 
     async def test_conf_schema_leaf_fields_match_memory_config_model(self):
         schema = json.loads((PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        injection_method = schema["memory"]["items"]["recall_engine"]["items"]["injection_method"]
+        self.assertEqual(
+            injection_method["options"],
+            ["extra_user_content", "user_message_before", "user_message_after", "fake_tool_call"],
+        )
+        self.assertNotIn("已废弃", injection_method["hint"])
+        self.assertNotIn("fake_tool_call_deepseek_v4", injection_method["hint"])
+        self.assertNotIn("system_prompt", injection_method["hint"])
 
         def schema_paths(node, prefix=()):
             items = node.get("items") if isinstance(node, dict) else None
