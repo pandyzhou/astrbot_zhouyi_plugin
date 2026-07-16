@@ -42,6 +42,14 @@ CORE_TABLES = (
     "graph_nodes",
     "graph_edges",
     "memory_atoms",
+    "memory_owners",
+    "memory_identity_links",
+    "memory_items",
+    "memory_item_revisions",
+    "memory_item_sources",
+    "memory_item_relations",
+    "memory_conflicts",
+    "memory_write_ops",
 )
 
 

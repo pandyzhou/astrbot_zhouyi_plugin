@@ -17,7 +17,7 @@ class DBMigration:
     """数据库迁移管理器"""
 
     # 当前数据库版本
-    CURRENT_VERSION = 8
+    CURRENT_VERSION = 9
 
     # 版本历史记录
     VERSION_HISTORY = {
@@ -29,6 +29,7 @@ class DBMigration:
         6: "插件 FTS 表统一 livingmemory 前缀，旧 documents_fts 安全重命名备份",
         7: "Storage indexes and FTS optimization for graph and atom data",
         8: "Write-operation log and access-aware metadata indexes",
+        9: "Owner-scoped evolving memory objects and immutable revisions",
     }
 
     def __init__(self, db_path: str):
@@ -239,6 +240,10 @@ class DBMigration:
                 # 从版本7升级到版本8
                 if current_version <= 7:
                     migration_steps.append(self._migrate_v7_to_v8)
+
+                # 从版本8升级到版本9
+                if current_version <= 8:
+                    migration_steps.append(self._migrate_v8_to_v9)
 
                 # 执行所有迁移步骤
                 for step in migration_steps:
@@ -744,6 +749,358 @@ class DBMigration:
         except Exception as e:
             logger.error(f"v7 -> v8 迁移失败: {e}", exc_info=True)
             raise
+
+    async def ensure_v9_schema(self) -> None:
+        """幂等创建 v9 核心结构，不更新版本号、不执行数据回填。"""
+        async with self.migration_lock:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA busy_timeout = 10000")
+                await db.execute("PRAGMA foreign_keys = ON")
+                await db.execute("BEGIN IMMEDIATE")
+                try:
+                    await self._apply_v9_schema(db)
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    raise
+
+    async def _migrate_v8_to_v9(
+        self,
+        progress_callback: Callable[[str, int, int], None] | None,
+    ):
+        """Create owner-scoped evolving-memory structures using DDL only."""
+        logger.info("执行迁移步骤: v8 -> v9 (owner-scoped evolving memory)")
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA busy_timeout = 10000")
+            await db.execute("PRAGMA foreign_keys = ON")
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await self._apply_v9_schema(db)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.error("v8 -> v9 迁移失败", exc_info=True)
+                raise
+        if progress_callback:
+            progress_callback("v9 可演化记忆结构已创建", 1, 1)
+        logger.info("v8 -> v9 迁移完成")
+
+    async def _apply_v9_schema(self, db: aiosqlite.Connection) -> None:
+        """Apply the complete v9 DDL idempotently inside the caller transaction."""
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS migration_status (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_owners (
+                owner_user_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'merged', 'disabled')),
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_identity_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL,
+                external_user_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL,
+                verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0, 1)),
+                source TEXT NOT NULL DEFAULT 'automatic',
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'revoked')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(platform_id, bot_id, external_user_id),
+                FOREIGN KEY(owner_user_id) REFERENCES memory_owners(owner_user_id)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_items (
+                memory_item_id TEXT PRIMARY KEY,
+                owner_user_id TEXT NOT NULL,
+                scope TEXT NOT NULL
+                    CHECK(scope IN ('user', 'persona', 'session', 'public', 'legacy_session')),
+                session_id TEXT,
+                persona_id TEXT,
+                item_type TEXT NOT NULL DEFAULT 'fact',
+                canonical_key TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'conflicted', 'archived', 'superseded')),
+                current_revision_no INTEGER NOT NULL DEFAULT 1 CHECK(current_revision_no >= 1),
+                version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+                current_document_id INTEGER,
+                importance REAL NOT NULL DEFAULT 0.5 CHECK(importance >= 0.0 AND importance <= 1.0),
+                confidence REAL NOT NULL DEFAULT 0.7 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+                useful_score REAL NOT NULL DEFAULT 0.0 CHECK(useful_score >= -1.0 AND useful_score <= 1.0),
+                useful_count INTEGER NOT NULL DEFAULT 0 CHECK(useful_count >= 0),
+                invalid_count INTEGER NOT NULL DEFAULT 0 CHECK(invalid_count >= 0),
+                group_safe INTEGER NOT NULL DEFAULT 0 CHECK(group_safe IN (0, 1)),
+                index_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(index_status IN ('current', 'pending', 'needs_repair', 'disabled')),
+                index_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(scope != 'persona' OR persona_id IS NOT NULL),
+                CHECK(scope NOT IN ('session', 'legacy_session') OR session_id IS NOT NULL),
+                FOREIGN KEY(owner_user_id) REFERENCES memory_owners(owner_user_id)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_item_revisions (
+                revision_id TEXT PRIMARY KEY,
+                memory_item_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL,
+                revision_no INTEGER NOT NULL CHECK(revision_no >= 1),
+                operation TEXT NOT NULL
+                    CHECK(operation IN ('create', 'update', 'merge', 'supersede', 'archive', 'backfill', 'conflict')),
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                structured_payload TEXT NOT NULL DEFAULT '{}',
+                base_version INTEGER NOT NULL CHECK(base_version >= 0),
+                actor_type TEXT NOT NULL
+                    CHECK(actor_type IN ('automatic', 'admin', 'user', 'migration', 'system')),
+                actor_id TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(memory_item_id, revision_no),
+                FOREIGN KEY(memory_item_id) REFERENCES memory_items(memory_item_id),
+                FOREIGN KEY(owner_user_id) REFERENCES memory_owners(owner_user_id)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_memory_item_revisions_immutable_update
+            BEFORE UPDATE ON memory_item_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'memory_item_revisions are immutable');
+            END
+            """
+        )
+        await db.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_memory_item_revisions_immutable_delete
+            BEFORE DELETE ON memory_item_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'memory_item_revisions are immutable');
+            END
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_item_sources (
+                source_id TEXT PRIMARY KEY,
+                source_key TEXT NOT NULL UNIQUE,
+                owner_user_id TEXT NOT NULL,
+                memory_item_id TEXT NOT NULL,
+                revision_no INTEGER NOT NULL CHECK(revision_no >= 1),
+                source_type TEXT NOT NULL,
+                source_ref TEXT,
+                document_id INTEGER,
+                session_id TEXT,
+                message_start_id INTEGER,
+                message_end_id INTEGER,
+                content_snapshot TEXT,
+                availability TEXT NOT NULL DEFAULT 'available'
+                    CHECK(availability IN ('available', 'partial', 'unavailable')),
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                CHECK(message_start_id IS NULL OR message_end_id IS NULL OR message_start_id <= message_end_id),
+                FOREIGN KEY(memory_item_id, revision_no)
+                    REFERENCES memory_item_revisions(memory_item_id, revision_no),
+                FOREIGN KEY(owner_user_id) REFERENCES memory_owners(owner_user_id)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_item_relations (
+                relation_id TEXT PRIMARY KEY,
+                owner_user_id TEXT NOT NULL,
+                source_item_id TEXT NOT NULL,
+                target_item_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL
+                    CHECK(relation_type IN (
+                        'merged_into', 'supersedes', 'derived_from',
+                        'duplicate_of', 'conflicts_with', 'related_to'
+                    )),
+                source_revision_no INTEGER,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                CHECK(source_item_id != target_item_id),
+                UNIQUE(source_item_id, target_item_id, relation_type),
+                FOREIGN KEY(source_item_id) REFERENCES memory_items(memory_item_id),
+                FOREIGN KEY(target_item_id) REFERENCES memory_items(memory_item_id),
+                FOREIGN KEY(owner_user_id) REFERENCES memory_owners(owner_user_id)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                owner_user_id TEXT NOT NULL,
+                left_item_id TEXT NOT NULL,
+                right_item_id TEXT NOT NULL,
+                conflict_type TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'medium'
+                    CHECK(severity IN ('low', 'medium', 'high', 'critical')),
+                status TEXT NOT NULL DEFAULT 'open'
+                    CHECK(status IN ('open', 'resolved', 'dismissed')),
+                resolution_action TEXT,
+                resolved_by TEXT,
+                resolution_note TEXT,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                resolved_at TEXT,
+                CHECK(left_item_id != right_item_id),
+                FOREIGN KEY(left_item_id) REFERENCES memory_items(memory_item_id),
+                FOREIGN KEY(right_item_id) REFERENCES memory_items(memory_item_id),
+                FOREIGN KEY(owner_user_id) REFERENCES memory_owners(owner_user_id)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS livingmemory_memory_items_fts
+            USING fts5(
+                content,
+                canonical_key,
+                memory_item_id UNINDEXED,
+                owner_user_id UNINDEXED,
+                item_type UNINDEXED,
+                tokenize='unicode61'
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_write_ops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_type TEXT NOT NULL,
+                memory_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                step TEXT NOT NULL DEFAULT 'started',
+                payload TEXT DEFAULT '{}',
+                error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                operation_key TEXT,
+                entity_id TEXT
+            )
+            """
+        )
+
+        compatibility_columns = {
+            "memory_atoms": (
+                ("memory_item_id", "TEXT"),
+                ("memory_revision_no", "INTEGER"),
+            ),
+            "graph_entries": (
+                ("memory_item_id", "TEXT"),
+                ("memory_revision_no", "INTEGER"),
+                ("projection_status", "TEXT"),
+            ),
+            "memory_write_ops": (
+                ("operation_key", "TEXT"),
+                ("entity_id", "TEXT"),
+            ),
+        }
+        for table_name, columns in compatibility_columns.items():
+            if not await self._table_exists(db, table_name):
+                continue
+            for column_name, declaration in columns:
+                await self._add_column_if_missing(
+                    db,
+                    table_name,
+                    column_name,
+                    declaration,
+                )
+
+        index_statements = (
+            "CREATE INDEX IF NOT EXISTS idx_memory_identity_owner ON memory_identity_links(owner_user_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_owner_status ON memory_items(owner_user_id, status, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_owner_scope ON memory_items(owner_user_id, scope, persona_id, session_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_owner_canonical ON memory_items(owner_user_id, canonical_key, status)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_owner_hash ON memory_items(owner_user_id, content_hash, status)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_revisions_owner_item ON memory_item_revisions(owner_user_id, memory_item_id, revision_no DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_sources_owner_item ON memory_item_sources(owner_user_id, memory_item_id, revision_no)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_sources_document ON memory_item_sources(document_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_relations_owner_source ON memory_item_relations(owner_user_id, source_item_id, relation_type)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_relations_owner_target ON memory_item_relations(owner_user_id, target_item_id, relation_type)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_conflicts_owner_status ON memory_conflicts(owner_user_id, status, severity, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_write_ops_status ON memory_write_ops(status, updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_write_ops_memory ON memory_write_ops(memory_id, op_type)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_write_ops_operation_key ON memory_write_ops(operation_key) WHERE operation_key IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_memory_write_ops_entity ON memory_write_ops(entity_id, op_type)",
+        )
+        for statement in index_statements:
+            await db.execute(statement)
+
+        optional_index_statements = {
+            "memory_atoms": (
+                "CREATE INDEX IF NOT EXISTS idx_atoms_memory_item ON memory_atoms(memory_item_id, memory_revision_no)",
+            ),
+            "graph_entries": (
+                "CREATE INDEX IF NOT EXISTS idx_graph_entries_memory_item ON graph_entries(memory_item_id, memory_revision_no, projection_status)",
+            ),
+        }
+        for table_name, statements in optional_index_statements.items():
+            if await self._table_exists(db, table_name):
+                for statement in statements:
+                    await db.execute(statement)
+
+    async def _add_column_if_missing(
+        self,
+        db: aiosqlite.Connection,
+        table_name: str,
+        column_name: str,
+        declaration: str,
+    ) -> None:
+        allowed_identifiers = {
+            "memory_atoms",
+            "graph_entries",
+            "memory_write_ops",
+            "memory_item_id",
+            "memory_revision_no",
+            "projection_status",
+            "operation_key",
+            "entity_id",
+        }
+        allowed_declarations = {"TEXT", "INTEGER"}
+        if (
+            table_name not in allowed_identifiers
+            or column_name not in allowed_identifiers
+            or declaration not in allowed_declarations
+        ):
+            raise ValueError("不允许的兼容字段 DDL")
+        cursor = await db.execute(f'PRAGMA table_info("{table_name}")')
+        existing_columns = {str(row[1]) for row in await cursor.fetchall()}
+        if column_name not in existing_columns:
+            await db.execute(
+                f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {declaration}'
+            )
 
     async def _table_exists(self, db: aiosqlite.Connection, table_name: str) -> bool:
         cursor = await db.execute(

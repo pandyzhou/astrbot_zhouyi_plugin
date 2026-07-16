@@ -84,12 +84,30 @@ class AtomStore:
                     decay_type TEXT NOT NULL DEFAULT 'exponential',
                     session_id TEXT,
                     persona_id TEXT,
-                    metadata TEXT DEFAULT '{}'
+                    metadata TEXT DEFAULT '{}',
+                    memory_item_id TEXT,
+                    memory_revision_no INTEGER
                 )
                 """
             )
+            cursor = await db.execute("PRAGMA table_info(memory_atoms)")
+            atom_columns = {str(row[1]) for row in await cursor.fetchall()}
+            for column_name, declaration in (
+                ("memory_item_id", "TEXT"),
+                ("memory_revision_no", "INTEGER"),
+            ):
+                if column_name not in atom_columns:
+                    await db.execute(
+                        f"ALTER TABLE memory_atoms ADD COLUMN {column_name} {declaration}"
+                    )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_atoms_parent ON memory_atoms(parent_memory_id)"
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_atoms_memory_item
+                ON memory_atoms(memory_item_id, memory_revision_no)
+                """
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_atoms_status ON memory_atoms(status)"
@@ -181,8 +199,9 @@ class AtomStore:
                 importance, confidence, created_at, last_accessed_at,
                 last_reinforced_at, event_time, ttl_days, expires_at,
                 status, reinforcement_count, decay_type,
-                session_id, persona_id, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                session_id, persona_id, metadata,
+                memory_item_id, memory_revision_no
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 atom.parent_memory_id,
@@ -203,6 +222,8 @@ class AtomStore:
                 atom.session_id,
                 atom.persona_id,
                 self._to_json(atom.metadata),
+                atom.memory_item_id,
+                atom.memory_revision_no,
             ),
         )
         atom_id = int(cursor.lastrowid)
@@ -479,6 +500,33 @@ class AtomStore:
                 await db.commit()
             return len(atom_ids)
 
+    async def mark_projection_stale_by_parent(self, parent_memory_id: int) -> int:
+        """Keep old projection atoms but remove them from active retrieval."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT id, metadata FROM memory_atoms WHERE parent_memory_id = ?",
+                (parent_memory_id,),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                metadata = self._from_json(row["metadata"])
+                metadata["projection_status"] = "stale"
+                await db.execute(
+                    "UPDATE memory_atoms SET status = ?, metadata = ? WHERE id = ?",
+                    (
+                        AtomStatus.SUPERSEDED.value,
+                        self._to_json(metadata),
+                        int(row["id"]),
+                    ),
+                )
+                await db.execute(
+                    "DELETE FROM memory_atoms_fts WHERE atom_id = ?",
+                    (int(row["id"]),),
+                )
+            await db.commit()
+        return len(rows)
+
     async def delete_by_parent(self, parent_memory_id: int) -> int:
         """Delete all atoms belonging to a parent memory. Returns count."""
         async with self._connect() as db:
@@ -597,6 +645,12 @@ class AtomStore:
             session_id=row["session_id"],
             persona_id=row["persona_id"],
             metadata=self._from_json(row["metadata"]),
+            memory_item_id=row["memory_item_id"],
+            memory_revision_no=(
+                int(row["memory_revision_no"])
+                if row["memory_revision_no"] is not None
+                else None
+            ),
         )
 
 

@@ -1,6 +1,7 @@
 """供 Agent 主动调用的长期记忆写入工具。"""
 
 import asyncio
+import hashlib
 import json
 from dataclasses import field
 from typing import Any
@@ -13,7 +14,8 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
-from ..utils import get_persona_id
+from ..models.evolving_memory import IndexStatus, MemoryActorType, MemoryScope
+from ..utils import build_access_context_from_event, get_persona_id
 
 
 def _json_result(data: dict[str, Any]) -> str:
@@ -38,6 +40,7 @@ class MemoryMemorizeTool(FunctionTool[AstrAgentContext]):
     context: Any = None
     memory_engine: Any = None
     memory_processor: Any = None
+    evolving_memory_manager: Any = None
 
     name: str = "memorize_long_term_memory"
     description: str = (
@@ -147,18 +150,122 @@ class MemoryMemorizeTool(FunctionTool[AstrAgentContext]):
             if cleaned_reason:
                 metadata["memorize_reason"] = cleaned_reason
 
-            memory_id = await self.memory_engine.add_memory(
-                content=content,
-                session_id=session_id,
-                persona_id=persona_id,
-                importance=normalized_importance,
-                metadata=metadata,
+            manager = self.evolving_memory_manager or getattr(
+                self.memory_engine, "evolving_memory_manager", None
             )
+            memory_id = None
+            memory_item_id = None
+            version = None
+            deduplicated = False
+            projection_status = None
+            projection_error = None
+            if manager is not None:
+                access_context = await build_access_context_from_event(
+                    event,
+                    manager,
+                    astrbot_context=self.context,
+                    persona_id=persona_id,
+                )
+                if access_context is None:
+                    return _json_result(
+                        {
+                            "memorized": False,
+                            "error": "access_context_unavailable",
+                        }
+                    )
+                raw_message_id = getattr(
+                    getattr(event, "message_obj", None), "message_id", None
+                )
+                try:
+                    source_message_id = int(raw_message_id)
+                    if source_message_id <= 0:
+                        source_message_id = None
+                except (TypeError, ValueError):
+                    source_message_id = None
+                effective_scope = (
+                    MemoryScope.SESSION
+                    if is_group_chat
+                    else (
+                        MemoryScope.PERSONA
+                        if access_context.persona_id
+                        else MemoryScope.USER
+                    )
+                )
+                structured_payload = {
+                    "topics": metadata.get("topics", []),
+                    "key_facts": metadata.get("key_facts", []),
+                    "sentiment": metadata.get("sentiment", "neutral"),
+                    "memorize_reason": cleaned_reason or None,
+                }
+                operation_context = {
+                    "owner_user_id": access_context.owner_user_id,
+                    "persona_id": access_context.persona_id,
+                    "scope": effective_scope.value,
+                    "session_id": access_context.session_id,
+                    "content": content,
+                    "source_content": cleaned_memory,
+                    "structured_payload": structured_payload,
+                    "importance": float(normalized_importance),
+                }
+                content_hash = hashlib.sha256(
+                    json.dumps(
+                        operation_context,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                operation_key = f"agent-memorize:{content_hash}"
+                result = await manager.create(
+                    context=access_context,
+                    content=content,
+                    operation_key=operation_key,
+                    scope=effective_scope,
+                    structured_payload=structured_payload,
+                    importance=normalized_importance,
+                    confidence=0.9,
+                    actor_type=MemoryActorType.AUTOMATIC,
+                    actor_id=self.name,
+                    reason=cleaned_reason or "agent memorize tool",
+                    source={
+                        "source_key": f"agent-memorize:{content_hash}",
+                        "source_type": "agent_memorize_tool",
+                        "source_ref": self.name,
+                        "session_id": access_context.session_id,
+                        "message_start_id": source_message_id,
+                        "message_end_id": source_message_id,
+                        "content_snapshot": cleaned_memory[:65536],
+                        "metadata": {"tool_name": self.name},
+                    },
+                )
+                memory_id = result.item.current_document_id
+                memory_item_id = result.item.memory_item_id
+                version = result.item.version
+                deduplicated = result.deduplicated
+                projection_status = result.projection_status.value
+                projection_error = result.item.index_error
+            else:
+                # 仅在对象管理器不存在的旧运行环境中兼容 legacy 写入。
+                memory_id = await self.memory_engine.add_memory(
+                    content=content,
+                    session_id=session_id,
+                    persona_id=persona_id,
+                    importance=normalized_importance,
+                    metadata=metadata,
+                )
 
+            needs_repair = projection_status == IndexStatus.NEEDS_REPAIR.value
             return _json_result(
                 {
                     "memorized": True,
+                    "status": "partial_success" if needs_repair else "success",
+                    "needs_repair": needs_repair,
+                    "projection_status": projection_status,
+                    "projection_error": projection_error if needs_repair else None,
                     "id": memory_id,
+                    "memory_item_id": memory_item_id,
+                    "version": version,
+                    "deduplicated": deduplicated,
                     "content": content,
                     "importance": normalized_importance,
                     "session_id": session_id,

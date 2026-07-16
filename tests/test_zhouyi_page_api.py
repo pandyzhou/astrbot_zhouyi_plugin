@@ -14,6 +14,7 @@ from data.plugins.astrbot_zhouyi_plugin.web_api import PAGE_API_PREFIX
 from data.plugins.astrbot_zhouyi_plugin.zhouyi_page_api import (
     CONFIG_V1_PREFIX,
     MC_V1_PREFIX,
+    MEMORY_ADMIN_ROUTE_DESCRIPTORS,
     MEMORY_ROUTE_DESCRIPTORS,
     MEMORY_V1_PREFIX,
     PAGE_V1_PREFIX,
@@ -86,8 +87,7 @@ class ZhouyiDashboardApiTests(unittest.IsolatedAsyncioTestCase):
         api.register_routes()
         api.register_routes()
         registered = {(path, tuple(methods)) for path, _, methods, _ in plugin.context.routes}
-        self.assertEqual(len(plugin.context.routes), 47)
-        self.assertEqual(len(registered), 47)
+        self.assertEqual(len(plugin.context.routes), len(registered))
         self.assertIn((f"{PAGE_V1_PREFIX}/bootstrap", ("GET",)), registered)
         self.assertIn((f"{PAGE_API_PREFIX}/bootstrap", ("GET",)), registered)
         self.assertIn((f"{MC_V1_PREFIX}/bootstrap", ("GET",)), registered)
@@ -101,6 +101,17 @@ class ZhouyiDashboardApiTests(unittest.IsolatedAsyncioTestCase):
         for suffix, _, methods, _ in MEMORY_ROUTE_DESCRIPTORS:
             self.assertIn((f"{MEMORY_V1_PREFIX}{suffix}", methods), registered)
             self.assertIn((f"{PAGE_API_PREFIX}{suffix}", methods), registered)
+        for suffix, _, methods, _ in MEMORY_ADMIN_ROUTE_DESCRIPTORS:
+            self.assertIn((f"{MEMORY_V1_PREFIX}{suffix}", methods), registered)
+            self.assertNotIn((f"{PAGE_API_PREFIX}{suffix}", methods), registered)
+        self.assertIn(
+            (f"{MEMORY_V1_PREFIX}/identities/owners/merge/preview", ("POST",)),
+            registered,
+        )
+        self.assertNotIn(
+            (f"{PAGE_API_PREFIX}/identities/owners/merge/preview", ("POST",)),
+            registered,
+        )
 
     async def test_stats_handler_receives_plugin_context(self):
         plugin = _Plugin()

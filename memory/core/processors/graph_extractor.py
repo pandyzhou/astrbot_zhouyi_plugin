@@ -115,6 +115,15 @@ class GraphExtractor:
                 "summary_schema_version": metadata.get("summary_schema_version"),
                 "graph_confidence": confidence,
                 "source_window": metadata.get("source_window"),
+                "archive_type": metadata.get("archive_type"),
+                "memory_item_id": metadata.get("memory_item_id"),
+                "memory_revision_no": metadata.get("memory_revision_no"),
+                "owner_user_id": metadata.get("owner_user_id"),
+                "scope": metadata.get("scope"),
+                "group_safe": metadata.get("group_safe", False),
+                "item_status": metadata.get("item_status"),
+                "projection_status": metadata.get("projection_status", "current"),
+                "version": metadata.get("version"),
             }
             graph.entries.append(
                 GraphEntry(
@@ -290,6 +299,7 @@ class GraphExtractor:
             # Fact entry with atom's own confidence
             payload = f"fact|{source_memory_id}||{fact_key}|{atom.content}"
             entry_key = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+            atom_metadata = dict(getattr(atom, "metadata", {}) or {})
             entry_metadata = {
                 "source_memory_id": source_memory_id,
                 "session_id": session_id,
@@ -298,6 +308,17 @@ class GraphExtractor:
                 "graph_confidence": atom_confidence,
                 "atom_type": atom_type_str,
                 "ttl_days": float(getattr(atom, "ttl_days", 30.0)),
+                "archive_type": atom_metadata.get("archive_type"),
+                "memory_item_id": getattr(atom, "memory_item_id", None)
+                or atom_metadata.get("memory_item_id"),
+                "memory_revision_no": getattr(atom, "memory_revision_no", None)
+                or atom_metadata.get("memory_revision_no"),
+                "owner_user_id": atom_metadata.get("owner_user_id"),
+                "scope": atom_metadata.get("scope"),
+                "group_safe": atom_metadata.get("group_safe", False),
+                "item_status": atom_metadata.get("item_status"),
+                "projection_status": atom_metadata.get("projection_status", "current"),
+                "version": atom_metadata.get("version"),
             }
             graph.entries.append(
                 GraphEntry(

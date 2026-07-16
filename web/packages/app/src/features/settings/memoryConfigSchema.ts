@@ -42,9 +42,9 @@ interface MemoryConfigCategoryGroup {
 }
 
 const CATEGORY_GROUPS: readonly MemoryConfigCategoryGroup[] = [
-  { key: 'basics', title: '基础与模型', sources: ['basic', 'provider_settings'] },
+  { key: 'basics', title: '基础与模型', sources: ['basic', 'provider_settings', 'identity_resolution'] },
   { key: 'conversation-recall', title: '会话与召回', sources: ['session_manager', 'recall_engine', 'fusion_strategy', 'retrieval'] },
-  { key: 'memory-processing', title: '记忆处理', sources: ['reflection_engine', 'agent_tools', 'filtering_settings'] },
+  { key: 'memory-processing', title: '记忆处理', sources: ['reflection_engine', 'agent_tools', 'filtering_settings', 'evolving_memory'] },
   { key: 'graph-weighting', title: '图记忆与权重', sources: ['graph_memory', 'importance_decay'] },
   { key: 'maintenance', title: '数据维护', sources: ['forgetting_agent', 'migration_settings', 'index_rebuild_settings', 'backup_settings'] },
 ];

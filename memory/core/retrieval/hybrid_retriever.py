@@ -30,6 +30,9 @@ class HybridResult:
     content: str
     metadata: dict[str, Any]
     score_breakdown: dict[str, float] | None = None  # 各维度分数明细
+    memory_item_id: str | None = None
+    version: int | None = None
+    source_type: str = "legacy_document"
 
 
 class HybridRetriever:
@@ -50,7 +53,7 @@ class HybridRetriever:
     def __init__(
         self,
         bm25_retriever: BM25Retriever,
-        vector_retriever: VectorRetriever,
+        vector_retriever: VectorRetriever | None,
         rrf_fusion: RRFFusion,
         config: dict[str, Any] | None = None,
     ):
@@ -125,11 +128,36 @@ class HybridRetriever:
         if "persona_id" not in metadata:
             metadata["persona_id"] = None
 
-        # 先添加到向量库获取doc_id
-        doc_id = await self.vector_retriever.add_document(content, metadata)
+        if self.vector_retriever is not None:
+            # 有 Embedding 时保持原有 AstrBot FaissVecDB 写入行为。
+            doc_id = await self.vector_retriever.add_document(content, metadata)
+        else:
+            # BM25-only 模式下 documents SQLite 是唯一事实存储，不创建伪向量记录。
+            async with self.bm25_retriever._connect() as db:
+                cursor = await db.execute(
+                    """
+                    INSERT INTO documents(doc_id, text, metadata, created_at, updated_at)
+                    VALUES (?, ?, ?, datetime('now'), datetime('now'))
+                    """,
+                    (
+                        f"bm25-only-{time.time_ns()}",
+                        content,
+                        json.dumps(metadata, ensure_ascii=False),
+                    ),
+                )
+                await db.commit()
+                doc_id = int(cursor.lastrowid)
 
-        # 使用相同的doc_id添加到BM25索引
-        await self.bm25_retriever.add_document(doc_id, content, metadata)
+        try:
+            await self.bm25_retriever.add_document(doc_id, content, metadata)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if self.vector_retriever is None:
+                async with self.bm25_retriever._connect() as db:
+                    await db.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+                    await db.commit()
+            raise
 
         return doc_id
 
@@ -139,6 +167,7 @@ class HybridRetriever:
         k: int = 10,
         session_id: str | None = None,
         persona_id: str | None = None,
+        access_context=None,
     ) -> list[HybridResult]:
         """
         执行混合检索
@@ -155,18 +184,45 @@ class HybridRetriever:
         if not query or not query.strip():
             return []
 
-        # 1. 并行执行两路检索
+        if self.vector_retriever is None:
+            bm25_results, bm25_error = await self._search_route(
+                "BM25",
+                self.bm25_retriever.search(
+                    query,
+                    k,
+                    session_id,
+                    persona_id,
+                    access_context=access_context,
+                ),
+            )
+            if bm25_error or not bm25_results:
+                return []
+            return self._fallback_bm25_only(bm25_results, k)
+
+        # 1. 并行执行两路检索，每一路独立隔离普通异常。
         (
             (bm25_results, bm25_error),
             (vector_results, vector_error),
         ) = await asyncio.gather(
             self._search_route(
                 "BM25",
-                self.bm25_retriever.search(query, k, session_id, persona_id),
+                self.bm25_retriever.search(
+                    query,
+                    k,
+                    session_id,
+                    persona_id,
+                    access_context=access_context,
+                ),
             ),
             self._search_route(
                 "向量",
-                self.vector_retriever.search(query, k, session_id, persona_id),
+                self.vector_retriever.search(
+                    query,
+                    k,
+                    session_id,
+                    persona_id,
+                    access_context=access_context,
+                ),
             ),
         )
 
@@ -434,18 +490,41 @@ class HybridRetriever:
             bool: 是否更新成功
         """
         try:
-            # 更新FAISS向量库（这会同步更新DocumentStorage中的metadata）
-            vector_success = await self.vector_retriever.update_metadata(
-                doc_id, metadata
-            )
-
-            if not vector_success:
-                logger.error(f"[同步更新] FAISS更新失败 (doc_id={doc_id})")
-                return False
+            if self.vector_retriever is not None:
+                vector_success = await self.vector_retriever.update_metadata(
+                    doc_id, metadata
+                )
+                if not vector_success:
+                    logger.error(f"[同步更新] FAISS更新失败 (doc_id={doc_id})")
+                    return False
+            else:
+                async with self.bm25_retriever._connect() as db:
+                    cursor = await db.execute(
+                        "SELECT metadata FROM documents WHERE id = ?", (doc_id,)
+                    )
+                    row = await cursor.fetchone()
+                    if row is None:
+                        return False
+                    current_metadata: dict[str, Any] = {}
+                    if row[0]:
+                        try:
+                            loaded = json.loads(row[0])
+                            if isinstance(loaded, dict):
+                                current_metadata = loaded
+                        except (json.JSONDecodeError, TypeError):
+                            current_metadata = {}
+                    current_metadata.update(metadata)
+                    await db.execute(
+                        "UPDATE documents SET metadata = ?, updated_at = datetime('now') WHERE id = ?",
+                        (json.dumps(current_metadata, ensure_ascii=False), doc_id),
+                    )
+                    await db.commit()
 
             logger.info(f"[同步更新] 元数据更新成功 (doc_id={doc_id})")
             return True
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"[同步更新] 失败 (doc_id={doc_id}): {e}", exc_info=True)
             return False
@@ -495,24 +574,25 @@ class HybridRetriever:
                 logger.error(f"[删除] BM25删除异常 (doc_id={doc_id}): {e}")
                 return False
 
-            # 再删除向量库（主数据）
-            try:
-                vector_deleted = await self.vector_retriever.delete_document(doc_id)
-                if not vector_deleted:
-                    logger.error(f"[删除] 向量库删除失败，需回滚 (doc_id={doc_id})")
-                    # 回滚: 恢复BM25索引
+            # 有向量库时再删除 FAISS；BM25-only 下 documents 仍由 SQLite 独立删除。
+            if self.vector_retriever is not None:
+                try:
+                    vector_deleted = await self.vector_retriever.delete_document(doc_id)
+                    if not vector_deleted:
+                        logger.error(f"[删除] 向量库删除失败，需回滚 (doc_id={doc_id})")
+                        await self._rollback_bm25_delete(
+                            doc_id, backup_content, backup_metadata
+                        )
+                        return False
+                    logger.debug(f"[删除] 向量库已删除 (doc_id={doc_id})")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"[删除] 向量删除异常，回滚BM25 (doc_id={doc_id}): {e}")
                     await self._rollback_bm25_delete(
                         doc_id, backup_content, backup_metadata
                     )
                     return False
-                logger.debug(f"[删除] 向量库已删除 (doc_id={doc_id})")
-            except Exception as e:
-                logger.error(f"[删除] 向量删除异常，回滚BM25 (doc_id={doc_id}): {e}")
-                # 回滚: 恢复BM25索引
-                await self._rollback_bm25_delete(
-                    doc_id, backup_content, backup_metadata
-                )
-                return False
 
             # 最后删除documents表记录
             try:

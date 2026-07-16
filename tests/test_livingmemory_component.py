@@ -7,6 +7,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 ASTRBOT_ROOT = Path(__file__).resolve().parents[4]
@@ -60,6 +61,8 @@ class _FailingInitializer:
         self.memory_processor = None
         self.conversation_manager = None
         self.index_validator = None
+        self.evolving_memory_manager = None
+        self.evolving_memory_store = None
         self.db = None
         self.graph_db = None
         self._initialized_callback = None
@@ -94,6 +97,8 @@ class _RetryInitializer(_FailingInitializer):
         self.memory_processor = object()
         self.conversation_manager = object()
         self.index_validator = object()
+        self.evolving_memory_manager = object()
+        self.evolving_memory_store = object()
         self.is_initialized = True
         await self._initialized_callback()
 
@@ -222,8 +227,49 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(component.ready)
             self.assertIsNotNone(component.events)
             self.assertIsNotNone(component.commands)
+            self.assertIs(
+                component.evolving_memory_manager,
+                component.bootstrap.evolving_memory_manager,
+            )
+            self.assertIs(
+                component.evolving_memory_store,
+                component.bootstrap.evolving_memory_store,
+            )
             self.assertEqual(len(context.tools), 1)
+            self.assertIs(
+                context.tools[0].kwargs["evolving_memory_manager"],
+                component.evolving_memory_manager,
+            )
             await component.terminate()
+
+    async def test_after_message_sent_proxy_and_runtime_status_include_feedback_backfill(self):
+        component_module = _load_component_module()
+        component = object.__new__(component_module.MemoryService)
+        component._ensure_plugin_ready = AsyncMock(return_value=(True, ""))
+        component.events = SimpleNamespace(
+            handle_after_message_sent=AsyncMock(),
+            get_runtime_status=lambda: {
+                "enabled": True,
+                "buffered_rounds": 2,
+                "task_count": 1,
+            },
+        )
+        component.bootstrap = SimpleNamespace(
+            get_runtime_status=lambda: {
+                "key_facts_backfill": {"status": "running"}
+            }
+        )
+        event = object()
+
+        await component.handle_after_message_sent(event, "sent")
+        status = component.get_runtime_status()
+
+        component.events.handle_after_message_sent.assert_awaited_once_with(
+            event, "sent"
+        )
+        self.assertEqual(status["key_facts_backfill"]["status"], "running")
+        self.assertEqual(status["feedback"]["buffered_rounds"], 2)
+        self.assertEqual(status["feedback"]["task_count"], 1)
 
     async def test_terminate_continues_closing_resources_after_cleanup_failure(self):
         component_module = _load_component_module()

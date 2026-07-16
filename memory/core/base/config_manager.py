@@ -116,3 +116,13 @@ class ConfigManager:
     def graph_memory(self) -> dict[str, Any]:
         """Graph-memory settings."""
         return self.get_section("graph_memory")
+
+    @property
+    def identity_resolution(self) -> dict[str, Any]:
+        """Owner identity resolution settings."""
+        return self.get_section("identity_resolution")
+
+    @property
+    def evolving_memory(self) -> dict[str, Any]:
+        """Evolving-memory object settings."""
+        return self.get_section("evolving_memory")

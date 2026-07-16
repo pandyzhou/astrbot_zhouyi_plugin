@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import hashlib
 from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
@@ -11,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.platform import MessageType
 from astrbot.api.provider import LLMResponse
 
+from ..models.evolving_memory import MemoryActorType, MemoryScope
 from ..utils import get_persona_id
 
 if TYPE_CHECKING:
@@ -19,6 +21,414 @@ if TYPE_CHECKING:
     from ..managers.memory_engine import MemoryEngine
     from ..processors.memory_processor import MemoryProcessor
     from .message_utils import MessageUtils
+
+
+def build_summary_identity(
+    event: AstrMessageEvent,
+    *,
+    session_id: str,
+    is_group: bool,
+    history_messages: list[Any] | None = None,
+) -> dict[str, Any] | None:
+    """Capture the exact identity tuple needed for owner-scoped summary writes."""
+
+    def event_value(method_name: str) -> str:
+        method = getattr(event, method_name, None)
+        if not callable(method):
+            return ""
+        try:
+            return str(method() or "").strip()
+        except Exception:
+            return ""
+
+    platform_id = event_value("get_platform_name")
+    if not platform_id:
+        platform_id = session_id.split(":", 1)[0].strip()
+
+    bot_id = event_value("get_self_id")
+    if not bot_id:
+        bot_id = str(
+            getattr(getattr(event, "message_obj", None), "self_id", "") or ""
+        ).strip()
+    external_user_id = event_value("get_sender_id")
+    if not external_user_id:
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        external_user_id = str(getattr(sender, "user_id", "") or "").strip()
+
+    if not platform_id or not bot_id or not external_user_id:
+        return None
+    return {
+        "platform_id": platform_id,
+        "bot_id": bot_id,
+        "external_user_id": external_user_id,
+        "session_id": session_id,
+        "is_group": bool(is_group),
+    }
+
+
+def get_summary_message_id_range(history_messages: list[Any]) -> tuple[int | None, int | None]:
+    message_ids = []
+    for message in history_messages:
+        try:
+            message_id = int(getattr(message, "id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if message_id > 0:
+            message_ids.append(message_id)
+    if not message_ids:
+        return None, None
+    return min(message_ids), max(message_ids)
+
+
+async def _persist_summary_key_facts_once(
+    *,
+    memory_engine: "MemoryEngine",
+    identity: dict[str, Any] | None,
+    history_messages: list[Any],
+    persona_id: str | None,
+    metadata: dict[str, Any],
+    legacy_document_id: int,
+    importance: float,
+    triggered_by: str,
+) -> dict[str, Any]:
+    """Execute one dual-write attempt without mutating the retry queue."""
+    raw_facts = metadata.get("key_facts")
+    facts = []
+    if isinstance(raw_facts, list):
+        facts = list(
+            dict.fromkeys(str(value).strip() for value in raw_facts if str(value).strip())
+        )
+    stats: dict[str, Any] = {
+        "attempted": len(facts),
+        "created": 0,
+        "deduplicated": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+    if not facts:
+        return stats
+
+    manager = getattr(memory_engine, "evolving_memory_manager", None)
+    if manager is None or not manager.evolving_config.get("enabled", True):
+        stats["skipped"] = len(facts)
+        return stats
+    if not manager.evolving_config.get("write_enabled", True):
+        stats["skipped"] = len(facts)
+        return stats
+    if identity is None:
+        stats["skipped"] = len(facts)
+        stats["errors"].append("无法解析 owner identity")
+        return stats
+
+    message_start_id, message_end_id = get_summary_message_id_range(history_messages)
+    if message_start_id is None or message_end_id is None:
+        stats["skipped"] = len(facts)
+        stats["errors"].append("总结消息缺少可追溯的数据库 ID")
+        return stats
+
+    try:
+        access_context = await manager.build_access_context(
+            platform_id=str(identity["platform_id"]),
+            bot_id=str(identity["bot_id"]),
+            external_user_id=str(identity["external_user_id"]),
+            session_id=str(identity["session_id"]),
+            persona_id=persona_id,
+            is_group=bool(identity["is_group"]),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        stats["failed"] = len(facts)
+        stats["errors"].append(str(exc))
+        logger.warning("总结 key_facts 无法建立 owner 上下文", exc_info=True)
+        return stats
+
+    canonical_summary = str(
+        metadata.get("canonical_summary") or metadata.get("persona_summary") or ""
+    ).strip()
+    target_scope = (
+        MemoryScope.SESSION
+        if access_context.is_group
+        else MemoryScope.PERSONA
+        if access_context.persona_id
+        else MemoryScope.USER
+    )
+    for fact_index, fact in enumerate(facts):
+        digest_input = "\x1f".join(
+            (
+                access_context.owner_user_id,
+                access_context.session_id,
+                str(message_start_id),
+                str(message_end_id),
+                fact.casefold(),
+            )
+        )
+        digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+        operation_key = f"summary-feedback:{digest}"
+        source = {
+            "source_key": f"summary-key-fact:{digest}",
+            "source_type": "summary_key_fact",
+            "source_ref": f"document:{legacy_document_id}",
+            "document_id": int(legacy_document_id),
+            "session_id": access_context.session_id,
+            "message_start_id": message_start_id,
+            "message_end_id": message_end_id,
+            "content_snapshot": (
+                fact
+                if not canonical_summary
+                else f"{fact}\n\n{canonical_summary[:4096]}"
+            ),
+            "metadata": {
+                "fact_index": fact_index,
+                "triggered_by": triggered_by,
+                "legacy_document_id": int(legacy_document_id),
+            },
+        }
+        try:
+            result = await manager.create(
+                context=access_context,
+                content=fact,
+                operation_key=operation_key,
+                scope=target_scope,
+                importance=max(0.0, min(1.0, float(importance))),
+                confidence=max(
+                    0.0,
+                    min(1.0, float(metadata.get("confidence", 0.7))),
+                ),
+                actor_type=MemoryActorType.AUTOMATIC,
+                actor_id=triggered_by,
+                reason="summary key_facts dual-write",
+                source=source,
+            )
+            if result.deduplicated:
+                stats["deduplicated"] += 1
+            else:
+                stats["created"] += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            stats["failed"] += 1
+            fact_hash = hashlib.sha256(fact.encode("utf-8")).hexdigest()[:12]
+            stats["errors"].append(
+                f"fact#{fact_index}:{type(exc).__name__}:{fact_hash}"
+            )
+            logger.warning(
+                "总结 key_fact 对象写入失败: fact_index=%d fact_hash=%s error=%s",
+                fact_index,
+                fact_hash,
+                type(exc).__name__,
+                exc_info=True,
+            )
+    return stats
+
+
+def _get_summary_key_facts_retry_queue(
+    memory_engine: "MemoryEngine",
+) -> dict[str, dict[str, Any]]:
+    queue = getattr(memory_engine, "_summary_key_facts_retry_queue", None)
+    if not isinstance(queue, dict):
+        queue = {}
+        setattr(memory_engine, "_summary_key_facts_retry_queue", queue)
+    return queue
+
+
+def _get_summary_key_facts_retry_lock(memory_engine: "MemoryEngine") -> asyncio.Lock:
+    lock = getattr(memory_engine, "_summary_key_facts_retry_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        setattr(memory_engine, "_summary_key_facts_retry_lock", lock)
+    return lock
+
+
+def _build_summary_key_facts_retry_key(
+    *,
+    identity: dict[str, Any] | None,
+    history_messages: list[Any],
+    metadata: dict[str, Any],
+    legacy_document_id: int,
+) -> str:
+    message_start_id, message_end_id = get_summary_message_id_range(history_messages)
+    facts = metadata.get("key_facts")
+    normalized_facts = (
+        [str(value).strip().casefold() for value in facts]
+        if isinstance(facts, list)
+        else []
+    )
+    identity_parts = []
+    if identity is not None:
+        identity_parts = [
+            str(identity.get(key) or "")
+            for key in (
+                "platform_id",
+                "bot_id",
+                "external_user_id",
+                "session_id",
+                "is_group",
+            )
+        ]
+    digest_input = "\x1f".join(
+        [
+            str(legacy_document_id),
+            str(message_start_id or ""),
+            str(message_end_id or ""),
+            *identity_parts,
+            *normalized_facts,
+        ]
+    )
+    return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+
+
+async def _enqueue_summary_key_facts_retry(
+    *,
+    memory_engine: "MemoryEngine",
+    identity: dict[str, Any] | None,
+    history_messages: list[Any],
+    persona_id: str | None,
+    metadata: dict[str, Any],
+    legacy_document_id: int,
+    importance: float,
+    triggered_by: str,
+) -> None:
+    retry_key = _build_summary_key_facts_retry_key(
+        identity=identity,
+        history_messages=history_messages,
+        metadata=metadata,
+        legacy_document_id=legacy_document_id,
+    )
+    payload_metadata = dict(metadata)
+    if isinstance(metadata.get("key_facts"), list):
+        payload_metadata["key_facts"] = list(metadata["key_facts"])
+    payload = {
+        "identity": dict(identity) if identity is not None else None,
+        "history_messages": list(history_messages),
+        "persona_id": persona_id,
+        "metadata": payload_metadata,
+        "legacy_document_id": int(legacy_document_id),
+        "importance": float(importance),
+        "triggered_by": triggered_by,
+        "retry_count": 0,
+    }
+    lock = _get_summary_key_facts_retry_lock(memory_engine)
+    async with lock:
+        queue = _get_summary_key_facts_retry_queue(memory_engine)
+        queue.setdefault(retry_key, payload)
+
+
+def _summary_key_facts_attempt_complete(stats: dict[str, Any]) -> bool:
+    attempted = int(stats.get("attempted", 0) or 0)
+    persisted = int(stats.get("created", 0) or 0) + int(
+        stats.get("deduplicated", 0) or 0
+    )
+    return int(stats.get("failed", 0) or 0) == 0 and persisted >= attempted
+
+
+async def retry_pending_summary_key_facts(
+    memory_engine: "MemoryEngine | None",
+) -> dict[str, int]:
+    """Retry queued object dual-writes without creating another legacy document."""
+    totals = {
+        "attempted": 0,
+        "completed": 0,
+        "created": 0,
+        "deduplicated": 0,
+        "failed": 0,
+        "remaining": 0,
+    }
+    if memory_engine is None:
+        return totals
+    queue = getattr(memory_engine, "_summary_key_facts_retry_queue", None)
+    if not isinstance(queue, dict) or not queue:
+        return totals
+
+    lock = _get_summary_key_facts_retry_lock(memory_engine)
+    async with lock:
+        queue = _get_summary_key_facts_retry_queue(memory_engine)
+        for retry_key, payload in list(queue.items()):
+            totals["attempted"] += 1
+            try:
+                stats = await _persist_summary_key_facts_once(
+                    memory_engine=memory_engine,
+                    identity=payload["identity"],
+                    history_messages=payload["history_messages"],
+                    persona_id=payload["persona_id"],
+                    metadata=payload["metadata"],
+                    legacy_document_id=payload["legacy_document_id"],
+                    importance=payload["importance"],
+                    triggered_by=payload["triggered_by"],
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                payload["retry_count"] = int(payload.get("retry_count", 0)) + 1
+                totals["failed"] += 1
+                logger.warning(
+                    "重试总结 key_facts 双写异常: retry_key=%s error=%s",
+                    retry_key[:12],
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                continue
+
+            totals["created"] += int(stats.get("created", 0) or 0)
+            totals["deduplicated"] += int(stats.get("deduplicated", 0) or 0)
+            if _summary_key_facts_attempt_complete(stats):
+                queue.pop(retry_key, None)
+                totals["completed"] += 1
+            else:
+                payload["retry_count"] = int(payload.get("retry_count", 0)) + 1
+                totals["failed"] += 1
+        totals["remaining"] = len(queue)
+
+    if totals["attempted"]:
+        logger.info(
+            "总结 key_facts 待重试队列处理完成: attempted=%d completed=%d "
+            "created=%d deduplicated=%d remaining=%d",
+            totals["attempted"],
+            totals["completed"],
+            totals["created"],
+            totals["deduplicated"],
+            totals["remaining"],
+        )
+    return totals
+
+
+async def persist_summary_key_facts(
+    *,
+    memory_engine: "MemoryEngine",
+    identity: dict[str, Any] | None,
+    history_messages: list[Any],
+    persona_id: str | None,
+    metadata: dict[str, Any],
+    legacy_document_id: int,
+    importance: float,
+    triggered_by: str,
+) -> dict[str, Any]:
+    """Best-effort dual-write with an in-process idempotent retry queue."""
+    stats = await _persist_summary_key_facts_once(
+        memory_engine=memory_engine,
+        identity=identity,
+        history_messages=history_messages,
+        persona_id=persona_id,
+        metadata=metadata,
+        legacy_document_id=legacy_document_id,
+        importance=importance,
+        triggered_by=triggered_by,
+    )
+    stats["queued"] = 0
+    if int(stats.get("failed", 0) or 0) > 0:
+        await _enqueue_summary_key_facts_retry(
+            memory_engine=memory_engine,
+            identity=identity,
+            history_messages=history_messages,
+            persona_id=persona_id,
+            metadata=metadata,
+            legacy_document_id=legacy_document_id,
+            importance=importance,
+            triggered_by=triggered_by,
+        )
+        stats["queued"] = 1
+    return stats
 
 
 class MemoryReflection:
@@ -79,14 +489,6 @@ class MemoryReflection:
             )
             return
 
-        # 过滤 tool 循环最终总结：若本次响应是 tool 调用完成后的总结，
-        # 其 tools_call_extra_content 会携带工具调用上下文，说明这是 tool loop 产生的内容
-        if resp.tools_call_extra_content:
-            logger.debug(
-                "[DEBUG-Reflection] 检测到 tool loop 总结响应（tools_call_extra_content 非空），跳过记录"
-            )
-            return
-
         try:
             session_id = event.unified_msg_origin
             logger.debug(f"[DEBUG-Reflection] 获取到 unified_msg_origin: {session_id}")
@@ -100,6 +502,10 @@ class MemoryReflection:
                 logger.warning(
                     f"[{session_id}] 检测到异常的session_id，这可能导致记忆总结异常。"
                 )
+
+            # 每个最终响应循环先重放历史双写失败；该路径只写对象层，
+            # 不会重新生成或重复存储 legacy 总结文档。
+            await retry_pending_summary_key_facts(self.memory_engine)
 
             # 检查响应内容是否有效（过滤空回复和错误）
             response_text = resp.completion_text
@@ -265,6 +671,12 @@ class MemoryReflection:
                 )
 
                 persona_id = await get_persona_id(self.context, event)
+                summary_identity = build_summary_identity(
+                    event,
+                    session_id=session_id,
+                    is_group=is_group,
+                    history_messages=history_messages,
+                )
 
                 # 创建后台任务进行存储（跟踪任务）
                 if not self._shutting_down:
@@ -285,6 +697,7 @@ class MemoryReflection:
                                 start_index,
                                 end_index,
                                 retry_count,
+                                summary_identity,
                             )
                         )
                     except Exception:
@@ -309,12 +722,17 @@ class MemoryReflection:
         start_index: int,
         end_index: int,
         retry_count: int,
+        summary_identity: dict[str, Any] | None = None,
     ):
         """后台存储任务"""
         from ..utils import OperationContext
 
         async with OperationContext("记忆存储", session_id):
             try:
+                # 即使本总结任务已过期，也先重试历史对象双写；重试请求持有
+                # 已成功 legacy 文档的 ID，因此绝不会重复写 legacy。
+                await retry_pending_summary_key_facts(self.memory_engine)
+
                 # 如果其他任务已经推进了总结进度，本任务可能已过期，直接跳过
                 current_summarized = (
                     await self.conversation_manager.get_session_metadata(
@@ -376,12 +794,27 @@ class MemoryReflection:
                         persona_id=persona_id,
                     )
 
-                    # 补充 source_window 元数据，记录本次总结的消息范围
+                    # 补充 source_window 元数据，记录索引范围与真实消息 ID。
+                    message_start_id, message_end_id = get_summary_message_id_range(
+                        history_messages
+                    )
                     metadata["source_window"] = {
                         "session_id": session_id,
                         "start_index": start_index,
                         "end_index": end_index,
                         "message_count": end_index - start_index,
+                        "message_start_id": message_start_id,
+                        "message_end_id": message_end_id,
+                        "sender_ids": list(
+                            dict.fromkeys(
+                                str(getattr(message, "sender_id", "") or "").strip()
+                                for message in history_messages
+                                if str(
+                                    getattr(message, "sender_id", "") or ""
+                                ).strip()
+                            )
+                        ),
+                        **(summary_identity or {}),
                     }
 
                     logger.info(
@@ -401,9 +834,9 @@ class MemoryReflection:
                     )
                     return
 
-                # 正常流程：添加到记忆引擎
+                # 正常流程：先写 legacy 文档，再尽力双写 owner-scoped key_facts。
                 if self.memory_engine:
-                    await self.memory_engine.add_memory(
+                    legacy_document_id = await self.memory_engine.add_memory(
                         content=content,
                         session_id=session_id,
                         persona_id=persona_id,
@@ -415,6 +848,31 @@ class MemoryReflection:
                     logger.info(
                         f"[{session_id}] 成功存储对话记忆（{len(history_messages)}条消息，重要性={importance:.2f}）"
                     )
+                    feedback_stats = await persist_summary_key_facts(
+                        memory_engine=self.memory_engine,
+                        identity=summary_identity,
+                        history_messages=history_messages,
+                        persona_id=persona_id,
+                        metadata=metadata,
+                        legacy_document_id=legacy_document_id,
+                        importance=importance,
+                        triggered_by="memory-reflection",
+                    )
+                    if feedback_stats["failed"] or feedback_stats["errors"]:
+                        logger.warning(
+                            f"[{session_id}] legacy 总结已保存，但 key_facts 双写未完全成功: "
+                            f"created={feedback_stats['created']}, "
+                            f"deduplicated={feedback_stats['deduplicated']}, "
+                            f"failed={feedback_stats['failed']}, "
+                            f"skipped={feedback_stats['skipped']}, "
+                            f"errors={feedback_stats['errors']}"
+                        )
+                    elif feedback_stats["attempted"]:
+                        logger.info(
+                            f"[{session_id}] key_facts 双写完成: "
+                            f"created={feedback_stats['created']}, "
+                            f"deduplicated={feedback_stats['deduplicated']}"
+                        )
 
                 # 成功：更新已总结的位置，清除待处理记录
                 if self.conversation_manager:

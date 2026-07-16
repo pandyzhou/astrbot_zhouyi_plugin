@@ -12,7 +12,9 @@ import aiosqlite
 
 from astrbot.api import logger
 
+from ..models.evolving_memory import MemoryAccessContext
 from ..processors.text_processor import TextProcessor
+from .access_filters import coerce_metadata, is_metadata_accessible
 
 
 @dataclass
@@ -148,6 +150,7 @@ class BM25Retriever:
         limit: int = 50,
         session_id: str | None = None,
         persona_id: str | None = None,
+        access_context: MemoryAccessContext | None = None,
     ) -> list[BM25Result]:
         """
         执行BM25搜索
@@ -182,8 +185,12 @@ class BM25Retriever:
 
         # 有过滤条件时大幅增加预取量，避免过滤后结果不足
         # Python 层过滤（BM25）比 FAISS 内部过滤损耗更大，需要更多候选
-        has_filters = session_id is not None or persona_id is not None
-        fetch_limit = limit * 10 if has_filters else limit * 2
+        has_filters = (
+            session_id is not None
+            or persona_id is not None
+            or access_context is not None
+        )
+        fetch_limit = limit * 20 if has_filters else limit * 2
 
         async with self._connect() as db:
             # 执行FTS5 BM25搜索
@@ -220,7 +227,7 @@ class BM25Retriever:
             docs = {}
             async for row in cursor:
                 doc_id, text, metadata_json = row
-                metadata = json.loads(metadata_json) if metadata_json else {}
+                metadata = coerce_metadata(metadata_json)
                 docs[doc_id] = {"text": text, "metadata": metadata}
 
             # 构建结果列表并应用过滤
@@ -232,15 +239,13 @@ class BM25Retriever:
                 doc = docs[doc_id]
                 metadata = doc["metadata"]
 
-                # 应用过滤器 - 直接比较完整的 session_id / persona_id
-                if session_id is not None:
-                    stored_session_id = metadata.get("session_id")
-                    if stored_session_id != session_id:
-                        continue
-                if persona_id is not None:
-                    stored_persona_id = metadata.get("persona_id")
-                    if stored_persona_id != persona_id:
-                        continue
+                if not is_metadata_accessible(
+                    metadata,
+                    access_context=access_context,
+                    session_id=session_id,
+                    persona_id=persona_id,
+                ):
+                    continue
 
                 results.append(
                     BM25Result(

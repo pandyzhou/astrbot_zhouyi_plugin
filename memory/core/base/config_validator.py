@@ -159,6 +159,54 @@ class ImportanceDecayConfig(BaseModel):
     )
 
 
+class IdentityResolutionConfig(BaseModel):
+    """用户身份解析与 owner 边界配置。"""
+
+    enabled: bool = Field(default=True, description="是否启用 owner 身份解析")
+    default_scope: Literal["user", "persona", "session"] = Field(
+        default="persona", description="自动写入的默认 scope"
+    )
+    unmapped_policy: Literal["create_isolated_owner", "reject"] = Field(
+        default="create_isolated_owner", description="未映射身份的处理策略"
+    )
+    require_explicit_cross_platform_link: bool = Field(
+        default=True, description="跨平台身份是否必须显式绑定"
+    )
+    allow_public_scope: bool = Field(
+        default=False, description="是否允许管理员创建 public scope"
+    )
+
+
+class EvolvingMemoryConfig(BaseModel):
+    """可演化长期记忆对象配置。"""
+
+    enabled: bool = Field(default=True, description="是否启用可演化记忆对象")
+    read_enabled: bool = Field(default=True, description="是否启用对象读取")
+    write_enabled: bool = Field(default=True, description="是否启用对象写入")
+    feedback_enabled: bool = Field(default=True, description="是否启用回复后反馈")
+    feedback_trigger_mode: Literal["adaptive", "batch", "immediate"] = Field(
+        default="adaptive", description="反馈触发模式"
+    )
+    feedback_batch_rounds: int = Field(
+        default=3, ge=1, le=50, description="普通反馈的最大累计轮数"
+    )
+    feedback_idle_seconds: int = Field(
+        default=300, ge=10, le=86400, description="反馈批次最大空闲秒数"
+    )
+    max_actions_per_batch: int = Field(
+        default=5, ge=1, le=50, description="单批反馈最大动作数"
+    )
+    min_action_confidence: float = Field(
+        default=0.65, ge=0.0, le=1.0, description="自动动作最低置信度"
+    )
+    group_private_visibility: Literal["explicit_only"] = Field(
+        default="explicit_only", description="群聊私密记忆可见策略"
+    )
+    migration_batch_size: int = Field(
+        default=100, ge=1, le=1000, description="旧 key_facts 回填批量"
+    )
+
+
 class MigrationSettings(BaseModel):
     """数据库迁移设置"""
 
@@ -275,6 +323,10 @@ class MemoryConfig(BaseModel):
         default_factory=ForgettingAgentConfig
     )
     filtering_settings: FilteringConfig = Field(default_factory=FilteringConfig)
+    identity_resolution: IdentityResolutionConfig = Field(
+        default_factory=IdentityResolutionConfig
+    )
+    evolving_memory: EvolvingMemoryConfig = Field(default_factory=EvolvingMemoryConfig)
     migration_settings: MigrationSettings = Field(default_factory=MigrationSettings)
     index_rebuild_settings: IndexRebuildSettings = Field(
         default_factory=IndexRebuildSettings

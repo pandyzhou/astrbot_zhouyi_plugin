@@ -46,6 +46,8 @@ class MemoryService:
         self.bootstrap: MemoryBootstrap | None = None
         self.events: MemoryEvents | None = None
         self.commands: MemoryCommands | None = None
+        self.evolving_memory_manager: Any | None = None
+        self.evolving_memory_store: Any | None = None
 
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._component_init_lock = asyncio.Lock()
@@ -199,6 +201,13 @@ class MemoryService:
                 ):
                     raise RuntimeError("部分核心组件未能初始化")
 
+                self.evolving_memory_manager = getattr(
+                    self.bootstrap, "evolving_memory_manager", None
+                )
+                self.evolving_memory_store = getattr(
+                    self.bootstrap, "evolving_memory_store", None
+                )
+
                 if self.events is None:
                     self.events = MemoryEvents(
                         context=self.context,
@@ -206,6 +215,7 @@ class MemoryService:
                         memory_engine=self.bootstrap.memory_engine,
                         memory_processor=self.bootstrap.memory_processor,
                         conversation_manager=self.bootstrap.conversation_manager,
+                        evolving_memory_manager=self.evolving_memory_manager,
                     )
 
                 if self.commands is None:
@@ -243,6 +253,7 @@ class MemoryService:
                     context=self.context,
                     config_manager=self.config_manager,
                     memory_engine=self.bootstrap.memory_engine,
+                    evolving_memory_manager=self.evolving_memory_manager,
                 )
             )
         if self.config_manager.get("agent_tools.enable_memorize_tool", False):
@@ -251,6 +262,7 @@ class MemoryService:
                     context=self.context,
                     memory_engine=self.bootstrap.memory_engine,
                     memory_processor=self.bootstrap.memory_processor,
+                    evolving_memory_manager=self.evolving_memory_manager,
                 )
             )
 
@@ -341,6 +353,13 @@ class MemoryService:
         ready, _ = await self._ensure_plugin_ready()
         if ready and self.events is not None:
             await self.events.handle_memory_reflection(event, resp)
+
+    async def handle_after_message_sent(
+        self, event: AstrMessageEvent, *args: Any
+    ) -> None:
+        ready, _ = await self._ensure_plugin_ready()
+        if ready and self.events is not None:
+            await self.events.handle_after_message_sent(event, *args)
 
     async def handle_session_reset(self, event: AstrMessageEvent, *_args: Any) -> None:
         if not event.get_extra("_clean_ltm_session", False):
@@ -445,6 +464,35 @@ class MemoryService:
         async for result in self._proxy_command(event, "handle_help"):
             yield result
 
+    def get_capability_status(self) -> dict[str, Any]:
+        runtime_status = self.get_runtime_status()
+        return {
+            "available": self.ready and self.initialization_error is None,
+            "enabled": True,
+            "initialized": self.ready,
+            "error": self.initialization_error,
+            "runtime": runtime_status,
+        }
+
+    def get_runtime_status(self) -> dict[str, Any]:
+        bootstrap_status = (
+            self.bootstrap.get_runtime_status()
+            if self.bootstrap is not None
+            and hasattr(self.bootstrap, "get_runtime_status")
+            else {}
+        )
+        feedback_status = (
+            self.events.get_runtime_status() if self.events is not None else {
+                "enabled": False,
+                "buffered_rounds": 0,
+                "buffer_count": 0,
+                "task_count": 0,
+                "inflight_count": 0,
+                "last_status": "unavailable",
+            }
+        )
+        return {**bootstrap_status, "feedback": feedback_status}
+
     @staticmethod
     def _consume_task_result(task: asyncio.Task[Any]) -> None:
         if task.cancelled():
@@ -525,5 +573,7 @@ class MemoryService:
             finally:
                 self.events = None
                 self.commands = None
+                self.evolving_memory_manager = None
+                self.evolving_memory_store = None
                 self._terminated = True
                 self._terminating = False

@@ -1,3 +1,4 @@
+import type { MemoryObjectFilters } from '../api/types';
 import type { QueryKey } from './queryCacheCore';
 
 export const MC_QUERY_PREFIX = ['mc'] as const;
@@ -9,6 +10,10 @@ export const MEMORY_QUERY_PREFIX = ['memory'] as const;
 export const MEMORY_OVERVIEW_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'overview'] as const;
 export const MEMORY_LIST_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'list'] as const;
 export const MEMORY_GRAPH_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'graph'] as const;
+export const MEMORY_OBJECTS_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'objects'] as const;
+export const MEMORY_CONFLICTS_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'conflicts'] as const;
+export const MEMORY_IDENTITIES_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'identities'] as const;
+export const MEMORY_MAINTENANCE_QUERY_PREFIX = [...MEMORY_QUERY_PREFIX, 'maintenance'] as const;
 export const MEMORY_CONFIG_QUERY_PREFIX = ['config', 'memory'] as const;
 
 export const SOURCE_UPDATES_QUERY_PREFIX = ['sources', 'updates'] as const;
@@ -22,6 +27,10 @@ export const queryKeyPrefixes = Object.freeze({
   memoryOverview: MEMORY_OVERVIEW_QUERY_PREFIX,
   memoryList: MEMORY_LIST_QUERY_PREFIX,
   memoryGraph: MEMORY_GRAPH_QUERY_PREFIX,
+  memoryObjects: MEMORY_OBJECTS_QUERY_PREFIX,
+  memoryConflicts: MEMORY_CONFLICTS_QUERY_PREFIX,
+  memoryIdentities: MEMORY_IDENTITIES_QUERY_PREFIX,
+  memoryMaintenance: MEMORY_MAINTENANCE_QUERY_PREFIX,
   memoryConfig: MEMORY_CONFIG_QUERY_PREFIX,
   sourceUpdates: SOURCE_UPDATES_QUERY_PREFIX,
 });
@@ -69,6 +78,40 @@ export function memoryList(filters: MemoryListQueryParams): QueryKey {
   ] as const;
 }
 
+export function memoryObjects(filters: MemoryObjectFilters): QueryKey {
+  return [...MEMORY_OBJECTS_QUERY_PREFIX, {
+    page: filters.page,
+    page_size: filters.page_size,
+    keyword: filters.keyword ?? null,
+    owner_user_id: filters.owner_user_id,
+    scope: filters.scope ?? 'all',
+    persona_id: filters.persona_id ?? null,
+    status: filters.status ?? 'all',
+    memory_type: filters.memory_type ?? 'all',
+    conflict: filters.conflict ?? 'all',
+    index_status: filters.index_status ?? 'all',
+    sort: filters.sort ?? 'updated_desc',
+  }] as const;
+}
+
+export function memoryObjectDetail(ownerUserId: string, memoryItemId: string): QueryKey {
+  return [...MEMORY_OBJECTS_QUERY_PREFIX, 'detail', ownerUserId, memoryItemId] as const;
+}
+
+export function memoryObjectRevisions(ownerUserId: string, memoryItemId: string): QueryKey {
+  return [...MEMORY_OBJECTS_QUERY_PREFIX, 'revisions', ownerUserId, memoryItemId] as const;
+}
+
+export function memoryObjectSources(ownerUserId: string, memoryItemId: string, revisionNo?: number): QueryKey {
+  return [...MEMORY_OBJECTS_QUERY_PREFIX, 'sources', ownerUserId, memoryItemId, revisionNo ?? null] as const;
+}
+
+export function memoryConflicts(ownerUserId: string, status = 'open'): QueryKey {
+  return [...MEMORY_CONFLICTS_QUERY_PREFIX, ownerUserId, status] as const;
+}
+export const memoryIdentities = MEMORY_IDENTITIES_QUERY_PREFIX;
+export const memoryMaintenance = MEMORY_MAINTENANCE_QUERY_PREFIX;
+
 export function memoryGraphOverview(
   session: string | null | undefined,
   persona: string | null | undefined,
@@ -83,6 +126,13 @@ export const queryKeys = Object.freeze({
   memoryOverviewStats,
   memoryOverviewBackups,
   memoryList,
+  memoryObjects,
+  memoryObjectDetail,
+  memoryObjectRevisions,
+  memoryObjectSources,
+  memoryConflicts,
+  memoryIdentities,
+  memoryMaintenance,
   memoryGraphOverview,
   memoryConfig,
   sourceUpdates,

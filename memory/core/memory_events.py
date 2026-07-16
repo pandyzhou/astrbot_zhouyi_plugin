@@ -31,7 +31,10 @@ from .managers.conversation_manager import ConversationManager
 from .managers.memory_engine import MemoryEngine
 from .processors.memory_processor import MemoryProcessor
 from .utils import (
+    RECALL_TRACE_EXTRA_KEY,
+    RESPONSE_CONTEXT_EXTRA_KEY,
     OperationContext,
+    build_access_context_from_event,
     format_memories_for_fake_tool_call,
     format_memories_for_injection,
     get_persona_id,
@@ -49,7 +52,13 @@ class MemoryEvents:
     """事件处理器"""
 
     STORAGE_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+    FEEDBACK_SHUTDOWN_TIMEOUT_SECONDS = 10.0
     GROUP_ALIAS_LOOKUP_TIMEOUT_SECONDS = 3.0
+    _STRONG_FEEDBACK_SIGNAL = re.compile(
+        r"(?:不对|不是|错了|纠正|更正|记住|别忘|我喜欢|我不喜欢|我偏好|我的名字|我是|叫我|"
+        r"他是我的|她是我的|我们是|关系是|actually|correction|remember|prefer|my name is)",
+        re.IGNORECASE,
+    )
     _INVALID_GROUP_NAMES = {
         "n/a",
         "na",
@@ -69,6 +78,7 @@ class MemoryEvents:
         memory_engine: MemoryEngine,
         memory_processor: MemoryProcessor,
         conversation_manager: ConversationManager,
+        evolving_memory_manager: Any | None = None,
     ):
         """
         初始化事件处理器
@@ -85,6 +95,9 @@ class MemoryEvents:
         self.memory_engine = memory_engine
         self.memory_processor = memory_processor
         self.conversation_manager = conversation_manager
+        self.evolving_memory_manager = evolving_memory_manager or getattr(
+            memory_engine, "evolving_memory_manager", None
+        )
 
         # 初始化子模块
         self._message_utils = MessageUtils(config_manager, conversation_manager)
@@ -106,6 +119,19 @@ class MemoryEvents:
         self._storage_sessions_inflight: set[str] = set()
         self._storage_state_lock = asyncio.Lock()
         self._shutting_down = False
+
+        # 回复后反馈缓冲与后台任务。
+        self._feedback_buffers: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._feedback_idle_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._feedback_tasks: set[asyncio.Task] = set()
+        self._feedback_inflight: set[tuple[str, str]] = set()
+        self._feedback_lock = asyncio.Lock()
+        self._feedback_status: dict[str, Any] = {
+            "last_status": "idle",
+            "last_error_hash": None,
+            "completed_batches": 0,
+            "failed_batches": 0,
+        }
 
         # 群聊 UMO alias 后台同步状态
         self._group_alias_tasks: dict[str, asyncio.Task] = {}
@@ -138,9 +164,248 @@ class MemoryEvents:
     async def handle_memory_reflection(
         self, event: AstrMessageEvent, resp: LLMResponse
     ):
-        """Check if reflection and memory storage is needed after LLM response"""
+        """记录最终可见助手回复并触发现有总结；反馈延后到发送完成。"""
         self._schedule_group_alias_sync(event)
         await self._memory_reflection.handle_memory_reflection(event, resp)
+
+        if getattr(resp, "role", None) != "assistant":
+            return
+        if getattr(resp, "tools_call_name", None):
+            return
+        response_text = str(getattr(resp, "completion_text", "") or "").strip()
+        if not response_text:
+            return
+        user_text = await self._message_utils.get_event_message_str(event)
+        persona_id = await get_persona_id(self.context, event)
+        trace = event.get_extra(RECALL_TRACE_EXTRA_KEY, [])
+        event.set_extra(
+            RESPONSE_CONTEXT_EXTRA_KEY,
+            {
+                "user_text": user_text,
+                "assistant_text": response_text,
+                "persona_id": persona_id,
+                "recall_trace": list(trace) if isinstance(trace, list) else [],
+                "captured_at": time.time(),
+            },
+        )
+
+    async def handle_after_message_sent(
+        self, event: AstrMessageEvent, *_args: Any
+    ) -> None:
+        """发送成功后处理反馈；reset 事件先丢弃旧缓冲再清理会话。"""
+        if event.get_extra("_clean_ltm_session", False):
+            await self._discard_feedback_buffer_for_event(event)
+            await self.handle_session_reset(event)
+            return
+        await self.handle_memory_feedback(event)
+
+    async def _discard_feedback_buffer_for_event(self, event: AstrMessageEvent) -> None:
+        session_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not session_id:
+            return
+        keys = [
+            key
+            for key in getattr(self, "_feedback_buffers", {})
+            if key[1] == session_id
+        ]
+        async with self._feedback_lock:
+            for key in keys:
+                self._feedback_buffers.pop(key, None)
+                idle_task = self._feedback_idle_tasks.pop(key, None)
+                if idle_task is not None and not idle_task.done():
+                    idle_task.cancel()
+
+    async def handle_memory_feedback(self, event: AstrMessageEvent) -> None:
+        """按 owner/session 缓冲一轮已发送对话并按配置调度反馈。"""
+        manager = self.evolving_memory_manager
+        if self._shutting_down or manager is None or self.memory_processor is None:
+            return
+        config = getattr(manager, "evolving_config", {}) or {}
+        if not config.get("enabled", True) or not config.get("feedback_enabled", True):
+            return
+        response_context = event.get_extra(RESPONSE_CONTEXT_EXTRA_KEY, None)
+        if not isinstance(response_context, dict):
+            return
+        user_text = str(response_context.get("user_text") or "").strip()
+        assistant_text = str(response_context.get("assistant_text") or "").strip()
+        if not assistant_text:
+            return
+        access_context = await build_access_context_from_event(
+            event,
+            manager,
+            astrbot_context=self.context,
+            persona_id=response_context.get("persona_id"),
+        )
+        if access_context is None:
+            return
+
+        raw_trace = response_context.get("recall_trace")
+        recall_trace = []
+        if isinstance(raw_trace, list):
+            for entry in raw_trace:
+                if not isinstance(entry, dict):
+                    continue
+                trace_context = entry.get("context") or entry.get("access_context")
+                if isinstance(trace_context, dict) and trace_context.get(
+                    "owner_user_id"
+                ) != access_context.owner_user_id:
+                    continue
+                if entry.get("memory_item_id"):
+                    recall_trace.append(dict(entry))
+
+        key = (access_context.owner_user_id, access_context.session_id)
+        round_payload = {
+            "conversation": [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_text},
+            ],
+            "recall_trace": recall_trace,
+            "access_context": access_context,
+        }
+        async with self._feedback_lock:
+            buffer = self._feedback_buffers.setdefault(key, [])
+            buffer.append(round_payload)
+            buffered_rounds = len(buffer)
+            self._schedule_feedback_idle_locked(key, config)
+
+        trigger_mode = str(config.get("feedback_trigger_mode", "adaptive"))
+        batch_rounds = max(1, int(config.get("feedback_batch_rounds", 3) or 3))
+        immediate = trigger_mode == "immediate"
+        if trigger_mode == "adaptive":
+            immediate = bool(recall_trace) or bool(
+                self._STRONG_FEEDBACK_SIGNAL.search(user_text)
+            )
+        if immediate or buffered_rounds >= batch_rounds:
+            self._schedule_feedback_flush(key)
+
+    def _schedule_feedback_idle_locked(
+        self, key: tuple[str, str], config: dict[str, Any]
+    ) -> None:
+        previous = self._feedback_idle_tasks.pop(key, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        idle_seconds = max(0.01, float(config.get("feedback_idle_seconds", 300) or 300))
+        task = asyncio.create_task(self._idle_feedback_flush(key, idle_seconds))
+        self._feedback_idle_tasks[key] = task
+        self._feedback_tasks.add(task)
+        task.add_done_callback(self._on_feedback_task_done)
+
+    async def _idle_feedback_flush(
+        self, key: tuple[str, str], idle_seconds: float
+    ) -> None:
+        try:
+            await asyncio.sleep(idle_seconds)
+            self._schedule_feedback_flush(key)
+        finally:
+            current = self._feedback_idle_tasks.get(key)
+            if current is asyncio.current_task():
+                self._feedback_idle_tasks.pop(key, None)
+
+    def _schedule_feedback_flush(
+        self, key: tuple[str, str], *, allow_shutdown: bool = False
+    ) -> None:
+        if (self._shutting_down and not allow_shutdown) or key in self._feedback_inflight:
+            return
+        idle_task = self._feedback_idle_tasks.pop(key, None)
+        if idle_task is not None and not idle_task.done():
+            idle_task.cancel()
+        self._feedback_inflight.add(key)
+        try:
+            task = asyncio.create_task(self._flush_feedback_buffer(key))
+        except Exception:
+            self._feedback_inflight.discard(key)
+            raise
+        self._feedback_tasks.add(task)
+        task.add_done_callback(self._on_feedback_task_done)
+
+    async def _flush_feedback_buffer(self, key: tuple[str, str]) -> None:
+        batch: list[dict[str, Any]] = []
+        try:
+            async with self._feedback_lock:
+                batch = self._feedback_buffers.pop(key, [])
+            if not batch:
+                return
+            conversation: list[dict[str, Any]] = []
+            recall_trace: list[dict[str, Any]] = []
+            trace_seen: set[tuple[str, int]] = set()
+            for round_payload in batch:
+                conversation.extend(round_payload["conversation"])
+                for entry in round_payload["recall_trace"]:
+                    trace_key = (
+                        str(entry.get("memory_item_id") or ""),
+                        int(entry.get("version", 0) or 0),
+                    )
+                    if trace_key[0] and trace_key not in trace_seen:
+                        recall_trace.append(entry)
+                        trace_seen.add(trace_key)
+            access_context = batch[-1]["access_context"]
+            result = await self.memory_processor.evaluate_memory_feedback(
+                conversation=conversation,
+                recall_trace=recall_trace,
+                access_context=access_context,
+                evolving_manager=self.evolving_memory_manager,
+            )
+            self._feedback_status["last_status"] = str(
+                (result or {}).get("status", "completed")
+            )
+            self._feedback_status["completed_batches"] += 1
+        except asyncio.CancelledError:
+            if batch:
+                await self._restore_feedback_batch(key, batch)
+            raise
+        except Exception as exc:
+            if batch:
+                await self._restore_feedback_batch(key, batch)
+            digest = hashlib.sha256(type(exc).__name__.encode("utf-8")).hexdigest()[:16]
+            self._feedback_status["last_status"] = "failed"
+            self._feedback_status["last_error_hash"] = digest
+            self._feedback_status["failed_batches"] += 1
+            logger.warning(
+                "记忆反馈批次失败 owner_hash=%s session_hash=%s error_hash=%s",
+                hashlib.sha256(key[0].encode("utf-8")).hexdigest()[:12],
+                hashlib.sha256(key[1].encode("utf-8")).hexdigest()[:12],
+                digest,
+                exc_info=True,
+            )
+        finally:
+            self._feedback_inflight.discard(key)
+
+    async def _restore_feedback_batch(
+        self, key: tuple[str, str], batch: list[dict[str, Any]]
+    ) -> None:
+        async with self._feedback_lock:
+            current = self._feedback_buffers.get(key, [])
+            self._feedback_buffers[key] = [*batch, *current]
+            if not self._shutting_down:
+                config = getattr(
+                    self.evolving_memory_manager, "evolving_config", {}
+                ) or {}
+                self._schedule_feedback_idle_locked(key, config)
+
+    def _on_feedback_task_done(self, task: asyncio.Task) -> None:
+        self._feedback_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except Exception:
+            pass
+
+    def get_runtime_status(self) -> dict[str, Any]:
+        manager = self.evolving_memory_manager
+        config = getattr(manager, "evolving_config", {}) if manager is not None else {}
+        return {
+            "enabled": bool(
+                manager is not None
+                and config.get("enabled", True)
+                and config.get("feedback_enabled", True)
+            ),
+            "buffered_rounds": sum(len(value) for value in self._feedback_buffers.values()),
+            "buffer_count": len(self._feedback_buffers),
+            "task_count": len(self._feedback_tasks),
+            "inflight_count": len(self._feedback_inflight),
+            **self._feedback_status,
+        }
 
     @classmethod
     def _normalize_group_name(
@@ -348,6 +613,29 @@ class MemoryEvents:
         """关闭事件处理器，等待所有存储任务完成"""
         self._shutting_down = True
         self._memory_reflection.set_shutting_down(True)
+
+        feedback_idle_tasks = getattr(self, "_feedback_idle_tasks", {})
+        for idle_task in list(feedback_idle_tasks.values()):
+            if not idle_task.done():
+                idle_task.cancel()
+        feedback_idle_tasks.clear()
+        for key in list(getattr(self, "_feedback_buffers", {})):
+            self._schedule_feedback_flush(key, allow_shutdown=True)
+        feedback_tasks = set(getattr(self, "_feedback_tasks", set()))
+        if feedback_tasks:
+            done, pending = await asyncio.wait(
+                feedback_tasks,
+                timeout=self.FEEDBACK_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+            if pending:
+                logger.warning(f"{len(pending)} 个记忆反馈任务停止超时，正在取消")
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            if done:
+                await asyncio.gather(*done, return_exceptions=True)
+        getattr(self, "_feedback_tasks", set()).clear()
+        getattr(self, "_feedback_inflight", set()).clear()
 
         group_alias_tasks = set(getattr(self, "_group_alias_tasks", {}).values())
         if group_alias_tasks:

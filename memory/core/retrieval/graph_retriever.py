@@ -9,6 +9,9 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from astrbot.api import logger
+
+from ..models.evolving_memory import MemoryAccessContext
 from ..models.memory_atom import compute_decay_score
 from ..utils.number_utils import clamp_float, safe_float
 from .graph_keyword_retriever import GraphKeywordRetriever
@@ -36,7 +39,7 @@ class GraphRetriever:
     def __init__(
         self,
         keyword_retriever: GraphKeywordRetriever,
-        vector_retriever: GraphVectorRetriever,
+        vector_retriever: GraphVectorRetriever | None,
         rrf_fusion: RRFFusion,
         config: dict[str, Any] | None = None,
     ):
@@ -50,20 +53,53 @@ class GraphRetriever:
         self.score_gamma = float(self.config.get("graph_score_gamma", 0.15))
         self.score_delta = float(self.config.get("graph_score_delta", 0.1))
 
+    async def _search_route(self, route_name: str, coroutine) -> list[Any]:
+        try:
+            return await coroutine
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                f"[GraphRetriever] {route_name}失败，保留其他图检索路",
+                exc_info=True,
+            )
+            return []
+
     async def search(
         self,
         query: str,
         k: int = 10,
         session_id: str | None = None,
         persona_id: str | None = None,
+        access_context: MemoryAccessContext | None = None,
     ) -> list[GraphResult]:
         """Run graph keyword and vector retrieval in parallel."""
         if not query or not query.strip():
             return []
 
+        vector_coroutine = (
+            self.vector_retriever.search(
+                query,
+                k,
+                session_id,
+                persona_id,
+                access_context=access_context,
+            )
+            if self.vector_retriever is not None
+            else asyncio.sleep(0, result=[])
+        )
         keyword_results, vector_results = await asyncio.gather(
-            self.keyword_retriever.search(query, k, session_id, persona_id),
-            self.vector_retriever.search(query, k, session_id, persona_id),
+            self._search_route(
+                "关键词路",
+                self.keyword_retriever.search(
+                    query,
+                    k,
+                    session_id,
+                    persona_id,
+                    access_context=access_context,
+                ),
+            ),
+            self._search_route("向量路", vector_coroutine),
         )
 
         if not keyword_results and not vector_results:

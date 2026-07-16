@@ -16,6 +16,13 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context
 
 from ..processors.text_processor import TextProcessor
+from .access_context import (
+    RECALL_TRACE_EXTRA_KEY,
+    RESPONSE_CONTEXT_EXTRA_KEY,
+    append_recall_trace,
+    build_access_context_from_event,
+    serialize_access_context,
+)
 from .stopwords_manager import StopwordsManager, get_stopwords_manager
 
 
@@ -620,6 +627,11 @@ __all__ = [
     "StopwordsManager",
     "get_stopwords_manager",
     "TextProcessor",
+    "RECALL_TRACE_EXTRA_KEY",
+    "RESPONSE_CONTEXT_EXTRA_KEY",
+    "append_recall_trace",
+    "build_access_context_from_event",
+    "serialize_access_context",
     "safe_parse_metadata",
     "safe_serialize_metadata",
     "validate_timestamp",

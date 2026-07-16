@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import hashlib
 from typing import TYPE_CHECKING
 
 from astrbot.api import logger
@@ -14,6 +15,8 @@ from astrbot.core.agent.message import TextPart
 
 from ..utils import (
     OperationContext,
+    append_recall_trace,
+    build_access_context_from_event,
     format_memories_for_fake_tool_call,
     format_memories_for_injection,
     get_persona_id,
@@ -155,6 +158,18 @@ class MemoryRecall:
 
                 recall_session_id = session_id if use_session_filtering else None
                 recall_persona_id = persona_id if use_persona_filtering else None
+                evolving_manager = getattr(
+                    self.memory_engine, "evolving_memory_manager", None
+                )
+                access_context = await build_access_context_from_event(
+                    event,
+                    evolving_manager,
+                    astrbot_context=self.context,
+                    persona_id=persona_id,
+                )
+                if evolving_manager is not None and access_context is None:
+                    # 身份不完整时禁用对象路，并强制 legacy 维持完整 UMO 隔离。
+                    recall_session_id = session_id
 
                 # 使用原始用户输入作为召回关键字
                 query_for_search = actual_query
@@ -197,6 +212,7 @@ class MemoryRecall:
                     k=self.config_manager.get("recall_engine.top_k", 5),
                     session_id=recall_session_id,
                     persona_id=recall_persona_id,
+                    access_context=access_context,
                 )
 
                 if recalled_memories:
@@ -218,10 +234,15 @@ class MemoryRecall:
 
                     # 输出详细记忆信息
                     for i, mem in enumerate(recalled_memories, 1):
+                        content_hash = hashlib.sha256(
+                            str(mem.content or "").encode("utf-8")
+                        ).hexdigest()[:16]
                         logger.debug(
-                            f"[{session_id}] 记忆 #{i}: 得分={mem.final_score:.3f}, "
-                            f"重要性={mem.metadata.get('importance', 0.5):.2f}, "
-                            f"内容={mem.content[:100]}..."
+                            f"[{session_id}] 记忆 #{i}: "
+                            f"item_id={getattr(mem, 'memory_item_id', None)}, "
+                            f"doc_id={getattr(mem, 'doc_id', None)}, "
+                            f"source_type={getattr(mem, 'source_type', 'legacy_document')}, "
+                            f"score={mem.final_score:.3f}, content_hash={content_hash}"
                         )
 
                     # 根据配置选择注入方式（含 Provider 兼容降级）
@@ -250,14 +271,17 @@ class MemoryRecall:
                         )
 
                     memory_str = format_memories_for_injection(memory_list)
+                    injected = False
 
                     if injection_method == "user_message_before":
                         req.prompt = memory_str + "\n\n" + (req.prompt or "")
+                        injected = bool(memory_str)
                         logger.info(
                             f"[{session_id}] 成功向用户消息前注入 {len(recalled_memories)} 条记忆"
                         )
                     elif injection_method == "user_message_after":
                         req.prompt = (req.prompt or "") + "\n\n" + memory_str
+                        injected = bool(memory_str)
                         logger.info(
                             f"[{session_id}] 成功向用户消息后注入 {len(recalled_memories)} 条记忆"
                         )
@@ -271,6 +295,7 @@ class MemoryRecall:
                         )
                         if fake_messages:
                             req.contexts.extend(fake_messages)
+                            injected = True
                             logger.info(
                                 f"[{session_id}] 成功以伪造工具调用方式注入 "
                                 f"{len(recalled_memories)} 条记忆"
@@ -278,12 +303,22 @@ class MemoryRecall:
                     else:
                         # extra_user_content（推荐）：追加到用户消息末尾，
                         # 不影响前缀缓存且 mark_as_temp 后不污染对话历史
-                        req.extra_user_content_parts.append(
-                            TextPart(text=memory_str).mark_as_temp()
-                        )
+                        if memory_str:
+                            req.extra_user_content_parts.append(
+                                TextPart(text=memory_str).mark_as_temp()
+                            )
+                            injected = True
                         logger.info(
                             f"[{session_id}] 成功向用户消息末尾注入 "
                             f"{len(recalled_memories)} 条记忆"
+                        )
+
+                    if injected:
+                        append_recall_trace(
+                            event,
+                            recalled_memories,
+                            access_context,
+                            recall_source="automatic",
                         )
                 else:
                     logger.info(f"[{session_id}] 未找到相关记忆")

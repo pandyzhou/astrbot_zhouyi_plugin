@@ -15,7 +15,7 @@ class GraphMemoryManager:
     def __init__(
         self,
         graph_store: GraphStore,
-        graph_vector_retriever: GraphVectorRetriever,
+        graph_vector_retriever: GraphVectorRetriever | None,
         graph_extractor: GraphExtractor,
     ):
         self.graph_store = graph_store
@@ -59,6 +59,9 @@ class GraphMemoryManager:
                 "graph entry id count mismatch: "
                 f"ids={len(entry_ids)}, entries={len(extracted.entries)}"
             )
+        if self.graph_vector_retriever is None:
+            return
+
         entry_vector_doc_ids: dict[int, int] = {}
         try:
             for entry_id, entry in zip(entry_ids, extracted.entries, strict=True):
@@ -73,17 +76,19 @@ class GraphMemoryManager:
     async def delete_memory(self, source_memory_id: int) -> None:
         """Delete graph artifacts belonging to one source memory."""
         vector_doc_ids = await self.graph_store.delete_memory(source_memory_id)
-        for vector_doc_id in vector_doc_ids:
-            await self.graph_vector_retriever.delete_entry(vector_doc_id)
+        if self.graph_vector_retriever is not None:
+            for vector_doc_id in vector_doc_ids:
+                await self.graph_vector_retriever.delete_entry(vector_doc_id)
 
     async def batch_delete_memories(self, source_memory_ids: list[int]) -> None:
         """Batch delete graph artifacts for multiple source memories."""
         if not source_memory_ids:
             return
         memory_vec_map = await self.graph_store.batch_delete_memories(source_memory_ids)
-        for vector_doc_ids in memory_vec_map.values():
-            for vector_doc_id in vector_doc_ids:
-                await self.graph_vector_retriever.delete_entry(vector_doc_id)
+        if self.graph_vector_retriever is not None:
+            for vector_doc_ids in memory_vec_map.values():
+                for vector_doc_id in vector_doc_ids:
+                    await self.graph_vector_retriever.delete_entry(vector_doc_id)
 
 
 __all__ = ["GraphMemoryManager"]

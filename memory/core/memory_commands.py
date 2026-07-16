@@ -11,9 +11,16 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult
 
 from .base.config_manager import ConfigManager
+from .event_handler_modules.memory_reflection import (
+    build_summary_identity,
+    get_summary_message_id_range,
+    persist_summary_key_facts,
+    retry_pending_summary_key_facts,
+)
 from .i18n_backend import t, t_list
 from .managers.conversation_manager import ConversationManager
 from .managers.memory_engine import MemoryEngine
+from .utils import append_recall_trace, build_access_context_from_event, get_persona_id
 from .validators.index_validator import IndexValidator
 
 
@@ -143,8 +150,24 @@ class MemoryCommands:
 
         try:
             session_id = event.unified_msg_origin
+            persona_id = await get_persona_id(self.context, event)
+            access_context = await build_access_context_from_event(
+                event,
+                getattr(self.memory_engine, "evolving_memory_manager", None),
+                astrbot_context=self.context,
+                persona_id=persona_id,
+            )
             results = await self.memory_engine.search_memories(
-                query=query.strip(), k=k, session_id=session_id
+                query=query.strip(),
+                k=k,
+                session_id=session_id,
+                access_context=access_context,
+            )
+            append_recall_trace(
+                event,
+                results,
+                access_context,
+                recall_source="command",
             )
 
             if not results:
@@ -341,6 +364,10 @@ class MemoryCommands:
 
         session_id = event.unified_msg_origin
         try:
+            # 手工总结入口也先重放历史双写失败；即使当前没有新消息，
+            # 仍可补齐对象层且不会重复 legacy 文档。
+            await retry_pending_summary_key_facts(self.memory_engine)
+
             # 获取当前消息数和总结进度
             actual_count = await self.conversation_manager.store.get_message_count(
                 session_id
@@ -397,6 +424,12 @@ class MemoryCommands:
             )
             if not is_group_chat and "GroupMessage" in session_id:
                 is_group_chat = True
+            summary_identity = build_summary_identity(
+                event,
+                session_id=session_id,
+                is_group=is_group_chat,
+                history_messages=history_messages,
+            )
 
             if not self._memory_processor:
                 yield event.plain_result(
@@ -421,21 +454,44 @@ class MemoryCommands:
                 persona_id=persona_id,
             )
 
+            message_start_id, message_end_id = get_summary_message_id_range(
+                history_messages
+            )
             metadata["source_window"] = {
                 "session_id": session_id,
                 "start_index": last_summarized_index,
                 "end_index": actual_count,
                 "message_count": actual_count - last_summarized_index,
+                "message_start_id": message_start_id,
+                "message_end_id": message_end_id,
+                "sender_ids": list(
+                    dict.fromkeys(
+                        str(getattr(message, "sender_id", "") or "").strip()
+                        for message in history_messages
+                        if str(getattr(message, "sender_id", "") or "").strip()
+                    )
+                ),
                 "triggered_by": "manual",
+                **(summary_identity or {}),
             }
 
-            await self.memory_engine.add_memory(
+            legacy_document_id = await self.memory_engine.add_memory(
                 content=content,
                 session_id=session_id,
                 persona_id=persona_id,
                 importance=importance,
                 metadata=metadata,
                 atoms=atoms,
+            )
+            feedback_stats = await persist_summary_key_facts(
+                memory_engine=self.memory_engine,
+                identity=summary_identity,
+                history_messages=history_messages,
+                persona_id=persona_id,
+                metadata=metadata,
+                legacy_document_id=legacy_document_id,
+                importance=importance,
+                triggered_by="manual-summary",
             )
 
             await self.conversation_manager.update_session_metadata(
@@ -446,14 +502,28 @@ class MemoryCommands:
             )
 
             topics = ", ".join(metadata.get("topics", [])) or t("common.none")
-            yield event.plain_result(
-                t(
-                    "summarize.success",
-                    importance=importance,
-                    topics=topics,
-                    count=actual_count,
-                )
+            result_message = t(
+                "summarize.success",
+                importance=importance,
+                topics=topics,
+                count=actual_count,
             )
+            if feedback_stats["attempted"]:
+                feedback_key = (
+                    "summarize.evolving_partial"
+                    if feedback_stats["failed"]
+                    or feedback_stats["skipped"]
+                    or feedback_stats["errors"]
+                    else "summarize.evolving_success"
+                )
+                result_message += "\n" + t(
+                    feedback_key,
+                    created=feedback_stats["created"],
+                    deduplicated=feedback_stats["deduplicated"],
+                    failed=feedback_stats["failed"],
+                    skipped=feedback_stats["skipped"],
+                )
+            yield event.plain_result(result_message)
 
         except Exception as e:
             logger.error(f"手动触发记忆总结失败: {e}", exc_info=True)

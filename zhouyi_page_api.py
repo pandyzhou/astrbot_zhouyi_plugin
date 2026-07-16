@@ -37,6 +37,31 @@ MEMORY_ROUTE_DESCRIPTORS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
     ("/backups", "list_backups", ("GET",), "Zhouyi Dashboard memory backups"),
 )
 
+MEMORY_ADMIN_ROUTE_DESCRIPTORS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
+    ("/objects", "list_objects", ("GET",), "Zhouyi Dashboard memory objects"),
+    ("/objects/create", "create_object", ("POST",), "Zhouyi Dashboard memory object create"),
+    ("/objects/detail", "get_object_detail", ("GET",), "Zhouyi Dashboard memory object detail"),
+    ("/objects/update", "update_object", ("POST",), "Zhouyi Dashboard memory object update"),
+    ("/objects/revisions", "list_revisions", ("GET",), "Zhouyi Dashboard memory object revisions"),
+    ("/objects/sources", "list_sources", ("GET",), "Zhouyi Dashboard memory object sources"),
+    ("/objects/merge/preview", "preview_merge", ("POST",), "Zhouyi Dashboard memory merge preview"),
+    ("/objects/merge", "merge_objects", ("POST",), "Zhouyi Dashboard memory object merge"),
+    ("/objects/supersede", "supersede_object", ("POST",), "Zhouyi Dashboard memory object supersede"),
+    ("/objects/archive", "archive_object", ("POST",), "Zhouyi Dashboard memory object archive"),
+    ("/objects/batch", "batch_objects", ("POST",), "Zhouyi Dashboard memory object batch"),
+    ("/conflicts", "list_conflicts", ("GET",), "Zhouyi Dashboard memory conflicts"),
+    ("/conflicts/resolve", "resolve_conflict", ("POST",), "Zhouyi Dashboard memory conflict resolve"),
+    ("/identities", "list_identities", ("GET",), "Zhouyi Dashboard memory identities"),
+    ("/identities/owners/create", "create_owner", ("POST",), "Zhouyi Dashboard memory owner create"),
+    ("/identities/owners/update", "update_owner", ("POST",), "Zhouyi Dashboard memory owner update"),
+    ("/identities/aliases/link", "link_alias", ("POST",), "Zhouyi Dashboard memory alias link"),
+    ("/identities/aliases/move", "move_alias", ("POST",), "Zhouyi Dashboard memory alias move"),
+    ("/identities/owners/merge/preview", "preview_owner_merge", ("POST",), "Zhouyi Dashboard memory owner merge preview"),
+    ("/identities/owners/merge", "merge_owners", ("POST",), "Zhouyi Dashboard memory owner merge"),
+    ("/maintenance/status", "get_maintenance_status", ("GET",), "Zhouyi Dashboard memory maintenance"),
+    ("/maintenance/index/retry", "retry_index", ("POST",), "Zhouyi Dashboard memory index retry"),
+)
+
 
 class ZhouyiDashboardApi:
     """Zhouyi Dashboard 的统一 Page API facade。"""
@@ -61,24 +86,63 @@ class ZhouyiDashboardApi:
                 from .memory.core.page_api_modules import (
                     BackupHandler,
                     GraphHandler,
+                    IdentityHandler,
+                    MaintenanceHandler,
                     MemoryHandler as MemoryPageHandler,
+                    MemoryObjectHandler,
                     PageApiUtils,
                     RecallHandler,
                     StatsHandler,
                 )
 
                 utils = PageApiUtils()
+                legacy_memory_handler = MemoryPageHandler(utils, memory_service)
+                object_handler = MemoryObjectHandler(utils, memory_service)
+                identity_handler = IdentityHandler(utils, memory_service)
+                maintenance_handler = MaintenanceHandler(utils, memory_service)
                 self._memory_components = {
                     "get_stats": StatsHandler(utils, getattr(plugin, "context", None)),
-                    "list_memories": MemoryPageHandler(utils),
-                    "get_memory_detail": MemoryPageHandler(utils),
-                    "update_memory": MemoryPageHandler(utils),
-                    "batch_delete_memories": MemoryPageHandler(utils),
-                    "batch_update_memories": MemoryPageHandler(utils),
+                    "list_memories": legacy_memory_handler,
+                    "get_memory_detail": legacy_memory_handler,
+                    "update_memory": legacy_memory_handler,
+                    "batch_delete_memories": legacy_memory_handler,
+                    "batch_update_memories": legacy_memory_handler,
                     "test_recall": RecallHandler(utils),
                     "get_graph_overview": GraphHandler(utils),
                     "query_graph": GraphHandler(utils),
                     "list_backups": BackupHandler(utils, str(getattr(memory_service, "data_dir", ""))),
+                    **{
+                        handler_name: object_handler
+                        for handler_name in (
+                            "list_objects",
+                            "create_object",
+                            "get_object_detail",
+                            "update_object",
+                            "list_revisions",
+                            "list_sources",
+                            "preview_merge",
+                            "merge_objects",
+                            "supersede_object",
+                            "archive_object",
+                            "batch_objects",
+                            "list_conflicts",
+                            "resolve_conflict",
+                        )
+                    },
+                    **{
+                        handler_name: identity_handler
+                        for handler_name in (
+                            "list_identities",
+                            "create_owner",
+                            "update_owner",
+                            "link_alias",
+                            "move_alias",
+                            "preview_owner_merge",
+                            "merge_owners",
+                        )
+                    },
+                    "get_maintenance_status": maintenance_handler,
+                    "retry_index": maintenance_handler,
                 }
             except Exception:
                 logger.warning("Memory Page handlers 导入失败", exc_info=True)
@@ -113,6 +177,13 @@ class ZhouyiDashboardApi:
             )
             register(f"{MEMORY_V1_PREFIX}{suffix}", handler, list(methods), description)
             register(f"{PAGE_API_PREFIX}{suffix}", handler, list(methods), f"Legacy {description}")
+
+        for suffix, handler_name, methods, description in MEMORY_ADMIN_ROUTE_DESCRIPTORS:
+            handler = self._memory_route_handlers.setdefault(
+                handler_name,
+                self._make_memory_handler(handler_name),
+            )
+            register(f"{MEMORY_V1_PREFIX}{suffix}", handler, list(methods), description)
 
         if self.memory_config_api is not None:
             register(

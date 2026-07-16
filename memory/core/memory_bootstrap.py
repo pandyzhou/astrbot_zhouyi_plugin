@@ -14,21 +14,60 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 from astrbot.api import logger
 from astrbot.api.star import Context
 from astrbot.core.provider.provider import EmbeddingProvider, Provider
 
 from ..storage.conversation_store import ConversationStore
 from ..storage.db_migration import DBMigration
+from ..storage.evolving_memory_store import EvolvingMemoryStore
 from .base.config_manager import ConfigManager
-from .base.exceptions import InitializationError, ProviderNotReadyError
+from .base.exceptions import InitializationError
 from .managers.conversation_manager import ConversationManager
+from .managers.evolving_memory_manager import EvolvingMemoryManager
 from .managers.memory_engine import MemoryEngine
 from .processors.memory_processor import MemoryProcessor
 from .schedulers.decay_scheduler import DecayScheduler
 from .validators.index_validator import IndexValidator
 
 FaissVecDB: Any = None
+
+_EVOLVING_V9_OBJECTS = frozenset(
+    {
+        "migration_status",
+        "memory_owners",
+        "memory_identity_links",
+        "memory_items",
+        "memory_item_revisions",
+        "memory_item_sources",
+        "memory_item_relations",
+        "memory_conflicts",
+        "memory_write_ops",
+        "livingmemory_memory_items_fts",
+    }
+)
+_EVOLVING_V9_REQUIRED_COLUMNS = {
+    "memory_items": frozenset(
+        {
+            "memory_item_id",
+            "owner_user_id",
+            "scope",
+            "canonical_key",
+            "content_hash",
+            "current_revision_no",
+            "version",
+            "index_status",
+        }
+    ),
+    "memory_item_revisions": frozenset(
+        {"memory_item_id", "owner_user_id", "revision_no", "operation", "content"}
+    ),
+    "memory_item_sources": frozenset(
+        {"source_key", "owner_user_id", "memory_item_id", "revision_no"}
+    ),
+    "memory_write_ops": frozenset({"operation_key", "entity_id"}),
+}
 
 # ── Faiss C++ fopen() 在 Windows 上使用 ANSI codepage ──
 # Python 传给 Faiss 的路径是 UTF-8 字节，Windows fopen 期望 ANSI 编码，
@@ -105,6 +144,9 @@ class MemoryBootstrap:
         self.db_migration: DBMigration | None = None
         self.conversation_store: ConversationStore | None = None
         self.conversation_manager: ConversationManager | None = None
+        self.evolving_memory_store: EvolvingMemoryStore | None = None
+        self.evolving_memory_manager: EvolvingMemoryManager | None = None
+        self.evolving_memory_retriever: Any | None = None
         self.index_validator: IndexValidator | None = None
         self.decay_scheduler: DecayScheduler | None = None
 
@@ -117,6 +159,12 @@ class MemoryBootstrap:
         self._provider_check_attempts = 0
         self._max_provider_attempts = 60
         self._retry_task: asyncio.Task | None = None
+        self._backfill_task: asyncio.Task | None = None
+        self._backfill_status: dict[str, Any] = {
+            "status": "idle",
+            "stats": None,
+            "error": None,
+        }
         self._initialized_callback: Callable[[], Awaitable[Any]] | None = None
 
     def set_initialized_callback(
@@ -145,22 +193,19 @@ class MemoryBootstrap:
         logger.info("Memory 插件开始后台初始化...")
 
         try:
-            # 1. 等待 Provider 就绪
-            if not await self._wait_for_providers_non_blocking():
-                missing = []
-                if not self.embedding_provider:
-                    missing.append(
-                        "Embedding Provider（请在 AstrBot 中配置向量嵌入模型）"
-                    )
-                if not self.llm_provider:
-                    missing.append("LLM Provider（请在 AstrBot 中配置语言模型）")
-                logger.warning(
-                    f"以下 Provider 暂时不可用，将在后台继续尝试: {', '.join(missing)}"
-                )
-                self._start_retry_task_if_needed()
-                return False
+            # Provider 只决定增强能力，不再阻塞 SQLite/FTS/会话与管理能力启动。
+            self._initialize_providers(silent=True)
+            self._providers_ready = bool(
+                self.embedding_provider is not None and self.llm_provider is not None
+            )
+            missing = []
+            if self.embedding_provider is None:
+                missing.append("Embedding Provider（BM25-only）")
+            if self.llm_provider is None:
+                missing.append("LLM Provider（自动总结/反馈不可用）")
+            if missing:
+                logger.warning(f"Memory 将以降级模式启动: {', '.join(missing)}")
 
-            # 2. Provider 就绪，继续完整初始化
             await self._complete_initialization()
             return True
 
@@ -468,40 +513,42 @@ class MemoryBootstrap:
             graph_index_path = data_dir_path / "livingmemory_graph.index"
             graph_memory_enabled = self.config_manager.get("graph_memory.enabled", True)
 
-            if not self.embedding_provider:
-                raise ProviderNotReadyError("Embedding Provider 未初始化")
-            if not self.llm_provider or not isinstance(self.llm_provider, Provider):
-                raise ProviderNotReadyError("LLM Provider 未初始化或类型不正确")
-
-            faiss_vec_db_cls = self._load_faiss_vec_db_class()
-
-            # 检查索引文件维度与当前 embedding provider 维度是否一致
-            await self._check_and_fix_dimension_mismatch(str(index_path))
-            if graph_memory_enabled:
-                await self._check_and_fix_dimension_mismatch(str(graph_index_path))
-
-            self.db = faiss_vec_db_cls(
-                str(db_path),
-                str(index_path),
-                self.embedding_provider,
-            )
-            await self.db.initialize()
+            self.db = None
             self.graph_db = None
-            if graph_memory_enabled:
-                self.graph_db = faiss_vec_db_cls(
-                    str(graph_doc_path),
-                    str(graph_index_path),
+            if self.embedding_provider is not None:
+                faiss_vec_db_cls = self._load_faiss_vec_db_class()
+                await self._check_and_fix_dimension_mismatch(str(index_path))
+                if graph_memory_enabled:
+                    await self._check_and_fix_dimension_mismatch(str(graph_index_path))
+
+                self.db = faiss_vec_db_cls(
+                    str(db_path),
+                    str(index_path),
                     self.embedding_provider,
                 )
-                await self.graph_db.initialize()
-            logger.info(f"数据库已初始化。数据目录: {self.data_dir}")
+                await self.db.initialize()
+                if graph_memory_enabled:
+                    self.graph_db = faiss_vec_db_cls(
+                        str(graph_doc_path),
+                        str(graph_index_path),
+                        self.embedding_provider,
+                    )
+                    await self.graph_db.initialize()
+                logger.info(f"向量数据库已初始化。数据目录: {self.data_dir}")
+            else:
+                logger.info("未配置 Embedding Provider，启动 SQLite/BM25-only 模式。")
 
-            # 初始化数据库迁移管理器
+            # 初始化数据库迁移管理器。对象记忆层必须同时满足版本与实际
+            # v9 schema readiness；禁止借助 EvolvingMemoryStore.initialize()
+            # 绕过 auto_migrate 设置执行 DDL。
             self.db_migration = DBMigration(str(db_path))
-
-            # 检查并执行数据库迁移
-            if self.config_manager.get("migration_settings.auto_migrate", True):
-                await self._check_and_migrate_database()
+            auto_migrate = bool(
+                self.config_manager.get("migration_settings.auto_migrate", True)
+            )
+            evolving_schema_state = await self._prepare_evolving_memory_layer(
+                db_path,
+                auto_migrate=auto_migrate,
+            )
 
             # 初始化MemoryEngine
             stopwords_dir = data_dir_path / "stopwords"
@@ -621,8 +668,18 @@ class MemoryBootstrap:
                 graph_vector_db=self.graph_db,
                 llm_provider=self.llm_provider,
                 config=memory_engine_config,
+                evolving_memory_store=self.evolving_memory_store,
+                evolving_memory_manager=self.evolving_memory_manager,
             )
             await self.memory_engine.initialize()
+            if not auto_migrate and not evolving_schema_state["ready"]:
+                await self._remove_spurious_initial_v9_version(
+                    db_path,
+                    evolving_schema_state,
+                )
+            self.evolving_memory_retriever = (
+                self.memory_engine.evolving_memory_retriever
+            )
             logger.info("MemoryEngine 已初始化")
 
             # 初始化 ConversationManager
@@ -657,9 +714,11 @@ class MemoryBootstrap:
             )
             logger.info("MemoryProcessor 已初始化")
 
-            # 初始化索引验证器并自动重建索引
-            self.index_validator = IndexValidator(str(db_path), self.db)
-            await self._auto_rebuild_index_if_needed()
+            # 只有真实向量库存在时才创建索引验证器；BM25-only 不伪造 FAISS。
+            self.index_validator = None
+            if self.db is not None:
+                self.index_validator = IndexValidator(str(db_path), self.db)
+                await self._auto_rebuild_index_if_needed()
 
             # 异步初始化 TextProcessor
             if self.memory_engine and hasattr(self.memory_engine, "text_processor"):
@@ -693,6 +752,8 @@ class MemoryBootstrap:
                 self.decay_scheduler = scheduler
                 logger.info("DecayScheduler 已启动")
 
+            self._start_evolving_backfill_task()
+
             # 标记初始化完成，并通知组合服务创建事件、命令和 Agent 工具。
             self._initialization_complete = True
             await self._notify_initialized()
@@ -705,18 +766,197 @@ class MemoryBootstrap:
             self._initialization_error = str(e)
             raise InitializationError(f"初始化失败: {e}") from e
 
-    async def _check_and_migrate_database(self):
-        """检查并执行数据库迁移"""
+    async def _prepare_evolving_memory_layer(
+        self,
+        db_path: Path,
+        *,
+        auto_migrate: bool,
+    ) -> dict[str, Any]:
+        """显式准备对象记忆 schema；关闭迁移时只读检查，绝不执行 DDL。"""
+        migration_ok = True
+        if auto_migrate:
+            migration_ok = await self._check_and_migrate_database()
+            if migration_ok and self.db_migration is not None:
+                try:
+                    # 新建/空数据库会被旧版本探测视作“最新”，这里在允许迁移时
+                    # 显式补齐 v9，而不是依赖 store.initialize() 隐式建表。
+                    await self.db_migration.ensure_v9_schema()
+                except Exception as exc:
+                    migration_ok = False
+                    logger.error(f"准备 v9 对象记忆结构失败: {exc}", exc_info=True)
+
+        state = await self._check_evolving_schema_readiness(db_path)
+        if (
+            auto_migrate
+            and migration_ok
+            and state["schema_ready"]
+            and (
+                state["db_version"] is None
+                or state["db_version"] < DBMigration.CURRENT_VERSION
+            )
+            and self.db_migration is not None
+        ):
+            # 只有实际结构完整后才写版本，避免 db_version 领先于 schema。
+            await self.db_migration.initialize_version_table()
+            await self.db_migration.set_db_version(
+                DBMigration.CURRENT_VERSION,
+                DBMigration.VERSION_HISTORY.get(DBMigration.CURRENT_VERSION, ""),
+            )
+            state = await self._check_evolving_schema_readiness(db_path)
+
+        self.evolving_memory_store = None
+        self.evolving_memory_manager = None
+        if not state["ready"]:
+            reason = state["reason"]
+            self._backfill_status = {
+                "status": "disabled",
+                "stats": None,
+                "error": reason,
+            }
+            logger.warning(
+                "对象记忆层已安全禁用，legacy/BM25 继续可用: %s%s",
+                reason,
+                "（auto_migrate=false，未执行任何 v9 DDL）"
+                if not auto_migrate
+                else "",
+            )
+            return state
+
+        store = EvolvingMemoryStore(str(db_path))
+        # readiness 已验证；不调用 manager.initialize()，避免 store 再次执行 DDL。
+        store._initialized = True
+        self.evolving_memory_store = store
+        self.evolving_memory_manager = EvolvingMemoryManager(
+            store,
+            identity_resolution=self.config_manager.get("identity_resolution", {}),
+            evolving_memory=self.config_manager.get("evolving_memory", {}),
+        )
+        return state
+
+    async def _check_evolving_schema_readiness(
+        self,
+        db_path: Path,
+    ) -> dict[str, Any]:
+        """只读校验 db_version 与 v9 实际对象、关键列是否同时就绪。"""
+        state: dict[str, Any] = {
+            "ready": False,
+            "schema_ready": False,
+            "db_version": None,
+            "version_row_count": 0,
+            "missing_objects": sorted(_EVOLVING_V9_OBJECTS),
+            "missing_columns": {},
+            "reason": "数据库文件不存在",
+        }
+        if not db_path.exists():
+            return state
+
+        try:
+            async with aiosqlite.connect(str(db_path)) as db:
+                await db.execute("PRAGMA query_only = ON")
+                cursor = await db.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                )
+                objects = {str(row[0]) for row in await cursor.fetchall()}
+                missing_objects = sorted(_EVOLVING_V9_OBJECTS - objects)
+
+                version = None
+                version_row_count = 0
+                if "db_version" in objects:
+                    cursor = await db.execute("SELECT COUNT(*) FROM db_version")
+                    row = await cursor.fetchone()
+                    version_row_count = int(row[0]) if row else 0
+                    cursor = await db.execute(
+                        "SELECT version FROM db_version ORDER BY id DESC LIMIT 1"
+                    )
+                    row = await cursor.fetchone()
+                    if row is not None:
+                        version = int(row[0])
+
+                missing_columns: dict[str, list[str]] = {}
+                for table, required_columns in _EVOLVING_V9_REQUIRED_COLUMNS.items():
+                    if table not in objects:
+                        continue
+                    cursor = await db.execute(f'PRAGMA table_info("{table}")')
+                    columns = {str(row[1]) for row in await cursor.fetchall()}
+                    missing = sorted(required_columns - columns)
+                    if missing:
+                        missing_columns[table] = missing
+        except Exception as exc:
+            state["reason"] = f"schema readiness 检查失败: {exc}"
+            logger.error(state["reason"], exc_info=True)
+            return state
+
+        schema_ready = not missing_objects and not missing_columns
+        version_ready = (
+            version is not None and version >= DBMigration.CURRENT_VERSION
+        )
+        if not schema_ready:
+            details = []
+            if missing_objects:
+                details.append(f"缺少对象: {', '.join(missing_objects)}")
+            if missing_columns:
+                column_details = "; ".join(
+                    f"{table}({', '.join(columns)})"
+                    for table, columns in sorted(missing_columns.items())
+                )
+                details.append(f"缺少列: {column_details}")
+            reason = "；".join(details)
+        elif not version_ready:
+            reason = (
+                f"实际 v9 结构完整，但 db_version={version!r}，"
+                f"未达到 v{DBMigration.CURRENT_VERSION}"
+            )
+        else:
+            reason = "v9 schema 与 db_version 已同步就绪"
+
+        return {
+            "ready": schema_ready and version_ready,
+            "schema_ready": schema_ready,
+            "db_version": version,
+            "version_row_count": version_row_count,
+            "missing_objects": missing_objects,
+            "missing_columns": missing_columns,
+            "reason": reason,
+        }
+
+    async def _remove_spurious_initial_v9_version(
+        self,
+        db_path: Path,
+        schema_state: dict[str, Any],
+    ) -> None:
+        """撤销 legacy 引擎对未迁移数据库自动写入的伪 v9 版本记录。"""
+        if schema_state["schema_ready"] or schema_state["version_row_count"]:
+            return
+        try:
+            async with aiosqlite.connect(str(db_path)) as db:
+                cursor = await db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='db_version'"
+                )
+                if await cursor.fetchone() is None:
+                    return
+                await db.execute(
+                    """
+                    DELETE FROM db_version
+                    WHERE version = ? AND description = '初始版本 - 当前架构'
+                    """,
+                    (DBMigration.CURRENT_VERSION,),
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.error(f"清理未迁移数据库的伪 v9 版本记录失败: {exc}", exc_info=True)
+
+    async def _check_and_migrate_database(self) -> bool:
+        """检查并执行数据库迁移。返回迁移流程是否成功。"""
         try:
             if not self.db_migration:
                 logger.warning("数据库迁移管理器未初始化")
-                return
+                return False
 
             needs_migration = await self.db_migration.needs_migration()
 
             if not needs_migration:
                 logger.info("数据库版本已是最新，无需迁移")
-                return
+                return True
 
             logger.info("检测到旧版本数据库，开始自动迁移。")
 
@@ -730,11 +970,14 @@ class MemoryBootstrap:
             if result.get("success"):
                 logger.info(f"数据库迁移结果: {result.get('message')}")
                 logger.info(f"   耗时: {result.get('duration', 0):.2f}秒")
-            else:
-                logger.error(f"数据库迁移失败: {result.get('message')}")
+                return True
+
+            logger.error(f"数据库迁移失败: {result.get('message')}")
+            return False
 
         except Exception as e:
             logger.error(f"数据库迁移检查失败: {e}", exc_info=True)
+            return False
 
     async def _auto_rebuild_index_if_needed(self):
         """自动检查并重建索引"""
@@ -799,6 +1042,73 @@ class MemoryBootstrap:
 
         except Exception as e:
             logger.error(f"修复 message_count 失败: {e}", exc_info=True)
+
+    def _start_evolving_backfill_task(self) -> None:
+        manager = self.evolving_memory_manager
+        if manager is None or (self._backfill_task and not self._backfill_task.done()):
+            return
+        self._backfill_status = {"status": "running", "stats": None, "error": None}
+        task = asyncio.create_task(manager.backfill_legacy_key_facts())
+        self._backfill_task = task
+        task.add_done_callback(self._on_evolving_backfill_done)
+
+    def _on_evolving_backfill_done(self, task: asyncio.Task) -> None:
+        if self._backfill_task is task:
+            self._backfill_task = None
+        if task.cancelled():
+            self._backfill_status = {
+                "status": "cancelled",
+                "stats": None,
+                "error": None,
+            }
+            return
+        try:
+            stats = task.result()
+        except Exception as exc:
+            self._backfill_status = {
+                "status": "failed",
+                "stats": None,
+                "error": str(exc),
+            }
+            logger.error(f"key_facts 后台回填失败: {exc}", exc_info=True)
+            return
+        self._backfill_status = {
+            "status": "completed",
+            "stats": stats,
+            "error": None,
+        }
+
+    async def _stop_evolving_backfill_task(self) -> None:
+        task = self._backfill_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        self._backfill_task = None
+
+    def get_runtime_status(self) -> dict[str, Any]:
+        if self.memory_engine is not None:
+            runtime = self.memory_engine.get_runtime_status()
+        else:
+            degraded_states = []
+            if self.embedding_provider is None:
+                degraded_states.append("bm25_only")
+            if self.llm_provider is None:
+                degraded_states.append("no_llm")
+            runtime = {
+                "status": "full" if not degraded_states else "degraded",
+                "retrieval_mode": (
+                    "full" if self.embedding_provider is not None else "bm25_only"
+                ),
+                "llm_mode": "full" if self.llm_provider is not None else "no_llm",
+                "degraded_states": degraded_states,
+                "evolving_memory_enabled": self.evolving_memory_manager is not None,
+            }
+        return {**runtime, "key_facts_backfill": dict(self._backfill_status)}
 
     @property
     def is_initialized(self) -> bool:
@@ -940,6 +1250,7 @@ class MemoryBootstrap:
 
     async def cleanup_runtime_resources(self) -> None:
         """按创建顺序的逆序幂等清理全部运行资源并清空属性。"""
+        await self._stop_evolving_backfill_task()
         scheduler = self.decay_scheduler
         conversation_store = self.conversation_store
         if conversation_store is None and self.conversation_manager is not None:
@@ -953,6 +1264,9 @@ class MemoryBootstrap:
         self.memory_processor = None
         self.conversation_manager = None
         self.conversation_store = None
+        self.evolving_memory_retriever = None
+        self.evolving_memory_manager = None
+        self.evolving_memory_store = None
         self.memory_engine = None
         self.db_migration = None
         self.graph_db = None
@@ -990,3 +1304,4 @@ class MemoryBootstrap:
             except asyncio.CancelledError:
                 pass
         self._retry_task = None
+        await self._stop_evolving_backfill_task()

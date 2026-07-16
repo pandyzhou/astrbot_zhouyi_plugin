@@ -6,6 +6,9 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from ..models.evolving_memory import MemoryAccessContext
+from .access_filters import is_metadata_accessible
+
 
 @dataclass(slots=True)
 class GraphVectorResult:
@@ -45,21 +48,23 @@ class GraphVectorRetriever:
         k: int = 10,
         session_id: str | None = None,
         persona_id: str | None = None,
+        access_context: MemoryAccessContext | None = None,
     ) -> list[GraphVectorResult]:
         """Search graph entries through vector similarity."""
         if not query or not query.strip():
             return []
 
         metadata_filters: dict[str, Any] = {}
-        if session_id is not None:
-            metadata_filters["session_id"] = session_id
-        if persona_id is not None:
-            metadata_filters["persona_id"] = persona_id
+        if access_context is None:
+            if session_id is not None:
+                metadata_filters["session_id"] = session_id
+            if persona_id is not None:
+                metadata_filters["persona_id"] = persona_id
 
-        fetch_k = k * 2 if metadata_filters else k
+        fetch_k = max(k * 20, k) if access_context is not None else (k * 2 if metadata_filters else k)
         raw_results = await self.faiss_db.retrieve(
             query=query,
-            k=k,
+            k=fetch_k,
             fetch_k=fetch_k,
             rerank=False,
             metadata_filters=metadata_filters if metadata_filters else None,
@@ -69,6 +74,14 @@ class GraphVectorRetriever:
         for result in raw_results:
             data = result.data
             metadata = self._coerce_metadata(data.get("metadata"))
+            if not is_metadata_accessible(
+                metadata,
+                access_context=access_context,
+                session_id=session_id,
+                persona_id=persona_id,
+                include_item_projection=True,
+            ):
+                continue
             source_memory_id = metadata.get("source_memory_id")
             if source_memory_id is None:
                 continue
@@ -80,6 +93,8 @@ class GraphVectorRetriever:
                     metadata=metadata,
                 )
             )
+            if len(results) >= k:
+                break
         return results
 
     async def _get_uuid_from_id(self, vector_doc_id: int) -> str | None:

@@ -141,7 +141,19 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             plugin = MyPlugin(context, config=None)
             await asyncio.gather(trend_started.wait(), standalone_started.wait())
-            self.assertEqual(len(context.registered_web_apis), 49)
+            registered = [
+                (route, tuple(methods))
+                for route, _, methods, _ in context.registered_web_apis
+            ]
+            self.assertEqual(len(registered), len(set(registered)))
+            self.assertIn(
+                ("/astrbot_zhouyi_plugin/page/bootstrap", ("GET",)),
+                registered,
+            )
+            self.assertIn(
+                ("/astrbot_zhouyi_plugin/page/stats", ("GET",)),
+                registered,
+            )
             trend_task = plugin.runtime.trend_task
             standalone_task = plugin.runtime.standalone_task
             self.assertIsNotNone(trend_task)

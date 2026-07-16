@@ -10,6 +10,8 @@ from quart import request
 
 from astrbot.api import logger
 
+from ..models.evolving_memory import MemoryActorType, MemoryItemStatus
+
 if TYPE_CHECKING:
     from .utils import PageApiUtils
 
@@ -17,7 +19,7 @@ if TYPE_CHECKING:
 class MemoryHandler:
     """记忆管理处理器"""
 
-    def __init__(self, utils: "PageApiUtils"):
+    def __init__(self, utils: "PageApiUtils", memory_service: Any | None = None):
         """
         初始化记忆管理处理器
 
@@ -25,6 +27,7 @@ class MemoryHandler:
             utils: PageApiUtils 工具实例
         """
         self.utils = utils
+        self.memory_service = memory_service
 
     @staticmethod
     def _normalize_importance_update(value: Any, value_scale: str = "auto") -> float:
@@ -209,16 +212,21 @@ class MemoryHandler:
 
         items: list[dict[str, Any]] = []
         for row in rows:
-            items.append(
-                {
-                    "id": row["id"],
-                    "doc_id": row["doc_id"],
-                    "text": row["text"],
-                    "metadata": self.utils.normalize_metadata(row["metadata"]),
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                }
-            )
+            metadata = self.utils.normalize_metadata(row["metadata"])
+            item = {
+                "id": row["id"],
+                "doc_id": row["doc_id"],
+                "text": row["text"],
+                "metadata": metadata,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            evolving_item = await self._object_for_document(int(row["id"]))
+            if evolving_item is not None:
+                stable_fields = self._stable_object_fields(evolving_item)
+                item.update(stable_fields)
+                metadata.update(stable_fields)
+            items.append(item)
 
         return self.utils.ok(
             {
@@ -281,6 +289,11 @@ class MemoryHandler:
             "last_access_time": metadata.get("last_access_time"),
             "update_history": metadata.get("update_history", []),
         }
+        evolving_item = await self._object_for_document(memory_id)
+        if evolving_item is not None:
+            stable_fields = self._stable_object_fields(evolving_item)
+            detail.update(stable_fields)
+            metadata.update(stable_fields)
 
         # 附加相关的图谱子图
         graph_store = self.utils.get_graph_store(memory_engine)
@@ -344,6 +357,17 @@ class MemoryHandler:
             return self.utils.error("记忆不存在")
 
         current_metadata = self.utils.normalize_metadata(memory.get("metadata"))
+        evolving_item = await self._object_for_document(memory_id)
+        if evolving_item is not None:
+            return await self._update_linked_object(
+                evolving_item=evolving_item,
+                memory_id=memory_id,
+                field=field,
+                value=value,
+                value_scale=value_scale,
+                reason=reason,
+                payload=payload,
+            )
 
         # 特殊处理：content 更新需要重新创建记忆
         if field == "content":
@@ -494,8 +518,42 @@ class MemoryHandler:
                 failed_count += 1
                 failed_ids.append(raw_id)
 
-        if valid_ids:
-            deleted_count = await memory_engine.batch_delete_memories(valid_ids)
+        unlinked_ids: list[int] = []
+        linked_items: list[tuple[int, Any]] = []
+        for memory_id in valid_ids:
+            evolving_item = await self._object_for_document(memory_id)
+            if evolving_item is None:
+                unlinked_ids.append(memory_id)
+            else:
+                linked_items.append((memory_id, evolving_item))
+
+        if unlinked_ids:
+            deleted_count = await memory_engine.batch_delete_memories(unlinked_ids)
+
+        if linked_items:
+            expected_versions = payload.get("expected_versions")
+            expected_versions = expected_versions if isinstance(expected_versions, dict) else {}
+            requested_owner = self.utils.optional_text(payload.get("owner_user_id"))
+            for memory_id, evolving_item in linked_items:
+                if requested_owner != evolving_item.owner_user_id:
+                    failed_count += 1
+                    failed_ids.append(memory_id)
+                    continue
+                expected = expected_versions.get(evolving_item.memory_item_id)
+                if expected is None:
+                    expected = expected_versions.get(str(memory_id))
+                try:
+                    expected_version = int(expected)
+                except (TypeError, ValueError):
+                    failed_count += 1
+                    failed_ids.append(memory_id)
+                    continue
+                try:
+                    await self._archive_linked_object(evolving_item, expected_version)
+                    deleted_count += 1
+                except Exception:
+                    failed_count += 1
+                    failed_ids.append(memory_id)
 
         return self.utils.ok(
             {
@@ -539,12 +597,43 @@ class MemoryHandler:
 
         updated_count = 0
         failed_ids: list[Any] = []
+        expected_versions = payload.get("expected_versions")
+        expected_versions = expected_versions if isinstance(expected_versions, dict) else {}
+        requested_owner = self.utils.optional_text(payload.get("owner_user_id"))
+        reason = str(payload.get("reason", "")).strip()
 
         for raw_id in memory_ids:
             try:
                 memory_id = int(raw_id)
             except (TypeError, ValueError):
                 failed_ids.append(raw_id)
+                continue
+
+            evolving_item = await self._object_for_document(memory_id)
+            if evolving_item is not None:
+                expected = expected_versions.get(evolving_item.memory_item_id)
+                if expected is None:
+                    expected = expected_versions.get(str(memory_id))
+                try:
+                    expected_version = int(expected)
+                    result = await self._update_linked_object(
+                        evolving_item=evolving_item,
+                        memory_id=memory_id,
+                        field=field,
+                        value=value,
+                        value_scale=value_scale,
+                        reason=reason,
+                        payload={
+                            "owner_user_id": requested_owner,
+                            "expected_version": expected_version,
+                        },
+                    )
+                    if result.get("status") == "ok":
+                        updated_count += 1
+                    else:
+                        failed_ids.append(raw_id)
+                except Exception:
+                    failed_ids.append(raw_id)
                 continue
 
             try:
@@ -584,6 +673,156 @@ class MemoryHandler:
                 "failed_count": len(failed_ids),
                 "total": len(memory_ids),
                 "failed_ids": failed_ids,
+            }
+        )
+
+    def _evolving_components(self):
+        try:
+            return self.utils.resolve_evolving_components(self.memory_service)
+        except Exception:
+            return None
+
+    async def _object_for_document(self, memory_id: int):
+        components = self._evolving_components()
+        if components is None:
+            return None
+        _manager, store = components
+        try:
+            return await store.get_item_by_document_id(current_document_id=memory_id)
+        except Exception:
+            logger.warning(
+                f"[PageAPI] 读取 document 关联对象失败 (memory_id={memory_id})",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _stable_object_fields(item: Any) -> dict[str, Any]:
+        return {
+            "memory_item_id": item.memory_item_id,
+            "owner_user_id": item.owner_user_id,
+            "item_type": item.item_type,
+            "memory_type": item.item_type,
+            "object_status": item.status.value,
+            "current_revision_no": item.current_revision_no,
+            "version": item.version,
+            "scope": item.scope.value,
+            "current_document_id": item.current_document_id,
+            "index_status": (
+                "synced" if item.index_status.value == "current" else item.index_status.value
+            ),
+        }
+
+    async def _archive_linked_object(self, evolving_item: Any, expected_version: int):
+        components = self._evolving_components()
+        if components is None:
+            raise RuntimeError("可演化记忆管理器尚未初始化")
+        manager, _store = components
+        actor = self.utils.require_actor_username()
+        context = await manager.build_admin_access_context(
+            owner_user_id=evolving_item.owner_user_id,
+            session_id=evolving_item.session_id,
+            persona_id=evolving_item.persona_id,
+        )
+        return await manager.archive(
+            context=context,
+            memory_item_id=evolving_item.memory_item_id,
+            expected_version=expected_version,
+            operation_key=self.utils.operation_key("legacy-archive", actor),
+            actor_type=MemoryActorType.ADMIN,
+            actor_id=actor,
+            reason="legacy document API archive",
+        )
+
+    async def _update_linked_object(
+        self,
+        *,
+        evolving_item: Any,
+        memory_id: int,
+        field: str,
+        value: Any,
+        value_scale: str,
+        reason: str,
+        payload: dict[str, Any],
+    ):
+        components = self._evolving_components()
+        if components is None:
+            return self.utils.error("可演化记忆管理器尚未初始化")
+        manager, _store = components
+        owner_user_id = self.utils.optional_text(payload.get("owner_user_id"))
+        if owner_user_id != evolving_item.owner_user_id:
+            return self.utils.problem(
+                "关联对象更新必须显式提供正确的 owner_user_id",
+                status=400,
+                code="MEMORY_INVALID_REQUEST",
+            )
+        try:
+            expected_version = int(payload.get("expected_version"))
+        except (TypeError, ValueError):
+            return self.utils.problem(
+                "关联对象更新必须提供 expected_version",
+                status=400,
+                code="MEMORY_INVALID_REQUEST",
+            )
+        actor = self.utils.require_actor_username()
+        context = await manager.build_admin_access_context(
+            owner_user_id=evolving_item.owner_user_id,
+            session_id=evolving_item.session_id,
+            persona_id=evolving_item.persona_id,
+        )
+        try:
+            if field == "status" and str(value).strip() in {"archived", "deleted"}:
+                result = await manager.archive(
+                    context=context,
+                    memory_item_id=evolving_item.memory_item_id,
+                    expected_version=expected_version,
+                    operation_key=self.utils.operation_key("legacy-archive", actor),
+                    actor_type=MemoryActorType.ADMIN,
+                    actor_id=actor,
+                    reason=reason or "legacy document API archive",
+                )
+            else:
+                update_kwargs: dict[str, Any] = {}
+                if field == "content":
+                    content = str(value).strip()
+                    if not content:
+                        return self.utils.error("记忆内容不能为空")
+                    update_kwargs["content"] = content
+                elif field == "importance":
+                    update_kwargs["importance"] = self._normalize_importance_update(
+                        value,
+                        value_scale,
+                    )
+                elif field == "type":
+                    item_type = str(value).strip()
+                    if not item_type:
+                        return self.utils.error("类型不能为空")
+                    update_kwargs["item_type"] = item_type
+                elif field == "status":
+                    status_value = str(value).strip()
+                    if status_value != "active":
+                        return self.utils.error("对象状态必须是 active、archived 或 deleted")
+                    update_kwargs["status"] = MemoryItemStatus.ACTIVE
+                else:
+                    return self.utils.error(f"不支持编辑字段: {field}")
+                result = await manager.admin_update(
+                    context=context,
+                    target_context=context,
+                    memory_item_id=evolving_item.memory_item_id,
+                    expected_version=expected_version,
+                    operation_key=self.utils.operation_key("legacy-update", actor),
+                    actor_id=actor,
+                    reason=reason or "legacy document API update",
+                    **update_kwargs,
+                )
+        except Exception as exc:
+            return self.utils.problem_from_exception(exc)
+        return self.utils.ok(
+            {
+                "message": f"记忆对象 {result.item.memory_item_id} 已生成新 revision",
+                "memory_id": memory_id,
+                "field": field,
+                **self._stable_object_fields(result.item),
             }
         )
 

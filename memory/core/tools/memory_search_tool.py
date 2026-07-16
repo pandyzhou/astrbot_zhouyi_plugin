@@ -13,7 +13,11 @@ from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
 from ..base.config_manager import ConfigManager
-from ..utils import get_persona_id
+from ..utils import (
+    append_recall_trace,
+    build_access_context_from_event,
+    get_persona_id,
+)
 
 
 def _json_result(data: dict[str, Any]) -> str:
@@ -30,6 +34,7 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
     context: Any = None
     config_manager: ConfigManager | None = None
     memory_engine: Any = None
+    evolving_memory_manager: Any = None
 
     name: str = "recall_long_term_memory"
     description: str = (
@@ -105,6 +110,22 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
 
             recall_session_id = session_id if use_session_filtering else None
             recall_persona_id = persona_id if use_persona_filtering else None
+            evolving_manager = self.evolving_memory_manager or getattr(
+                self.memory_engine, "evolving_memory_manager", None
+            )
+            access_context = await build_access_context_from_event(
+                event,
+                evolving_manager,
+                astrbot_context=self.context,
+                persona_id=(
+                    persona_id
+                    if use_persona_filtering
+                    else await get_persona_id(self.context, event)
+                ),
+            )
+            if evolving_manager is not None and access_context is None:
+                # 身份不完整时禁用对象路，并强制 legacy 维持完整 UMO 隔离。
+                recall_session_id = session_id
 
             default_k = int(self.config_manager.get("recall_engine.top_k", 5))
             max_k = int(self.config_manager.get("recall_engine.max_k", 10))
@@ -121,6 +142,7 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
                 k=limited_k,
                 session_id=recall_session_id,
                 persona_id=recall_persona_id,
+                access_context=access_context,
             )
 
             serialized_results = []
@@ -136,8 +158,18 @@ class MemorySearchTool(FunctionTool[AstrAgentContext]):
                         "persona_id": metadata.get("persona_id"),
                         "create_time": metadata.get("create_time"),
                         "last_access_time": metadata.get("last_access_time"),
+                        "memory_item_id": getattr(memory, "memory_item_id", None),
+                        "version": getattr(memory, "version", None),
+                        "source_type": getattr(memory, "source_type", "legacy_document"),
                     }
                 )
+
+            append_recall_trace(
+                event,
+                memories,
+                access_context,
+                recall_source="agent_tool",
+            )
 
             return _json_result(
                 {

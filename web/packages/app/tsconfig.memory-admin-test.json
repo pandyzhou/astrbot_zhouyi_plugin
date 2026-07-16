@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "ignoreDeprecations": "6.0",
+    "noEmit": false,
+    "outDir": "../../../temp/memory-admin-tests",
+    "rootDir": "src",
+    "types": ["node"]
+  },
+  "include": [
+    "src/api/types.ts",
+    "src/api/memoryAdminContract.ts",
+    "src/api/mockClient.ts",
+    "src/api/memoryAdminContract.test.ts",
+    "src/features/memory/types.ts",
+    "src/features/memory/memoryAdminState.ts",
+    "src/features/memory/memoryAdminState.test.ts",
+    "src/store/queryCacheCore.ts",
+    "src/store/queryKeys.ts"
+  ]
+}

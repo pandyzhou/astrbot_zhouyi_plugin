@@ -1,3 +1,51 @@
+import type {
+  MemoryConflict,
+  MemoryIdentitiesData,
+  MemoryIdentityAlias,
+  MemoryIndexRetryInput,
+  MemoryIndexStatus,
+  MemoryMaintenanceStatusData,
+  MemoryMergeInput,
+  MemoryMergePreviewData,
+  MemoryMergePreviewInput,
+  MemoryObject,
+  MemoryObjectDetailData,
+  MemoryObjectFilters,
+  MemoryObjectMutationInput,
+  MemoryObjectsData,
+  MemoryObjectScope,
+  MemoryObjectStatus,
+  MemoryObjectUpdateInput,
+  MemoryOwner,
+  MemoryRelation,
+  MemoryRevision,
+  MemorySourceMessage,
+} from '../../api/types';
+
+export type {
+  MemoryConflict,
+  MemoryIdentitiesData,
+  MemoryIdentityAlias,
+  MemoryIndexRetryInput,
+  MemoryIndexStatus,
+  MemoryMaintenanceStatusData,
+  MemoryMergeInput,
+  MemoryMergePreviewData,
+  MemoryMergePreviewInput,
+  MemoryObject,
+  MemoryObjectDetailData,
+  MemoryObjectFilters,
+  MemoryObjectMutationInput,
+  MemoryObjectsData,
+  MemoryObjectScope,
+  MemoryObjectStatus,
+  MemoryObjectUpdateInput,
+  MemoryOwner,
+  MemoryRelation,
+  MemoryRevision,
+  MemorySourceMessage,
+};
+
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 export interface MemoryUpdateHistoryItem {

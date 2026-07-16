@@ -16,15 +16,23 @@ import aiosqlite
 from astrbot.api import logger
 
 from ...storage.atom_store import AtomStore
+from ...storage.evolving_memory_store import EvolvingMemoryStore
 from ...storage.graph_store import GraphStore
 from ..managers.atom_lifecycle_manager import AtomLifecycleManager
+from ..managers.evolving_memory_manager import EvolvingMemoryManager
 from ..managers.graph_memory_manager import GraphMemoryManager
+from ..models.evolving_memory import (
+    MemoryAccessContext,
+    MemoryItemStatus,
+    MutationResult,
+)
 from ..models.memory_atom import AtomStatus, AtomType, DecayType, MemoryAtom
 from ..processors.graph_extractor import GraphExtractor
 from ..processors.text_processor import TextProcessor
 from ..retrieval.atom_retriever import AtomRetriever
 from ..retrieval.bm25_retriever import BM25Retriever
 from ..retrieval.dual_route_retriever import DualRouteRetriever
+from ..retrieval.evolving_memory_retriever import EvolvingMemoryRetriever
 from ..retrieval.graph_keyword_retriever import GraphKeywordRetriever
 from ..retrieval.graph_retriever import GraphRetriever
 from ..retrieval.graph_vector_retriever import GraphVectorRetriever
@@ -84,6 +92,8 @@ class MemoryEngine:
         graph_vector_db=None,
         llm_provider=None,
         config: dict[str, Any] | None = None,
+        evolving_memory_store: EvolvingMemoryStore | None = None,
+        evolving_memory_manager: EvolvingMemoryManager | None = None,
     ):
         """
         初始化记忆引擎
@@ -106,6 +116,10 @@ class MemoryEngine:
         self.graph_vector_db = graph_vector_db
         self.llm_provider = llm_provider
         self.config = config or {}
+        self.evolving_memory_store = evolving_memory_store
+        self.evolving_memory_manager = evolving_memory_manager
+        self.evolving_memory_retriever: EvolvingMemoryRetriever | None = None
+        self._evolving_generation = 0
         self.graph_enabled = bool(self.config.get("graph_memory_enabled", False))
         self.atom_enabled = bool(
             self.config.get(
@@ -180,15 +194,31 @@ class MemoryEngine:
         )
         await self.bm25_retriever.initialize()
 
-        # 6. 初始化向量检索器
-        self.vector_retriever = VectorRetriever(self.faiss_db, self.config)
+        # 6. 向量路是可选能力；没有 Embedding 时保持纯 SQLite/BM25。
+        self.vector_retriever = (
+            VectorRetriever(self.faiss_db, self.config)
+            if self.faiss_db is not None
+            else None
+        )
 
-        # 7. 初始化混合检索器
+        # 7. 初始化文档混合检索器（支持 BM25-only）。
         self.hybrid_retriever = HybridRetriever(
             self.bm25_retriever, self.vector_retriever, self.rrf_fusion, self.config
         )
 
-        if self.graph_enabled and self.graph_vector_db is not None:
+        if self.evolving_memory_store is not None:
+            self.evolving_memory_retriever = EvolvingMemoryRetriever(
+                self.evolving_memory_store,
+                self.text_processor,
+                self.vector_retriever,
+                self.config,
+            )
+        if self.evolving_memory_manager is not None:
+            self.evolving_memory_manager.projection_callback = (
+                self.project_evolving_memory_mutation
+            )
+
+        if self.graph_enabled:
             self.graph_store = GraphStore(self.db_path)
             await self.graph_store.initialize()
 
@@ -208,9 +238,10 @@ class MemoryEngine:
                 self.text_processor,
                 self.config,
             )
-            self.graph_vector_retriever = GraphVectorRetriever(
-                self.graph_vector_db,
-                self.config,
+            self.graph_vector_retriever = (
+                GraphVectorRetriever(self.graph_vector_db, self.config)
+                if self.graph_vector_db is not None
+                else None
             )
             self.graph_retriever = GraphRetriever(
                 self.graph_keyword_retriever,
@@ -382,9 +413,23 @@ class MemoryEngine:
         k: int,
         session_id: str | None,
         persona_id: str | None,
+        access_context: MemoryAccessContext | None = None,
+        object_generation: tuple[int, int, str] | None = None,
     ) -> tuple[Any, ...]:
+        access_policy = (
+            access_context.owner_user_id,
+            tuple(sorted(scope.value for scope in access_context.allowed_scopes)),
+            access_context.persona_id or "",
+            access_context.session_id,
+            bool(access_context.is_group),
+            bool(access_context.allow_public),
+            bool(access_context.allow_legacy_session),
+        ) if access_context is not None else ("legacy",)
         return (
             self._search_cache_generation,
+            self._evolving_generation,
+            object_generation or (0, 0, ""),
+            access_policy,
             self._normalize_cache_query(query),
             int(k),
             session_id or "",
@@ -468,6 +513,8 @@ class MemoryEngine:
             "session_id": getattr(atom, "session_id", None),
             "persona_id": getattr(atom, "persona_id", None),
             "metadata": dict(getattr(atom, "metadata", {}) or {}),
+            "memory_item_id": getattr(atom, "memory_item_id", None),
+            "memory_revision_no": getattr(atom, "memory_revision_no", None),
         }
 
     def _deserialize_atom_from_repair(
@@ -518,6 +565,12 @@ class MemoryEngine:
             session_id=payload.get("session_id") or session_id,
             persona_id=payload.get("persona_id") or persona_id,
             metadata=dict(payload.get("metadata") or {}),
+            memory_item_id=payload.get("memory_item_id"),
+            memory_revision_no=(
+                int(payload["memory_revision_no"])
+                if payload.get("memory_revision_no") is not None
+                else None
+            ),
         )
 
     async def _repair_incomplete_write_ops(self) -> int:
@@ -765,7 +818,7 @@ class MemoryEngine:
         uuid_rows = await cursor.fetchall()
         for row in uuid_rows:
             uuid_doc_id = row["doc_id"]
-            if not uuid_doc_id:
+            if not uuid_doc_id or self.faiss_db is None:
                 continue
             try:
                 await self.faiss_db.delete(uuid_doc_id)
@@ -963,6 +1016,280 @@ class MemoryEngine:
             await self.db_connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
             logger.warning(f"已清理旧 Memory FTS 触发器: {trigger_name}")
 
+    async def _count_documents(
+        self, metadata_filters: dict[str, Any] | None = None
+    ) -> int:
+        filters = metadata_filters or {}
+        if self.faiss_db is not None:
+            return await self.faiss_db.document_storage.count_documents(
+                metadata_filters=filters
+            )
+        if self.db_connection is None:
+            return 0
+        cursor = await self.db_connection.execute("SELECT metadata FROM documents")
+        rows = await cursor.fetchall()
+        return sum(
+            1
+            for row in rows
+            if all(
+                self._safe_json_dict(row[0]).get(key) == value
+                for key, value in filters.items()
+            )
+        )
+
+    async def _get_documents(
+        self,
+        *,
+        metadata_filters: dict[str, Any] | None = None,
+        ids: list[int] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        filters = metadata_filters or {}
+        if self.faiss_db is not None:
+            return await self.faiss_db.document_storage.get_documents(
+                metadata_filters=filters,
+                ids=ids,
+                limit=limit,
+                offset=offset,
+            )
+        if self.db_connection is None:
+            return []
+        params: list[Any] = []
+        conditions: list[str] = []
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            conditions.append(f"id IN ({placeholders})")
+            params.extend(int(item) for item in ids)
+        for key, value in filters.items():
+            conditions.append("json_extract(metadata, ?) = ?")
+            params.extend((f"$.{key}", value))
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.extend((max(1, int(limit)), max(0, int(offset))))
+        cursor = await self.db_connection.execute(
+            f"""
+            SELECT id, doc_id, text, metadata, created_at, updated_at
+            FROM documents
+            {where}
+            ORDER BY id ASC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        )
+        rows = await cursor.fetchall()
+        documents: list[dict[str, Any]] = []
+        for row in rows:
+            metadata = self._safe_json_dict(row["metadata"])
+            if any(metadata.get(key) != value for key, value in filters.items()):
+                continue
+            documents.append(
+                {
+                    "id": int(row["id"]),
+                    "doc_id": row["doc_id"],
+                    "text": row["text"],
+                    "metadata": metadata,
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return documents
+
+    async def _projection_write_status(self, memory_id: int) -> str | None:
+        if self.db_connection is None:
+            return None
+        cursor = await self.db_connection.execute(
+            """
+            SELECT status
+            FROM memory_write_ops
+            WHERE op_type = 'add' AND memory_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (memory_id,),
+        )
+        row = await cursor.fetchone()
+        return str(row[0]) if row else None
+
+    async def _mark_projection_stale(self, document_id: int) -> None:
+        memory = await self.get_memory(document_id)
+        if memory is None:
+            return
+        metadata = self._safe_json_dict(memory.get("metadata"))
+        if metadata.get("archive_type") != "memory_item_projection":
+            return
+        if self.hybrid_retriever is None or self.bm25_retriever is None:
+            raise RuntimeError("文档检索器未初始化")
+
+        updated = await self.hybrid_retriever.update_metadata(
+            document_id,
+            {"projection_status": "stale", "protected": False},
+        )
+        if not updated:
+            raise RuntimeError(f"旧对象投影元数据更新失败: {document_id}")
+        if not await self.bm25_retriever.delete_document(document_id):
+            raise RuntimeError(f"旧对象投影 FTS 移除失败: {document_id}")
+
+        if self.graph_store is not None:
+            vector_doc_ids = await self.graph_store.mark_memory_projection_status(
+                document_id, "stale"
+            )
+            if self.graph_vector_retriever is not None:
+                for vector_doc_id in vector_doc_ids:
+                    updated = await self.graph_vector_retriever.update_metadata(
+                        vector_doc_id, {"projection_status": "stale"}
+                    )
+                    if not updated:
+                        raise RuntimeError(
+                            f"旧对象图向量投影更新失败: {vector_doc_id}"
+                        )
+        if self.atom_store is not None:
+            await self.atom_store.mark_projection_stale_by_parent(document_id)
+
+    async def project_evolving_memory_mutation(
+        self, result: MutationResult
+    ) -> dict[str, int]:
+        """Create document/vector/graph/atom projections for one canonical revision."""
+        item = result.item
+        if (
+            result.deduplicated
+            and item.index_status.value == "current"
+            and item.current_document_id is not None
+        ):
+            return {"current_document_id": int(item.current_document_id)}
+
+        old_projection_ids: set[int] = set()
+        if self.evolving_memory_store is not None:
+            for item_id in result.affected_item_ids:
+                affected = await self.evolving_memory_store.get_item(
+                    owner_user_id=item.owner_user_id,
+                    memory_item_id=item_id,
+                )
+                if affected is not None and affected.current_document_id is not None:
+                    old_projection_ids.add(int(affected.current_document_id))
+        if item.current_document_id is not None:
+            old_projection_ids.add(int(item.current_document_id))
+
+        metadata = {
+            "archive_type": "memory_item_projection",
+            "protected": True,
+            "projection_status": "current",
+            "memory_item_id": item.memory_item_id,
+            "memory_revision_no": item.current_revision_no,
+            "owner_user_id": item.owner_user_id,
+            "scope": item.scope.value,
+            "session_id": item.session_id,
+            "persona_id": item.persona_id,
+            "group_safe": item.group_safe,
+            "item_status": item.status.value,
+            "item_type": item.item_type,
+            "importance": item.importance,
+            "confidence": item.confidence,
+            "version": item.version,
+            "canonical_summary": item.content,
+            "key_facts": [item.content],
+        }
+        atom = MemoryAtom(
+            parent_memory_id=0,
+            atom_type=AtomType.FACTUAL,
+            content=item.content,
+            importance=float(item.importance),
+            confidence=float(item.confidence),
+            session_id=item.session_id,
+            persona_id=item.persona_id,
+            metadata=dict(metadata),
+            memory_item_id=item.memory_item_id,
+            memory_revision_no=item.current_revision_no,
+        )
+
+        new_document_id: int | None = None
+        try:
+            new_document_id = await self.add_memory(
+                item.content,
+                session_id=item.session_id,
+                persona_id=item.persona_id,
+                importance=float(item.importance),
+                metadata=metadata,
+                atoms=[atom],
+            )
+            write_status = await self._projection_write_status(new_document_id)
+            if write_status == "needs_repair":
+                raise RuntimeError("对象投影的图或原子索引未完整写入")
+
+            for document_id in sorted(old_projection_ids):
+                if document_id != new_document_id:
+                    await self._mark_projection_stale(document_id)
+
+            if item.status not in {
+                MemoryItemStatus.ACTIVE,
+                MemoryItemStatus.CONFLICTED,
+            } and self.atom_store is not None:
+                await self.atom_store.mark_projection_stale_by_parent(new_document_id)
+            return {"current_document_id": new_document_id}
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if new_document_id is not None:
+                try:
+                    await self._mark_projection_stale(new_document_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "[MemoryEngine] 失败的新对象投影无法完整标 stale",
+                        exc_info=True,
+                    )
+            raise
+        finally:
+            self._evolving_generation += 1
+            self._invalidate_search_cache()
+
+    async def _safe_retrieval_route(self, route_name: str, coroutine):
+        try:
+            return await coroutine
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                f"[MemoryEngine] {route_name}失败，保留其他召回路",
+                exc_info=True,
+            )
+            return []
+
+    @staticmethod
+    def _merge_evolving_results(
+        item_results: list[HybridResult],
+        legacy_results: list[HybridResult],
+        k: int,
+    ) -> list[HybridResult]:
+        item_by_id = {
+            result.memory_item_id: result
+            for result in item_results
+            if result.memory_item_id
+        }
+        item_projection_ids = {
+            result.doc_id for result in item_results if result.doc_id > 0
+        }
+        merged = list(item_results)
+        for result in legacy_results:
+            metadata = result.metadata if isinstance(result.metadata, dict) else {}
+            memory_item_id = result.memory_item_id or metadata.get("memory_item_id")
+            if memory_item_id and memory_item_id in item_by_id:
+                item_result = item_by_id[memory_item_id]
+                item_result.final_score = min(
+                    1.0, max(item_result.final_score, result.final_score) + 0.05
+                )
+                breakdown = item_result.score_breakdown or {}
+                breakdown["projection_route_score"] = round(result.final_score, 4)
+                item_result.score_breakdown = breakdown
+                continue
+            if result.doc_id in item_projection_ids:
+                continue
+            if memory_item_id:
+                result.memory_item_id = str(memory_item_id)
+            merged.append(result)
+        merged.sort(key=lambda value: value.final_score, reverse=True)
+        return merged[:k]
+
     # ==================== 核心记忆操作 ====================
 
     async def add_memory(
@@ -1150,58 +1477,89 @@ class MemoryEngine:
         k: int = 5,
         session_id: str | None = None,
         persona_id: str | None = None,
+        access_context: MemoryAccessContext | None = None,
     ) -> list[HybridResult]:
-        """
-        检索相关记忆
-
-        Args:
-            query: 查询字符串
-            k: 返回数量
-            session_id: 会话ID过滤(可选,应传入unified_msg_origin完整格式)
-            persona_id: 人格ID过滤(可选)
-
-        Returns:
-            List[HybridResult]: 检索结果列表
-        """
+        """Search item, legacy document and graph routes with per-route isolation."""
         if not query or not query.strip():
             return []
 
-        cache_key = self._search_cache_key(query, k, session_id, persona_id)
+        effective_session_id = session_id or (
+            access_context.session_id if access_context is not None else None
+        )
+        effective_persona_id = persona_id or (
+            access_context.persona_id if access_context is not None else None
+        )
+        object_generation = None
+        if access_context is not None and self.evolving_memory_store is not None:
+            object_generation = await self.evolving_memory_store.get_generation_token(
+                access_context.owner_user_id
+            )
+        cache_key = self._search_cache_key(
+            query,
+            k,
+            effective_session_id,
+            effective_persona_id,
+            access_context,
+            object_generation,
+        )
         cached_results = self._get_cached_search_results(cache_key)
         if cached_results is not None:
             for result in cached_results:
+                if result.source_type.startswith("legacy") and result.doc_id > 0:
+                    self._create_tracked_task(
+                        self._update_access_time_internal(result.doc_id)
+                    )
+            return cached_results
+
+        if effective_session_id and ":" in effective_session_id:
+            self._create_tracked_task(
+                self._migrate_session_data_if_needed(effective_session_id)
+            )
+
+        if self.hybrid_retriever is None:
+            raise RuntimeError("混合检索器未初始化")
+        legacy_coroutine = (
+            self.dual_route_retriever.search(
+                query,
+                max(k * 2, k),
+                effective_session_id,
+                effective_persona_id,
+                access_context=access_context,
+            )
+            if self.dual_route_retriever is not None
+            else self.hybrid_retriever.search(
+                query,
+                max(k * 2, k),
+                effective_session_id,
+                effective_persona_id,
+                access_context=access_context,
+            )
+        )
+        item_enabled = bool(
+            access_context is not None
+            and self.evolving_memory_retriever is not None
+            and self.evolving_memory_manager is not None
+            and self.evolving_memory_manager.evolving_config.get("enabled", True)
+            and self.evolving_memory_manager.evolving_config.get("read_enabled", True)
+        )
+        item_coroutine = (
+            self.evolving_memory_retriever.search(
+                query, max(k * 2, k), access_context
+            )
+            if item_enabled
+            else asyncio.sleep(0, result=[])
+        )
+        item_results, legacy_results = await asyncio.gather(
+            self._safe_retrieval_route("对象路", item_coroutine),
+            self._safe_retrieval_route("文档/图路", legacy_coroutine),
+        )
+        results = self._merge_evolving_results(item_results, legacy_results, k)
+
+        for result in results:
+            if result.source_type.startswith("legacy") and result.doc_id > 0:
                 self._create_tracked_task(
                     self._update_access_time_internal(result.doc_id)
                 )
-            return cached_results
-
-        # 如果session_id是unified_msg_origin格式，自动触发旧数据迁移
-        if session_id and ":" in session_id:
-            # 异步触发迁移，不阻塞查询
-            self._create_tracked_task(self._migrate_session_data_if_needed(session_id))
-
-        # 【关键修改】不再提取UUID，直接使用完整的unified_msg_origin进行匹配
-        # 因为现在数据库中存储的就是完整格式
-        # session_id 和 persona_id 保持原样传递给检索器
-
-        # 执行混合检索 / 双路检索
-        if self.dual_route_retriever is not None:
-            results = await self.dual_route_retriever.search(
-                query,
-                k,
-                session_id,
-                persona_id,
-            )
-        else:
-            if self.hybrid_retriever is None:
-                raise RuntimeError("混合检索器未初始化")
-            results = await self.hybrid_retriever.search(
-                query, k, session_id, persona_id
-            )
-
-        # 异步更新访问时间(不阻塞返回)
-        for result in results:
-            self._create_tracked_task(self._update_access_time_internal(result.doc_id))
 
         self._set_cached_search_results(cache_key, results)
         return results
@@ -1216,10 +1574,8 @@ class MemoryEngine:
         Returns:
             Optional[Dict]: 记忆数据,包含text和metadata
         """
-        # 从faiss_db的document_storage获取文档
         try:
-            # 使用 get_documents (复数) 并传入 ids 参数
-            docs = await self.faiss_db.document_storage.get_documents(
+            docs = await self._get_documents(
                 metadata_filters={}, ids=[memory_id], limit=1
             )
 
@@ -1488,16 +1844,14 @@ class MemoryEngine:
         if self.graph_memory_manager is None:
             return {"rebuilt": 0, "skipped": 0}
 
-        total_count = await self.faiss_db.document_storage.count_documents(
-            metadata_filters={}
-        )
+        total_count = await self._count_documents(metadata_filters={})
         batch_size = 200
         offset = 0
         rebuilt = 0
         skipped = 0
 
         while offset < total_count:
-            docs = await self.faiss_db.document_storage.get_documents(
+            docs = await self._get_documents(
                 metadata_filters={},
                 limit=batch_size,
                 offset=offset,
@@ -1719,7 +2073,7 @@ class MemoryEngine:
         # 使用数据库层面的排序和分页，避免加载所有数据
         try:
             # 先获取总数判断是否需要分批
-            total_count = await self.faiss_db.document_storage.count_documents(
+            total_count = await self._count_documents(
                 metadata_filters={"session_id": session_id}
             )
 
@@ -1728,7 +2082,7 @@ class MemoryEngine:
 
             # 如果总数小于等于limit，直接一次性获取
             if total_count <= limit:
-                all_docs = await self.faiss_db.document_storage.get_documents(
+                all_docs = await self._get_documents(
                     metadata_filters={"session_id": session_id},
                     limit=limit,
                     offset=0,
@@ -1750,7 +2104,7 @@ class MemoryEngine:
                 offset = 0
 
                 while offset < total_count:
-                    batch = await self.faiss_db.document_storage.get_documents(
+                    batch = await self._get_documents(
                         metadata_filters={"session_id": session_id},
                         limit=batch_size,
                         offset=offset,
@@ -1840,7 +2194,7 @@ class MemoryEngine:
                 found_ids = [int(row["id"]) for row in uuid_rows]
                 for row in uuid_rows:
                     uuid_doc_id = row["doc_id"]
-                    if uuid_doc_id:
+                    if uuid_doc_id and self.faiss_db is not None:
                         try:
                             await self.faiss_db.delete(uuid_doc_id)
                         except asyncio.CancelledError:
@@ -1957,9 +2311,7 @@ class MemoryEngine:
         # 分批扫描文档并删除，避免一次性加载所有数据到内存
         try:
             # 先获取总数
-            total_count = await self.faiss_db.document_storage.count_documents(
-                metadata_filters={}
-            )
+            total_count = await self._count_documents(metadata_filters={})
 
             if total_count == 0:
                 return 0
@@ -1970,7 +2322,7 @@ class MemoryEngine:
 
             # First pass: scan candidates without deleting to avoid offset-shift skips.
             while offset < total_count:
-                batch_docs = await self.faiss_db.document_storage.get_documents(
+                batch_docs = await self._get_documents(
                     metadata_filters={}, limit=batch_size, offset=offset
                 )
 
@@ -1983,6 +2335,11 @@ class MemoryEngine:
 
                 for doc in batch_docs:
                     metadata = doc["metadata"]
+                    if bool(metadata.get("protected", False)) or (
+                        metadata.get("archive_type") == "memory_item_projection"
+                        and metadata.get("projection_status", "current") == "current"
+                    ):
+                        continue
 
                     create_time = safe_float(metadata.get("create_time"), time.time())
                     doc_importance = clamp_float(
@@ -2140,6 +2497,24 @@ class MemoryEngine:
         except Exception as e:
             logger.error(f"[自动迁移] 迁移失败: {e}", exc_info=True)
 
+    def get_runtime_status(self) -> dict[str, Any]:
+        degraded_states: list[str] = []
+        retrieval_mode = "full" if self.vector_retriever is not None else "bm25_only"
+        llm_mode = "full" if self.llm_provider is not None else "no_llm"
+        if retrieval_mode != "full":
+            degraded_states.append(retrieval_mode)
+        if llm_mode != "full":
+            degraded_states.append(llm_mode)
+        return {
+            "status": "full" if not degraded_states else "degraded",
+            "retrieval_mode": retrieval_mode,
+            "llm_mode": llm_mode,
+            "degraded_states": degraded_states,
+            "evolving_memory_enabled": self.evolving_memory_retriever is not None,
+            "graph_keyword_enabled": self.graph_keyword_retriever is not None,
+            "graph_vector_enabled": self.graph_vector_retriever is not None,
+        }
+
     async def get_statistics(self) -> dict[str, Any]:
         """
         获取记忆统计信息（使用批量处理避免内存问题）
@@ -2155,9 +2530,7 @@ class MemoryEngine:
         """
         try:
             # 使用 count_documents() 高效获取总数（不加载数据）
-            total_count = await self.faiss_db.document_storage.count_documents(
-                metadata_filters={}
-            )
+            total_count = await self._count_documents(metadata_filters={})
 
             stats = {}
             stats["total_memories"] = total_count
@@ -2180,7 +2553,7 @@ class MemoryEngine:
 
             while offset < total_count:
                 # 获取一批文档
-                batch_docs = await self.faiss_db.document_storage.get_documents(
+                batch_docs = await self._get_documents(
                     metadata_filters={}, limit=batch_size, offset=offset
                 )
 
@@ -2251,6 +2624,24 @@ class MemoryEngine:
             else:
                 stats["graph_memory_enabled"] = False
 
+            stats["runtime"] = self.get_runtime_status()
+            stats["evolving_memory_items"] = {}
+            stats["evolving_memory_total"] = 0
+            if self.db_connection is not None:
+                cursor = await self.db_connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_items'"
+                )
+                if await cursor.fetchone() is not None:
+                    cursor = await self.db_connection.execute(
+                        "SELECT status, COUNT(*) FROM memory_items GROUP BY status"
+                    )
+                    item_rows = await cursor.fetchall()
+                    stats["evolving_memory_items"] = {
+                        str(row[0]): int(row[1]) for row in item_rows
+                    }
+                    stats["evolving_memory_total"] = sum(
+                        stats["evolving_memory_items"].values()
+                    )
             return stats
         except asyncio.CancelledError:
             raise
@@ -2264,6 +2655,9 @@ class MemoryEngine:
                 "oldest_memory": None,
                 "newest_memory": None,
                 "graph_memory_enabled": bool(self.graph_store is not None),
+                "runtime": self.get_runtime_status(),
+                "evolving_memory_items": {},
+                "evolving_memory_total": 0,
             }
 
     async def maintain_storage(self, *, vacuum: bool = False) -> dict[str, Any]:

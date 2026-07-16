@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { DataState, WorkshopPanel } from '@pandyzhou/astrbot-mc-ui';
-import { memoryGet } from '../../api/client';
+import { memoryAdminClient, memoryGet } from '../../api/client';
 import { useI18n } from '../../i18n';
 import { queryCache } from '../../store/queryCacheCore';
 import { queryKeys } from '../../store/queryKeys';
@@ -13,6 +13,11 @@ export function OverviewPage() {
     queryKeys.memoryOverviewStats,
     () => memoryGet<StatsData>('stats'),
   );
+  const maintenanceQuery = useCachedQuery(
+    queryKeys.memoryMaintenance,
+    () => memoryAdminClient.maintenance(),
+    { ttl: 15_000 },
+  );
   const backupsQuery = useCachedQuery<{ backups: BackupItem[] }>(
     queryKeys.memoryOverviewBackups,
     () => memoryGet<{ backups: BackupItem[] }>('backups'),
@@ -24,7 +29,8 @@ export function OverviewPage() {
   const refresh = () => {
     queryCache.invalidate(queryKeys.memoryOverviewStats);
     queryCache.invalidate(queryKeys.memoryOverviewBackups);
-    void Promise.allSettled([statsQuery.refresh(), backupsQuery.refresh()]);
+    queryCache.invalidate(queryKeys.memoryMaintenance);
+    void Promise.allSettled([statsQuery.refresh(), backupsQuery.refresh(), maintenanceQuery.refresh()]);
   };
 
   const status = stats?.status_breakdown ?? {};
@@ -36,13 +42,14 @@ export function OverviewPage() {
   if (statsQuery.isInitialLoading) return <DataState state="loading" title={t('loading')} message={t('memoryCapability')} />;
   if (!stats && statsQuery.error) return <DataState state="error" title={t('operationFailed')} message={statsQuery.error instanceof Error ? statsQuery.error.message : String(statsQuery.error)} action={<button className="wf-button" type="button" onClick={() => { void statsQuery.refresh().catch(() => undefined); }}>{t('retry')}</button>} />;
 
+  const maintenance = maintenanceQuery.data;
   const cards = [
     [t('total'), stats?.total_memories ?? 0],
     [t('active'), status.active ?? 0],
-    [t('archived'), status.archived ?? 0],
-    [t('deleted'), status.deleted ?? 0],
-    [t('graphNodes'), stats?.graph_nodes ?? 0],
-    [t('atoms'), stats?.atom_count ?? 0],
+    ['对象迁移', `${maintenance?.migration.processed ?? 0}/${maintenance?.migration.total ?? 0}`],
+    ['未解析 owner', maintenance?.migration.unresolved_owner_count ?? 0],
+    ['来源覆盖', `${Math.round((maintenance?.sources.coverage_ratio ?? 0) * 100)}%`],
+    ['索引待同步', (maintenance?.index.pending_count ?? 0) + (maintenance?.index.needs_repair_count ?? 0)],
   ];
 
   return (

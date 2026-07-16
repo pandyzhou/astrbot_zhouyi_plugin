@@ -8,6 +8,9 @@ from typing import Any
 
 from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
 
+from ..models.evolving_memory import MemoryAccessContext
+from .access_filters import coerce_metadata, is_metadata_accessible
+
 _TRUNCATED_CONTENT_MARKER = "\n...[中间内容已截断]...\n"
 
 
@@ -128,6 +131,8 @@ class VectorRetriever:
         k: int = 10,
         session_id: str | None = None,
         persona_id: str | None = None,
+        access_context: MemoryAccessContext | None = None,
+        include_item_projection: bool = False,
     ) -> list[VectorResult]:
         """
         执行向量相似度搜索
@@ -158,21 +163,25 @@ class VectorRetriever:
             )
             processed_query = processed_query[:_MAX_QUERY_CHARS]
 
-        # 构建元数据过滤器
+        # 旧调用继续使用 FaissVecDB 的精确 metadata filter；带 access context
+        # 时需要 owner-or-legacy-session 的 OR 语义，因此扩大候选后在 Python 强制过滤。
         metadata_filters = {}
-        if session_id is not None:
-            metadata_filters["session_id"] = session_id
-        if persona_id is not None:
-            metadata_filters["persona_id"] = persona_id
+        if access_context is None:
+            if session_id is not None:
+                metadata_filters["session_id"] = session_id
+            if persona_id is not None:
+                metadata_filters["persona_id"] = persona_id
 
-        # 执行向量检索
-        # fetch_k设置为k*2以确保过滤后有足够的结果
-        fetch_k = k * 2 if metadata_filters else k
+        fetch_k = (
+            max(k * 20, k)
+            if access_context is not None
+            else (k * 2 if metadata_filters else k)
+        )
 
         faiss_results = await self.faiss_db.retrieve(
             query=processed_query,
-            k=k,
-            fetch_k=fetch_k,
+            k=fetch_k,
+            fetch_k=max(fetch_k, k),
             rerank=False,
             metadata_filters=metadata_filters if metadata_filters else None,
         )
@@ -180,17 +189,26 @@ class VectorRetriever:
         # 转换为VectorResult格式
         results = []
         for result in faiss_results:
-            # FaissVecDB返回的Result对象包含similarity和data
-            # data是包含id, text, metadata的字典
             doc_data = result.data
+            metadata = coerce_metadata(doc_data.get("metadata"))
+            if not is_metadata_accessible(
+                metadata,
+                access_context=access_context,
+                session_id=session_id,
+                persona_id=persona_id,
+                include_item_projection=include_item_projection,
+            ):
+                continue
             results.append(
                 VectorResult(
                     doc_id=doc_data["id"],
-                    score=result.similarity,  # FaissVecDB已经归一化到[0,1]
+                    score=result.similarity,
                     content=doc_data["text"],
-                    metadata=doc_data["metadata"],
+                    metadata=metadata,
                 )
             )
+            if len(results) >= k:
+                break
 
         return results
 

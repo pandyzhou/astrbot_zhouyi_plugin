@@ -151,10 +151,12 @@ class MyPlugin(Star):
             await service.handle_memory_reflection(event, resp)
 
     @filter.after_message_sent()
-    async def handle_session_reset(self, event: AstrMessageEvent, *args: Any) -> None:
+    async def handle_after_message_sent(
+        self, event: AstrMessageEvent, *args: Any
+    ) -> None:
         service = self.runtime.memory
         if service is not None:
-            await service.handle_session_reset(event, *args)
+            await service.handle_after_message_sent(event, *args)
 
     @filter.command_group("zhouyi")
     def zhouyi(self):

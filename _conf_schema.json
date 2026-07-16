@@ -348,6 +348,133 @@
                     }
                 }
             },
+            "identity_resolution": {
+                "description": "用户身份解析",
+                "hint": "将平台、Bot 和外部用户 ID 映射到稳定 owner。不会按昵称自动合并身份。",
+                "type": "object",
+                "items": {
+                    "enabled": {
+                        "description": "启用身份解析",
+                        "hint": "开启后使用稳定 owner 作为新记忆对象的强制访问边界。",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "default_scope": {
+                        "description": "默认写入范围",
+                        "hint": "自动写入默认使用 persona；群聊自动写入仍会强制使用 session。",
+                        "type": "string",
+                        "options": [
+                            "user",
+                            "persona",
+                            "session"
+                        ],
+                        "default": "persona"
+                    },
+                    "unmapped_policy": {
+                        "description": "未映射身份策略",
+                        "hint": "create_isolated_owner 会为精确的平台、Bot、外部用户组合创建隔离 owner；reject 则拒绝访问。",
+                        "type": "string",
+                        "options": [
+                            "create_isolated_owner",
+                            "reject"
+                        ],
+                        "default": "create_isolated_owner"
+                    },
+                    "require_explicit_cross_platform_link": {
+                        "description": "跨平台显式绑定",
+                        "hint": "开启后跨平台账号只能由管理员显式绑定，禁止按昵称自动合并。",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "allow_public_scope": {
+                        "description": "允许公共范围",
+                        "hint": "默认关闭。开启后仍只允许管理员手工创建 public 记忆，自动动作始终拒绝。",
+                        "type": "bool",
+                        "default": false
+                    }
+                }
+            },
+            "evolving_memory": {
+                "description": "可演化记忆对象",
+                "hint": "控制稳定 ID、不可变 revision、反馈动作和旧 key_facts 回填。",
+                "type": "object",
+                "items": {
+                    "enabled": {
+                        "description": "启用可演化记忆",
+                        "hint": "开启稳定记忆对象核心能力。",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "read_enabled": {
+                        "description": "启用对象读取",
+                        "hint": "允许读取 owner 隔离的当前记忆对象。",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "write_enabled": {
+                        "description": "启用对象写入",
+                        "hint": "允许 create、update、merge、supersede 和 archive。",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "feedback_enabled": {
+                        "description": "启用回复后反馈",
+                        "hint": "允许运行时根据实际使用结果强化或演化记忆。",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "feedback_trigger_mode": {
+                        "description": "反馈触发模式",
+                        "hint": "adaptive 按信号强度决定立即或批量处理。",
+                        "type": "string",
+                        "options": [
+                            "adaptive",
+                            "batch",
+                            "immediate"
+                        ],
+                        "default": "adaptive"
+                    },
+                    "feedback_batch_rounds": {
+                        "description": "反馈累计轮数",
+                        "hint": "普通闲聊最多累计多少轮后处理一次反馈。",
+                        "type": "int",
+                        "default": 3
+                    },
+                    "feedback_idle_seconds": {
+                        "description": "反馈空闲秒数",
+                        "hint": "反馈批次空闲达到该秒数后触发处理。",
+                        "type": "int",
+                        "default": 300
+                    },
+                    "max_actions_per_batch": {
+                        "description": "单批最大动作数",
+                        "hint": "限制一次反馈批次可提交的记忆动作数量。",
+                        "type": "int",
+                        "default": 5
+                    },
+                    "min_action_confidence": {
+                        "description": "自动动作最低置信度",
+                        "hint": "低于该阈值的自动记忆动作不提交。",
+                        "type": "float",
+                        "default": 0.65
+                    },
+                    "group_private_visibility": {
+                        "description": "群聊私密记忆策略",
+                        "hint": "explicit_only 表示私聊产生的 user/persona 记忆仅在 group_safe=true 时可用于群聊。",
+                        "type": "string",
+                        "options": [
+                            "explicit_only"
+                        ],
+                        "default": "explicit_only"
+                    },
+                    "migration_batch_size": {
+                        "description": "旧数据回填批量",
+                        "hint": "每批从旧 documents.key_facts 生成稳定记忆对象的文档数量。",
+                        "type": "int",
+                        "default": 100
+                    }
+                }
+            },
             "migration_settings": {
                 "description": "数据库迁移",
                 "hint": "控制插件启动时的数据库版本升级行为",

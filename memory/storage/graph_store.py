@@ -107,12 +107,27 @@ class GraphStore:
                     metadata TEXT DEFAULT '{}',
                     edge_id INTEGER,
                     vector_doc_id INTEGER,
+                    memory_item_id TEXT,
+                    memory_revision_no INTEGER,
+                    projection_status TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(edge_id) REFERENCES graph_edges(id) ON DELETE CASCADE
                 )
                 """
             )
+            cursor = await db.execute("PRAGMA table_info(graph_entries)")
+            graph_entry_columns = {str(row[1]) for row in await cursor.fetchall()}
+            for column_name, declaration in (
+                ("memory_item_id", "TEXT"),
+                ("memory_revision_no", "INTEGER"),
+                ("projection_status", "TEXT"),
+            ):
+                if column_name not in graph_entry_columns:
+                    await db.execute(
+                        f"ALTER TABLE graph_entries ADD COLUMN {column_name} {declaration}"
+                    )
+
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS graph_entry_nodes (
@@ -156,6 +171,12 @@ class GraphStore:
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_graph_entries_persona_id ON graph_entries(persona_id)"
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_graph_entries_memory_item
+                ON graph_entries(memory_item_id, memory_revision_no, projection_status)
+                """
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_graph_entry_nodes_node ON graph_entry_nodes(node_id)"
@@ -417,7 +438,9 @@ class GraphStore:
                 """
                 UPDATE graph_entries
                 SET session_id = ?, persona_id = ?, entry_type = ?, relation_type = ?,
-                    content = ?, metadata = ?, edge_id = ?, updated_at = ?
+                    content = ?, metadata = ?, edge_id = ?,
+                    memory_item_id = ?, memory_revision_no = ?, projection_status = ?,
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -428,6 +451,9 @@ class GraphStore:
                     entry.content,
                     self._to_json(entry.metadata),
                     edge_id,
+                    entry.metadata.get("memory_item_id"),
+                    entry.metadata.get("memory_revision_no"),
+                    entry.metadata.get("projection_status"),
                     now,
                     entry_id,
                 ),
@@ -446,8 +472,9 @@ class GraphStore:
                 INSERT INTO graph_entries(
                     entry_key, source_memory_id, session_id, persona_id,
                     entry_type, relation_type, content, metadata,
-                    edge_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    edge_id, memory_item_id, memory_revision_no, projection_status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry.entry_key,
@@ -459,6 +486,9 @@ class GraphStore:
                     entry.content,
                     self._to_json(entry.metadata),
                     edge_id,
+                    entry.metadata.get("memory_item_id"),
+                    entry.metadata.get("memory_revision_no"),
+                    entry.metadata.get("projection_status"),
                     now,
                     now,
                 ),
@@ -512,6 +542,44 @@ class GraphStore:
                 ],
             )
             await db.commit()
+
+    async def mark_memory_projection_status(
+        self, source_memory_id: int, projection_status: str
+    ) -> list[int]:
+        """Update projection status on graph entries and return vector document ids."""
+        vector_doc_ids: list[int] = []
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT id, vector_doc_id, metadata FROM graph_entries WHERE source_memory_id = ?",
+                (source_memory_id,),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                metadata = self._from_json(row["metadata"])
+                metadata["projection_status"] = projection_status
+                await db.execute(
+                    """
+                    UPDATE graph_entries
+                    SET projection_status = ?, metadata = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        projection_status,
+                        self._to_json(metadata),
+                        self._now_iso(),
+                        int(row["id"]),
+                    ),
+                )
+                if row["vector_doc_id"] is not None:
+                    vector_doc_ids.append(int(row["vector_doc_id"]))
+                if projection_status == "stale":
+                    await db.execute(
+                        "DELETE FROM livingmemory_graph_entries_fts WHERE entry_id = ?",
+                        (int(row["id"]),),
+                    )
+            await db.commit()
+        return vector_doc_ids
 
     async def delete_memory(self, source_memory_id: int) -> list[int]:
         """Delete graph artifacts belonging to one source memory."""

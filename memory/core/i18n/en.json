@@ -68,7 +68,9 @@
     "no_new": "No new conversations to summarize currently.\nTotal messages: {total}\nLast summarized message index: {index}",
     "starting": "Starting manual memory summarization...\nMessage range: [{start}:{end}], total {count} items",
     "fetch_failed": "Failed to fetch messages: no summarizable messages read.\nPlease confirm the current session has historical messages and retry.",
-    "success": "Memory summarization complete.\nImportance: {importance:.2f}\nTopics: {topics}\nUpdated summarization progress to message {count}"
+    "success": "Memory summarization complete.\nImportance: {importance:.2f}\nTopics: {topics}\nUpdated summarization progress to message {count}",
+    "evolving_success": "Object memory write complete: {created} created, {deduplicated} deduplicated.",
+    "evolving_partial": "The legacy summary was saved, but object memory was only partially written: {created} created, {deduplicated} deduplicated, {failed} failed, {skipped} skipped."
   },
   "reset": {
     "action_name": "Reset memory context",

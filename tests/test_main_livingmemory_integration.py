@@ -16,6 +16,16 @@ if str(ASTRBOT_ROOT) not in sys.path:
 from data.plugins.astrbot_zhouyi_plugin import runtime as plugin_runtime
 from data.plugins.astrbot_zhouyi_plugin.main import MyPlugin
 from data.plugins.astrbot_zhouyi_plugin.runtime import PluginRuntime
+from data.plugins.astrbot_zhouyi_plugin.web_api import MC_ROUTE_DESCRIPTORS, PAGE_API_PREFIX
+from data.plugins.astrbot_zhouyi_plugin.zhouyi_page_api import (
+    CONFIG_V1_PREFIX,
+    MC_V1_PREFIX,
+    MEMORY_ADMIN_ROUTE_DESCRIPTORS,
+    MEMORY_ROUTE_DESCRIPTORS,
+    MEMORY_V1_PREFIX,
+    PAGE_V1_PREFIX,
+    SOURCES_V1_PREFIX,
+)
 
 
 class DummyContext:
@@ -109,7 +119,7 @@ class MainMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "handle_all_group_messages",
                 "handle_memory_recall",
                 "handle_memory_reflection",
-                "handle_session_reset",
+                "handle_after_message_sent",
             }.issubset(methods)
         )
 
@@ -247,6 +257,7 @@ class MainMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_enabled_section_uses_legacy_data_dir_and_proxies_commands(self):
         context = DummyContext()
         created = []
+        after_sent = []
 
         class FakeComponent:
             def __init__(self, component_context, config, data_dir):
@@ -257,6 +268,9 @@ class MainMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             async def search(self, event, query, k):
                 yield event.plain_result(f"{query}:{k}")
+
+            async def handle_after_message_sent(self, event, *args):
+                after_sent.append((event, args))
 
             async def terminate(self):
                 return None
@@ -292,6 +306,8 @@ class MainMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await collect_results(plugin.search(event, "星星", 7)),
                 [("plain", "星星:7")],
             )
+            await plugin.handle_after_message_sent(event, "sent")
+            self.assertEqual(after_sent, [(event, ("sent",))])
             await plugin.terminate()
 
         self.assertEqual(
@@ -336,7 +352,7 @@ class MainMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         await plugin.handle_memory_recall(event, object())
         await plugin.handle_memory_reflection(event, object())
-        await plugin.handle_session_reset(event)
+        await plugin.handle_after_message_sent(event)
 
     async def test_component_construction_failure_does_not_break_mc_initialization(self):
         context = DummyContext()
@@ -365,19 +381,35 @@ class MainMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             plugin = MyPlugin(
                 context, config={"memory": {"enabled": True}}
             )
-            self.assertEqual(len(context.registered_web_apis), 49)
-            registered = {
+            registered_entries = [
                 (route, tuple(methods))
                 for route, _, methods, _ in context.registered_web_apis
+            ]
+            registered = set(registered_entries)
+            self.assertEqual(len(registered_entries), len(registered))
+
+            expected = {
+                (f"{PAGE_V1_PREFIX}/bootstrap", ("GET",)),
+                (f"{PAGE_API_PREFIX}/bootstrap", ("GET",)),
+                (f"{CONFIG_V1_PREFIX}/memory", ("GET",)),
+                (f"{CONFIG_V1_PREFIX}/memory", ("POST",)),
+                (f"{SOURCES_V1_PREFIX}/updates", ("GET",)),
+                (f"{SOURCES_V1_PREFIX}/updates/refresh", ("POST",)),
             }
-            self.assertIn(
-                ("/astrbot_zhouyi_plugin/page/v1/config/memory", ("GET",)),
-                registered,
-            )
-            self.assertIn(
-                ("/astrbot_zhouyi_plugin/page/v1/config/memory", ("POST",)),
-                registered,
-            )
+            for suffix, _handler, methods, _description in MC_ROUTE_DESCRIPTORS:
+                expected.add((f"{MC_V1_PREFIX}{suffix}", tuple(methods)))
+                if suffix != "/bootstrap":
+                    expected.add((f"{PAGE_API_PREFIX}{suffix}", tuple(methods)))
+            for suffix, _handler, methods, _description in MEMORY_ROUTE_DESCRIPTORS:
+                expected.add((f"{MEMORY_V1_PREFIX}{suffix}", tuple(methods)))
+                expected.add((f"{PAGE_API_PREFIX}{suffix}", tuple(methods)))
+            for suffix, _handler, methods, _description in MEMORY_ADMIN_ROUTE_DESCRIPTORS:
+                expected.add((f"{MEMORY_V1_PREFIX}{suffix}", tuple(methods)))
+
+            self.assertEqual(registered, expected)
+            self.assertIn((f"{PAGE_API_PREFIX}/stats", ("GET",)), registered)
+            self.assertIn((f"{PAGE_API_PREFIX}/memories", ("GET",)), registered)
+            self.assertIn((f"{PAGE_API_PREFIX}/graph/query", ("POST",)), registered)
             self.assertIsNone(plugin.runtime.memory)
             self.assertIsNotNone(plugin.runtime.standalone_task)
             self.assertIsNotNone(plugin.runtime.trend_task)

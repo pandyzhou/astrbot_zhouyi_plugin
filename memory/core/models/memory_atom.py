@@ -89,6 +89,8 @@ class MemoryAtom:
     session_id: str | None = None
     persona_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    memory_item_id: str | None = None
+    memory_revision_no: int | None = None
 
     # Internal id, set after insertion
     atom_id: int = 0

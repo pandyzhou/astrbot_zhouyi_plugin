@@ -6,6 +6,9 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from astrbot.api import logger
+
+from ..models.evolving_memory import MemoryAccessContext
 from .graph_retriever import GraphRetriever
 from .hybrid_retriever import HybridResult, HybridRetriever
 
@@ -33,19 +36,48 @@ class DualRouteRetriever:
             self.config.get("dynamic_route_weighting", True)
         )
 
+    async def _search_route(self, route_name: str, coroutine):
+        try:
+            return await coroutine
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                f"[DualRouteRetriever] {route_name}失败，保留其他召回路",
+                exc_info=True,
+            )
+            return []
+
     async def search(
         self,
         query: str,
         k: int = 10,
         session_id: str | None = None,
         persona_id: str | None = None,
+        access_context: MemoryAccessContext | None = None,
     ) -> list[HybridResult]:
         """Run both retrieval routes and merge their memory candidates."""
         doc_results, graph_results = await asyncio.gather(
-            self.document_retriever.search(
-                query, max(k * 2, k), session_id, persona_id
+            self._search_route(
+                "文档路",
+                self.document_retriever.search(
+                    query,
+                    max(k * 2, k),
+                    session_id,
+                    persona_id,
+                    access_context=access_context,
+                ),
             ),
-            self.graph_retriever.search(query, max(k * 2, k), session_id, persona_id),
+            self._search_route(
+                "图路",
+                self.graph_retriever.search(
+                    query,
+                    max(k * 2, k),
+                    session_id,
+                    persona_id,
+                    access_context=access_context,
+                ),
+            ),
         )
 
         if not graph_results:
@@ -93,7 +125,16 @@ class DualRouteRetriever:
             )
 
             if not memory_content or not memory_metadata:
-                memory = await self.memory_loader(doc_id)
+                try:
+                    memory = await self.memory_loader(doc_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        f"[DualRouteRetriever] 文档加载失败 (doc_id={doc_id})",
+                        exc_info=True,
+                    )
+                    memory = None
                 if not memory:
                     continue
                 memory_content = str(memory.get("text") or memory_content)
@@ -160,6 +201,25 @@ class DualRouteRetriever:
                     content=memory_content,
                     metadata=memory_metadata,
                     score_breakdown=score_breakdown,
+                    memory_item_id=(
+                        doc_result.memory_item_id
+                        if doc_result is not None
+                        else memory_metadata.get("memory_item_id")
+                    ),
+                    version=(
+                        doc_result.version
+                        if doc_result is not None
+                        else memory_metadata.get("version")
+                    ),
+                    source_type=(
+                        doc_result.source_type
+                        if doc_result is not None
+                        else (
+                            "memory_item_graph"
+                            if memory_metadata.get("memory_item_id")
+                            else "legacy_graph"
+                        )
+                    ),
                 )
             )
 
