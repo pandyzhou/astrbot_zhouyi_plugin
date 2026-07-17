@@ -16,7 +16,6 @@ CARD_BG = (22, 28, 43)
 TEXT = (245, 248, 255, 255)
 MUTED = (174, 190, 211, 255)
 ACCENT = (91, 238, 177, 255)
-ACCENT_SOFT = (91, 238, 177, 78)
 GRID = (130, 150, 178, 66)
 PANEL = (8, 15, 29, 226)
 
@@ -203,50 +202,12 @@ def _normalize_hourly_window(
         last_sample=last_sample,
     )
     mode = _trend_mode(window_hours)
-    points = (
-        _aggregate_3h_points(timestamps, values)
-        if mode == "area3h"
-        else [PlotPoint(ts, value, ts, ts) for ts, value in zip(timestamps, values)]
-    )
+    points = [PlotPoint(ts, value, ts, ts) for ts, value in zip(timestamps, values)]
     return HourlyTrend(timestamps, values, points, stats, mode)
 
 
 def _trend_mode(hours: int) -> str:
-    value = max(1, int(hours))
-    if value <= 24:
-        return "bar"
-    if value <= 72:
-        return "area"
-    return "area3h"
-
-
-def _aggregate_3h_points(
-    timestamps: Sequence[int],
-    values: Sequence[Optional[int]],
-) -> list[PlotPoint]:
-    """从当前小时向前按三小时分组；组内缺任一点即为缺失。"""
-    groups: list[PlotPoint] = []
-    end = len(timestamps)
-    while end > 0:
-        start = max(0, end - 3)
-        group_ts = timestamps[start:end]
-        group_values = values[start:end]
-        value: Optional[float]
-        if any(item is None for item in group_values):
-            value = None
-        else:
-            value = round(sum(int(item) for item in group_values if item is not None) / len(group_values), 1)
-        groups.append(
-            PlotPoint(
-                ts=group_ts[-1],
-                value=value,
-                source_start_ts=group_ts[0],
-                source_end_ts=group_ts[-1],
-            )
-        )
-        end = start
-    groups.reverse()
-    return groups
+    return "bar" if max(1, int(hours)) <= 24 else "line"
 
 
 def _split_contiguous_segments(points: Sequence[PlotPoint]) -> list[list[PlotPoint]]:
@@ -281,10 +242,13 @@ def _nice_y_axis(
     values: Iterable[Optional[float]],
     average: Optional[float] = None,
 ) -> tuple[int, int, list[int]]:
-    candidates = [float(value) for value in values if value is not None]
+    candidates = [max(0.0, float(value)) for value in values if value is not None]
     if average is not None:
-        candidates.append(float(average))
+        candidates.append(max(0.0, float(average)))
     maximum = max(candidates, default=0.0)
+    if maximum <= 3:
+        return 3, 1, [0, 1, 2, 3]
+
     step = max(1, int(math.ceil(_nice_number(maximum / 5.0, ceil_value=True))))
     intervals = max(4, int(math.ceil(maximum / step)))
     while intervals > 6:
@@ -380,25 +344,6 @@ def _paste_logo(
 
 def _format_hour(ts: Optional[int]) -> str:
     return "--" if ts is None else datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
-
-
-def _format_plot_value(value: float) -> str:
-    numeric = float(value)
-    if numeric.is_integer():
-        return str(int(numeric))
-    return f"{numeric:.1f}"
-
-
-def _mini_point_render_plan(
-    points: Sequence[PlotPoint],
-) -> list[tuple[int, PlotPoint, Optional[str]]]:
-    """返回非缺失绘制点；仅在点数不超过 24 时附带逐点数值。"""
-    show_labels = len(points) <= 24
-    return [
-        (index, point, _format_plot_value(float(point.value)) if show_labels else None)
-        for index, point in enumerate(points)
-        if point.value is not None
-    ]
 
 
 def _point_x(index: int, count: int, left: float, right: float) -> float:
@@ -520,15 +465,7 @@ def _draw_plot(
                 y = y_at(float(point.value))
                 coordinates.append((x, y))
             if len(coordinates) >= 2:
-                polygon = coordinates + [(coordinates[-1][0], plot_bottom), (coordinates[0][0], plot_bottom)]
-                draw.polygon(polygon, fill=ACCENT_SOFT)
                 draw.line(coordinates, fill=ACCENT, width=3, joint="curve")
-            elif coordinates:
-                x, y = coordinates[0]
-                draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=ACCENT)
-            for point, (x, y) in zip(segment, coordinates):
-                if point.value == 0:
-                    draw.ellipse((x - 3, plot_bottom - 3, x + 3, plot_bottom + 3), fill=ACCENT)
 
     labels = _select_x_axis_labels(trend.timestamps)
     planned_labels: list[tuple[str, float, int]] = []
@@ -572,13 +509,6 @@ def _draw_plot(
         if position is None:
             continue
         x, y = position
-        draw.ellipse(
-            (x - 6, y - 6, x + 6, y + 6),
-            fill=(10, 21, 35, 255),
-            outline=TEXT,
-            width=2,
-        )
-        draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=ACCENT)
         tw, th = _text_size(draw, label, value_font)
         label_x = max(plot_left + 4, min(plot_right - tw - 4, x - tw / 2))
         label_y = max(plot_top + 3, min(plot_bottom - th - 3, y - th - 10))
@@ -654,7 +584,7 @@ def generate_bar_chart_image(
         draw.text((right - note_width - 14, stat_top + 13), note_text, font=stat_label_font, fill=MUTED)
 
     _draw_plot(draw, trend, (34, 202, width - 34, height - 60), axis_font, value_font)
-    mode_text = {"bar": "小时柱状", "area": "小时面积", "area3h": "3 小时聚合面积"}[trend.mode]
+    mode_text = "小时柱状" if trend.mode == "bar" else "小时折线"
     footer = f"最后采样：{_format_hour(trend.stats.last_sample)} · {mode_text}"
     draw.text((36, height - 43), _ellipsize(draw, footer, footer_font, width - 72), font=footer_font, fill=MUTED)
     return _encode_png(canvas)
@@ -798,6 +728,37 @@ def _draw_mini_x_labels(
             draw.text((last[1], label_y), last[0], font=font, fill=MUTED)
 
 
+def _draw_dashed_line(
+    draw: ImageDraw.ImageDraw,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    *,
+    fill: tuple[int, int, int, int],
+    width: int,
+    dash: float,
+    gap: float,
+) -> None:
+    distance = math.dist(start, end)
+    if distance <= 0:
+        return
+    dx = (end[0] - start[0]) / distance
+    dy = (end[1] - start[1]) / distance
+    offset = 0.0
+    while offset < distance:
+        segment_end = min(distance, offset + dash)
+        draw.line(
+            (
+                start[0] + dx * offset,
+                start[1] + dy * offset,
+                start[0] + dx * segment_end,
+                start[1] + dy * segment_end,
+            ),
+            fill=fill,
+            width=width,
+        )
+        offset += dash + gap
+
+
 def _draw_mini_chart(
     draw: ImageDraw.ImageDraw,
     trend: HourlyTrend,
@@ -809,19 +770,64 @@ def _draw_mini_chart(
     scale: float,
 ) -> None:
     left, top, right, bottom = bounds
-    plot_bounds = (left, top + _scaled(4, scale), right, bottom - _scaled(25, scale))
-    plot_left, plot_top, plot_right, plot_bottom = plot_bounds
+    y_max, _, ticks = _nice_y_axis(trend.values)
+    tick_labels = [str(tick) for tick in ticks]
+    label_height = max(_text_size(draw, label, label_font)[1] for label in tick_labels)
+    label_column_width = max(
+        _scaled(18, scale),
+        min(
+            _scaled(48, scale),
+            max(_text_size(draw, label, label_font)[0] for label in tick_labels),
+        ),
+    )
+    side_gap = _scaled(7, scale)
+    plot_left = left + label_column_width + side_gap
+    plot_right = right - label_column_width - side_gap
+    plot_top = top + max(_scaled(4, scale), math.ceil(label_height / 2))
+    plot_bottom = bottom - _scaled(25, scale) - math.ceil(label_height / 2)
+    plot_bounds = (plot_left, plot_top, plot_right, plot_bottom)
+
+    def y_at(value: int) -> float:
+        return plot_bottom - value / y_max * (plot_bottom - plot_top)
+
     baseline_width = _scaled(1.5, scale)
     draw.line(
         (plot_left, plot_bottom, plot_right, plot_bottom),
         fill=(188, 205, 226, 110),
         width=baseline_width,
     )
+    for tick, label in zip(ticks, tick_labels):
+        y = y_at(tick)
+        if tick != 0:
+            _draw_dashed_line(
+                draw,
+                (plot_left, y),
+                (plot_right, y),
+                fill=(126, 148, 178, 76),
+                width=_scaled(1, scale),
+                dash=_scaled(3, scale),
+                gap=_scaled(3, scale),
+            )
+        tw, th = _text_size(draw, label, label_font)
+        label_y = y - th / 2
+        draw.text(
+            (plot_left - side_gap - tw, label_y),
+            label,
+            font=label_font,
+            fill=MUTED,
+        )
+        draw.text(
+            (plot_right + side_gap, label_y),
+            label,
+            font=label_font,
+            fill=MUTED,
+        )
+
     _draw_mini_x_labels(
         draw,
         trend.timestamps,
         plot_bounds,
-        plot_bottom + _scaled(7, scale),
+        plot_bottom + math.ceil(label_height / 2) + _scaled(7, scale),
         axis_font,
         scale,
     )
@@ -842,8 +848,6 @@ def _draw_mini_chart(
         )
         return
 
-    y_max, _, _ = _nice_y_axis(trend.values)
-
     def coordinate(point: PlotPoint) -> tuple[float, float]:
         return _plot_coordinate(
             point.ts,
@@ -855,106 +859,10 @@ def _draw_mini_chart(
         )
 
     line_width = _scaled(2, scale)
-    point_radius = _scaled(3, scale)
-    peak_radius = _scaled(5, scale)
-    marker_outline = _scaled(1.5, scale)
     for segment in _split_contiguous_segments(trend.points):
         coordinates = [coordinate(point) for point in segment]
         if len(coordinates) >= 2:
-            polygon = coordinates + [
-                (coordinates[-1][0], plot_bottom),
-                (coordinates[0][0], plot_bottom),
-            ]
-            draw.polygon(polygon, fill=(91, 238, 177, 42))
             draw.line(coordinates, fill=ACCENT, width=line_width, joint="curve")
-
-    plotted_peak = False
-    padding_x = _scaled(3, scale)
-    padding_y = _scaled(2, scale)
-    label_gap = _scaled(4, scale)
-    label_radius = _scaled(3, scale)
-    label_outline = _scaled(1, scale)
-    stroke_width = _scaled(0.6, scale)
-    for point_index, point, label in _mini_point_render_plan(trend.points):
-        x, y = coordinate(point)
-        is_peak = trend.stats.peak_ts == point.ts and trend.stats.peak == point.value
-        radius = peak_radius if is_peak else point_radius
-        draw.ellipse(
-            (x - radius, y - radius, x + radius, y + radius),
-            fill=(7, 16, 29, 255),
-            outline=TEXT if is_peak else ACCENT,
-            width=marker_outline,
-        )
-        if is_peak:
-            plotted_peak = True
-            inner_radius = max(2, round(radius * 0.48))
-            draw.ellipse(
-                (x - inner_radius, y - inner_radius, x + inner_radius, y + inner_radius),
-                fill=ACCENT,
-            )
-        if label is None:
-            continue
-        label = _ellipsize(draw, label, label_font, plot_right - plot_left - padding_x * 2)
-        tw, th = _text_size(draw, label, label_font)
-        label_x = max(plot_left + padding_x, min(plot_right - tw - padding_x, x - tw / 2))
-        above_y = y - th - radius - label_gap - padding_y
-        below_y = y + radius + label_gap + padding_y
-        prefer_below = point_index % 2 == 1 or above_y < plot_top + padding_y
-        label_y = below_y if prefer_below else above_y
-        label_y = max(plot_top + padding_y, min(plot_bottom - th - padding_y, label_y))
-        draw.rounded_rectangle(
-            (
-                label_x - padding_x,
-                label_y - padding_y,
-                label_x + tw + padding_x,
-                label_y + th + padding_y,
-            ),
-            radius=label_radius,
-            fill=(5, 12, 24, 225),
-            outline=(228, 236, 247, 150),
-            width=label_outline,
-        )
-        draw.text(
-            (label_x, label_y),
-            label,
-            font=label_font,
-            fill=TEXT,
-            stroke_width=stroke_width,
-            stroke_fill=(2, 7, 16, 255),
-        )
-
-    if trend.stats.peak_ts is not None and not plotted_peak:
-        peak_position = _raw_observation_position(
-            trend.timestamps,
-            trend.values,
-            trend.stats.peak_ts,
-            plot_bounds,
-            y_max,
-        )
-        if peak_position is not None:
-            peak_x, peak_y = peak_position
-            draw.ellipse(
-                (
-                    peak_x - peak_radius,
-                    peak_y - peak_radius,
-                    peak_x + peak_radius,
-                    peak_y + peak_radius,
-                ),
-                fill=(7, 16, 29, 255),
-                outline=TEXT,
-                width=marker_outline,
-            )
-            inner_radius = max(2, round(peak_radius * 0.48))
-            draw.ellipse(
-                (
-                    peak_x - inner_radius,
-                    peak_y - inner_radius,
-                    peak_x + inner_radius,
-                    peak_y + inner_radius,
-                ),
-                fill=ACCENT,
-            )
-
 
 def _draw_summary_server_card(
     draw: ImageDraw.ImageDraw,

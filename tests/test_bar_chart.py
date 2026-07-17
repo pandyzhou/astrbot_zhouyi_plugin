@@ -6,6 +6,7 @@ import sys
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
@@ -16,12 +17,9 @@ if str(ASTRBOT_ROOT) not in sys.path:
 from data.plugins.astrbot_zhouyi_plugin.script.bar_chart import (
     PlotPoint,
     ServerTrendInput,
-    _aggregate_3h_points,
-    _format_plot_value,
-    _mini_point_render_plan,
+    _draw_mini_chart,
     _nice_y_axis,
     _normalize_hourly_window,
-    _plot_coordinate,
     _raw_observation_position,
     _select_x_axis_labels,
     _split_contiguous_segments,
@@ -103,42 +101,60 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(trend.stats.observed, 1)
 
     def test_modes_at_boundaries(self):
-        expected = {24: "bar", 25: "area", 72: "area", 73: "area3h", 168: "area3h"}
+        expected = {
+            24: "bar",
+            25: "line",
+            72: "line",
+            73: "line",
+            96: "line",
+            168: "line",
+        }
         for hours, mode in expected.items():
             with self.subTest(hours=hours):
                 self.assertEqual(_trend_mode(hours), mode)
                 self.assertEqual(_normalize_hourly_window([], hours, NOW).mode, mode)
 
-    def test_three_hour_aggregation_is_backward_and_strict_about_missing(self):
-        timestamps = [END - index * 3600 for index in range(6, -1, -1)]
-        values = [1, 2, 3, None, 5, 6, 7]
-        points = _aggregate_3h_points(timestamps, values)
-        self.assertEqual([item.value for item in points], [1.0, None, 6.0])
-        self.assertEqual(points[-1].source_end_ts, END)
-        trend = _normalize_hourly_window(
-            [point(offset, value) for offset, value in zip(range(-6, 1), values) if value is not None],
-            73,
-            NOW,
-        )
-        self.assertEqual(trend.stats.observed, 6)
-        self.assertEqual(trend.stats.average, 4.0)
+    def test_96_and_168_hour_windows_keep_raw_integer_points_and_missing_hours(self):
+        for hours in (96, 168):
+            missing_offsets = {-13, -2}
+            history = [
+                point(offset, (offset + hours) % 11)
+                for offset in range(-(hours - 1), 1)
+                if offset not in missing_offsets
+            ]
+            trend = _normalize_hourly_window(history, hours, NOW)
+
+            with self.subTest(hours=hours):
+                self.assertEqual(trend.mode, "line")
+                self.assertEqual(len(trend.timestamps), hours)
+                self.assertEqual(len(trend.points), hours)
+                self.assertEqual([item.value for item in trend.points], trend.values)
+                self.assertTrue(
+                    all(item.value is None or isinstance(item.value, int) for item in trend.points)
+                )
+                for offset in missing_offsets:
+                    index = offset + hours - 1
+                    self.assertIsNone(trend.values[index])
+                    self.assertIsNone(trend.points[index].value)
+                self.assertTrue(
+                    all(
+                        item.source_start_ts == item.ts == item.source_end_ts
+                        for item in trend.points
+                    )
+                )
 
     def test_168h_peak_annotation_uses_raw_hour_coordinate(self):
         history = [point(offset, 6) for offset in range(-167, 1)]
         for offset, value in ((-83, 0), (-82, 28), (-81, 0)):
             history[offset + 167] = point(offset, value)
         trend = _normalize_hourly_window(history, 168, NOW)
-        self.assertEqual(trend.mode, "area3h")
+        self.assertEqual(trend.mode, "line")
         self.assertEqual((trend.stats.peak_ts, trend.stats.peak), (END - 82 * 3600, 28))
-        aggregate = next(
-            item
-            for item in trend.points
-            if item.source_start_ts <= trend.stats.peak_ts <= item.source_end_ts
-        )
-        self.assertEqual(aggregate.value, 9.3)
+        peak_point = next(item for item in trend.points if item.ts == trend.stats.peak_ts)
+        self.assertEqual(peak_point.value, 28)
 
         bounds = (100.0, 20.0, 900.0, 320.0)
-        y_max, _, _ = _nice_y_axis(trend.values, trend.stats.average)
+        y_max, _, _ = _nice_y_axis(trend.values)
         raw_position = _raw_observation_position(
             trend.timestamps,
             trend.values,
@@ -150,17 +166,8 @@ class NormalizeTests(unittest.TestCase):
         raw_x, raw_y = raw_position
         expected_x = bounds[0] + 85 / 167 * (bounds[2] - bounds[0])
         self.assertAlmostEqual(raw_x, expected_x)
-
-        aggregate_x, aggregate_y = _plot_coordinate(
-            aggregate.ts,
-            aggregate.value,
-            trend.timestamps[0],
-            trend.timestamps[-1],
-            bounds,
-            y_max,
-        )
-        self.assertLess(raw_y, aggregate_y - 100)
-        self.assertNotAlmostEqual(raw_x, aggregate_x)
+        expected_y = bounds[3] - 28 / y_max * (bounds[3] - bounds[1])
+        self.assertAlmostEqual(raw_y, expected_y)
 
     def test_contiguous_segments_do_not_cross_missing(self):
         points = [
@@ -174,33 +181,49 @@ class NormalizeTests(unittest.TestCase):
         segments = _split_contiguous_segments(points)
         self.assertEqual([[point.ts for point in segment] for segment in segments], [[1, 2], [4], [6]])
 
-    def test_mini_point_plan_labels_up_to_24_and_keeps_real_zero(self):
-        points = [PlotPoint(index, None if index == 7 else index % 4) for index in range(24)]
-        plan = _mini_point_render_plan(points)
-        self.assertEqual(len(plan), 23)
-        self.assertNotIn(7, [index for index, _, _ in plan])
-        zero_entries = [(index, label) for index, point, label in plan if point.value == 0]
-        self.assertTrue(zero_entries)
-        self.assertTrue(all(label == "0" for _, label in zero_entries))
-        self.assertTrue(all(label is not None for _, _, label in plan))
+    def test_mini_chart_draws_nonzero_integer_ticks_as_even_dashed_grid(self):
+        values = [0, 1, 2, 3] * 6
+        trend = _normalize_hourly_window(
+            [point(offset, value) for offset, value in zip(range(-23, 1), values)],
+            24,
+            NOW,
+        )
+        image = Image.new("RGBA", (600, 180), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        font = draw.getfont()
 
-    def test_mini_point_plan_draws_all_markers_without_labels_over_24(self):
-        points = [PlotPoint(index, None if index in (5, 19) else index / 10) for index in range(25)]
-        plan = _mini_point_render_plan(points)
-        self.assertEqual([index for index, _, _ in plan], [index for index in range(25) if index not in (5, 19)])
-        self.assertTrue(all(label is None for _, _, label in plan))
+        with patch(
+            "data.plugins.astrbot_zhouyi_plugin.script.bar_chart._draw_dashed_line"
+        ) as draw_dashed_line:
+            _draw_mini_chart(
+                draw,
+                trend,
+                (100, 20, 500, 165),
+                axis_font=font,
+                label_font=font,
+                empty_font=font,
+                scale=1,
+            )
 
-    def test_plot_value_format_uses_integer_or_one_decimal(self):
-        self.assertEqual(_format_plot_value(3.0), "3")
-        self.assertEqual(_format_plot_value(2.25), "2.2")
-        self.assertEqual(_format_plot_value(2.26), "2.3")
+        self.assertEqual(draw_dashed_line.call_count, 3)
+        grid_y = [item.args[1][1] for item in draw_dashed_line.call_args_list]
+        self.assertAlmostEqual(grid_y[0] - grid_y[1], grid_y[1] - grid_y[2])
 
-    def test_nice_axis_uses_integer_125_step_and_covers_values(self):
-        for values in ([0], [1], [17], [99], [1234]):
+    def test_nice_axis_low_range_uses_only_integer_ticks(self):
+        y_max, step, ticks = _nice_y_axis([0, 1, None, 2, 3])
+        self.assertEqual((y_max, step, ticks), (3, 1, [0, 1, 2, 3]))
+        self.assertTrue(all(isinstance(item, int) and item >= 0 for item in ticks))
+
+    def test_nice_axis_high_range_uses_regular_integer_step(self):
+        y_max, step, ticks = _nice_y_axis([0, 7, None, 13, 24])
+        self.assertEqual((y_max, step, ticks), (25, 5, [0, 5, 10, 15, 20, 25]))
+
+    def test_nice_axis_integer_125_step_covers_larger_values(self):
+        for values in ([17], [99], [1234]):
             with self.subTest(values=values):
-                y_max, step, ticks = _nice_y_axis(values, sum(values) / len(values))
+                y_max, step, ticks = _nice_y_axis(values)
                 self.assertGreaterEqual(y_max, max(values))
-                self.assertTrue(all(isinstance(item, int) for item in ticks))
+                self.assertTrue(all(isinstance(item, int) and item >= 0 for item in ticks))
                 self.assertGreaterEqual(len(ticks) - 1, 4)
                 self.assertLessEqual(len(ticks) - 1, 6)
                 normalized = step / (10 ** int(len(str(step)) - 1))
@@ -231,6 +254,33 @@ class RenderTests(unittest.TestCase):
         image = decode_png(value)
         self.assertEqual(image.size, (960, 540))
         self.assertEqual((self.background.mode, self.background.size, self.background.tobytes()), before)
+
+    def test_generated_images_cover_24_48_96_and_168_hours(self):
+        history = [
+            point(offset, (offset + 168) % 25)
+            for offset in range(-167, 1)
+            if offset != -5
+        ]
+        server = ServerTrendInput("1", "Alpha", history)
+        for hours in (24, 48, 96, 168):
+            with self.subTest(hours=hours):
+                detail = decode_png(
+                    generate_bar_chart_image(
+                        history,
+                        "Alpha",
+                        hours=hours,
+                        background=self.background,
+                        now_ts=NOW,
+                    )
+                )
+                summary = generate_summary_chart_images(
+                    [server],
+                    hours=hours,
+                    background=self.background,
+                    now_ts=NOW,
+                )
+                self.assertEqual(detail.size, (960, 540))
+                self.assertEqual([decode_png(value).size for value in summary], [(1600, 500)])
 
     def test_detail_handles_empty_long_name_and_real_zero(self):
         for history, name in (
