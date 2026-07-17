@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 
 CARD_BG = (22, 28, 43)
@@ -225,6 +225,150 @@ def _split_contiguous_segments(points: Sequence[PlotPoint]) -> list[list[PlotPoi
     return segments
 
 
+def _draw_antialiased_line(
+    draw: ImageDraw.ImageDraw,
+    points: Sequence[tuple[float, float]],
+    *,
+    fill: object,
+    width: int,
+    joint: str = "curve",
+    supersampling: int = 4,
+) -> None:
+    """在局部透明层上超采样绘线；不可合成时退回普通折线。"""
+    coordinates = list(points)
+    line_width = max(1, int(width))
+
+    def draw_fallback() -> None:
+        draw.line(coordinates, fill=fill, width=line_width, joint=joint)
+
+    target = getattr(draw, "_image", None)
+    if len(coordinates) < 2 or not isinstance(target, Image.Image) or target.mode != "RGBA":
+        draw_fallback()
+        return
+
+    try:
+        numeric_points = [(float(x), float(y)) for x, y in coordinates]
+        if any(not math.isfinite(value) for point in numeric_points for value in point):
+            draw_fallback()
+            return
+
+        scale = max(2, int(supersampling))
+        margin = math.ceil(line_width / 2) + 3
+        left = max(0, math.floor(min(x for x, _ in numeric_points) - margin))
+        top = max(0, math.floor(min(y for _, y in numeric_points) - margin))
+        right = min(target.width, math.ceil(max(x for x, _ in numeric_points) + margin) + 1)
+        bottom = min(target.height, math.ceil(max(y for _, y in numeric_points) + margin) + 1)
+        if right <= left or bottom <= top:
+            draw_fallback()
+            return
+
+        local_size = (right - left, bottom - top)
+        high_resolution = Image.new(
+            "RGBA",
+            (local_size[0] * scale, local_size[1] * scale),
+            (0, 0, 0, 0),
+        )
+        high_resolution_points = [
+            ((x - left) * scale, (y - top) * scale)
+            for x, y in numeric_points
+        ]
+        ImageDraw.Draw(high_resolution).line(
+            high_resolution_points,
+            fill=fill,
+            width=line_width * scale,
+            joint=joint,
+        )
+        antialiased = high_resolution.resize(local_size, Image.Resampling.LANCZOS)
+        composited = Image.alpha_composite(target.crop((left, top, right, bottom)), antialiased)
+        target.paste(composited, (left, top))
+    except (AttributeError, OSError, TypeError, ValueError):
+        draw_fallback()
+
+
+def _monotone_smooth_path(
+    points: Sequence[tuple[float, float]],
+    subdivisions: int = 5,
+) -> list[tuple[float, float]]:
+    """用单调三次 Hermite 插值细分折线，不越过任一相邻端点范围。"""
+    original = list(points)
+    if len(original) < 3:
+        return original
+
+    coordinates = [(float(x), float(y)) for x, y in original]
+    if any(not math.isfinite(value) for point in coordinates for value in point):
+        return original
+    if any(coordinates[index + 1][0] <= coordinates[index][0] for index in range(len(coordinates) - 1)):
+        return original
+
+    interval_widths = [
+        coordinates[index + 1][0] - coordinates[index][0]
+        for index in range(len(coordinates) - 1)
+    ]
+    slopes = [
+        (coordinates[index + 1][1] - coordinates[index][1]) / interval_widths[index]
+        for index in range(len(coordinates) - 1)
+    ]
+    tangents = [0.0] * len(coordinates)
+    for index in range(1, len(coordinates) - 1):
+        previous_slope = slopes[index - 1]
+        next_slope = slopes[index]
+        if previous_slope == 0.0 or next_slope == 0.0 or previous_slope * next_slope <= 0.0:
+            continue
+        previous_width = interval_widths[index - 1]
+        next_width = interval_widths[index]
+        first_weight = 2.0 * next_width + previous_width
+        second_weight = next_width + 2.0 * previous_width
+        tangents[index] = (first_weight + second_weight) / (
+            first_weight / previous_slope + second_weight / next_slope
+        )
+
+    def endpoint_tangent(first_width: float, second_width: float, first_slope: float, second_slope: float) -> float:
+        tangent = ((2.0 * first_width + second_width) * first_slope - first_width * second_slope) / (
+            first_width + second_width
+        )
+        if tangent * first_slope <= 0.0:
+            return 0.0
+        if first_slope * second_slope < 0.0 and abs(tangent) > 3.0 * abs(first_slope):
+            return 3.0 * first_slope
+        return tangent
+
+    tangents[0] = endpoint_tangent(
+        interval_widths[0], interval_widths[1], slopes[0], slopes[1]
+    )
+    tangents[-1] = endpoint_tangent(
+        interval_widths[-1], interval_widths[-2], slopes[-1], slopes[-2]
+    )
+
+    steps = max(1, int(subdivisions))
+    smoothed: list[tuple[float, float]] = [original[0]]
+    for index in range(len(coordinates) - 1):
+        x0, y0 = coordinates[index]
+        x1, y1 = coordinates[index + 1]
+        width = interval_widths[index]
+        lower_y = min(y0, y1)
+        upper_y = max(y0, y1)
+        for step in range(1, steps + 1):
+            if step == steps:
+                smoothed.append(original[index + 1])
+                continue
+            ratio = step / steps
+            ratio_squared = ratio * ratio
+            ratio_cubed = ratio_squared * ratio
+            first_basis = 2.0 * ratio_cubed - 3.0 * ratio_squared + 1.0
+            second_basis = ratio_cubed - 2.0 * ratio_squared + ratio
+            third_basis = -2.0 * ratio_cubed + 3.0 * ratio_squared
+            fourth_basis = ratio_cubed - ratio_squared
+            y = (
+                first_basis * y0
+                + second_basis * width * tangents[index]
+                + third_basis * y1
+                + fourth_basis * width * tangents[index + 1]
+            )
+            x = x0 + ratio * width
+            smoothed.append((x, max(lower_y, min(upper_y, y))))
+    return smoothed
+
+
 def _nice_number(value: float, *, ceil_value: bool) -> float:
     if value <= 0:
         return 1.0
@@ -303,12 +447,51 @@ def _make_fallback_background(size: tuple[int, int]) -> Image.Image:
 def _prepare_canvas(
     background: Optional[Image.Image],
     size: tuple[int, int],
+    dark_overlay_alpha: int = 105,
 ) -> Image.Image:
     source = background.copy() if background is not None else _make_fallback_background(size)
     canvas = ImageOps.fit(source.convert("RGB"), size, method=Image.Resampling.LANCZOS)
     canvas = canvas.convert("RGBA")
-    canvas = Image.alpha_composite(canvas, Image.new("RGBA", size, (3, 8, 18, 105)))
+    parsed_alpha = _coerce_int(dark_overlay_alpha)
+    overlay_alpha = max(0, min(255, 105 if parsed_alpha is None else parsed_alpha))
+    canvas = Image.alpha_composite(
+        canvas,
+        Image.new("RGBA", size, (3, 8, 18, overlay_alpha)),
+    )
     return canvas
+
+
+def _apply_rounded_blur(
+    image: Image.Image,
+    bounds: tuple[int, int, int, int],
+    *,
+    radius: int,
+    blur_radius: float,
+) -> None:
+    """仅在给定圆角区域内原位应用高斯模糊。"""
+    left, top, right, bottom = (int(value) for value in bounds)
+    left = max(0, min(image.width, left))
+    top = max(0, min(image.height, top))
+    right = max(left, min(image.width - 1, right))
+    bottom = max(top, min(image.height - 1, bottom))
+    width = right - left + 1
+    height = bottom - top + 1
+    if width <= 1 or height <= 1:
+        return
+
+    normalized_blur = max(0.0, float(blur_radius))
+    if normalized_blur == 0.0:
+        return
+    normalized_radius = max(0, min(int(radius), width // 2, height // 2))
+    region = image.crop((left, top, right + 1, bottom + 1))
+    blurred = region.filter(ImageFilter.GaussianBlur(radius=normalized_blur))
+    mask = Image.new("L", region.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, width - 1, height - 1),
+        radius=normalized_radius,
+        fill=255,
+    )
+    image.paste(blurred, (left, top), mask)
 
 
 def _paste_logo(
@@ -465,7 +648,13 @@ def _draw_plot(
                 y = y_at(float(point.value))
                 coordinates.append((x, y))
             if len(coordinates) >= 2:
-                draw.line(coordinates, fill=ACCENT, width=3, joint="curve")
+                _draw_antialiased_line(
+                    draw,
+                    _monotone_smooth_path(coordinates),
+                    fill=ACCENT,
+                    width=3,
+                    joint="curve",
+                )
 
     labels = _select_x_axis_labels(trend.timestamps)
     planned_labels: list[tuple[str, float, int]] = []
@@ -862,7 +1051,13 @@ def _draw_mini_chart(
     for segment in _split_contiguous_segments(trend.points):
         coordinates = [coordinate(point) for point in segment]
         if len(coordinates) >= 2:
-            draw.line(coordinates, fill=ACCENT, width=line_width, joint="curve")
+            _draw_antialiased_line(
+                draw,
+                _monotone_smooth_path(coordinates),
+                fill=ACCENT,
+                width=line_width,
+                joint="curve",
+            )
 
 def _draw_summary_server_card(
     draw: ImageDraw.ImageDraw,
@@ -874,13 +1069,27 @@ def _draw_summary_server_card(
     font_sizes: dict[str, int],
 ) -> None:
     left, top, right, bottom = card_bounds
-    draw.rounded_rectangle(
-        card_bounds,
-        radius=_scaled(17, scale),
-        fill=(6, 13, 26, 242),
-        outline=(255, 255, 255, 56),
-        width=_scaled(1, scale),
-    )
+    card_width = right - left + 1
+    card_height = bottom - top + 1
+    target = getattr(draw, "_image", None)
+    if isinstance(target, Image.Image) and target.mode == "RGBA" and card_width > 0 and card_height > 0:
+        glass = Image.new("RGBA", (card_width, card_height), (0, 0, 0, 0))
+        ImageDraw.Draw(glass).rounded_rectangle(
+            (0, 0, card_width - 1, card_height - 1),
+            radius=_scaled(17, scale),
+            fill=(6, 13, 26, 155),
+            outline=(255, 255, 255, 72),
+            width=_scaled(1, scale),
+        )
+        target.alpha_composite(glass, (left, top))
+    else:
+        draw.rounded_rectangle(
+            card_bounds,
+            radius=_scaled(17, scale),
+            fill=(6, 13, 26),
+            outline=(255, 255, 255),
+            width=_scaled(1, scale),
+        )
     left_region, middle_region, right_region = _summary_card_regions(card_bounds, scale)
     separator_offset = _scaled(8, scale)
     for separator_x in (left_region[2] + separator_offset, middle_region[2] + separator_offset):
@@ -1070,10 +1279,14 @@ def generate_summary_chart_images(
             width=canvas_width,
             height=height,
         )
-        canvas = _prepare_canvas(background, (canvas_width, page_height))
+        canvas = _prepare_canvas(
+            background,
+            (canvas_width, page_height),
+            dark_overlay_alpha=35,
+        )
         canvas = Image.alpha_composite(
             canvas,
-            Image.new("RGBA", (canvas_width, page_height), (2, 7, 16, 92)),
+            Image.new("RGBA", (canvas_width, page_height), (2, 7, 16, 15)),
         )
         overlay = Image.new("RGBA", (canvas_width, page_height), (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
@@ -1086,7 +1299,7 @@ def generate_summary_chart_images(
                 page_height - _scaled(10, scale),
             ),
             radius=_scaled(28, scale),
-            fill=(3, 9, 20, 128),
+            fill=(3, 9, 20, 60),
             outline=(255, 255, 255, 92),
             width=_scaled(1, scale),
         )
@@ -1170,6 +1383,12 @@ def generate_summary_chart_images(
         )
 
         for bounds, server in zip(card_bounds, page_servers):
+            _apply_rounded_blur(
+                canvas,
+                bounds,
+                radius=_scaled(17, scale),
+                blur_radius=4.0 * scale,
+            )
             trend = _normalize_hourly_window(server.history, hours, now_ts=now_ts)
             _draw_summary_server_card(
                 draw,

@@ -17,9 +17,13 @@ if str(ASTRBOT_ROOT) not in sys.path:
 from data.plugins.astrbot_zhouyi_plugin.script.bar_chart import (
     PlotPoint,
     ServerTrendInput,
+    _apply_rounded_blur,
+    _draw_antialiased_line,
     _draw_mini_chart,
+    _monotone_smooth_path,
     _nice_y_axis,
     _normalize_hourly_window,
+    _prepare_canvas,
     _raw_observation_position,
     _select_x_axis_labels,
     _split_contiguous_segments,
@@ -48,6 +52,78 @@ def decode_png(value: str) -> Image.Image:
     with Image.open(io.BytesIO(data)) as image:
         image.load()
         return image.copy()
+
+
+class AntialiasedLineTests(unittest.TestCase):
+    def test_rgba_canvas_receives_antialiased_line_pixels(self):
+        image = Image.new("RGBA", (48, 40), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+
+        _draw_antialiased_line(
+            draw,
+            [(4.0, 34.0), (23.0, 4.0), (43.0, 31.0)],
+            fill=(91, 238, 177, 255),
+            width=3,
+        )
+
+        self.assertIsNotNone(image.getbbox())
+        alpha_histogram = image.getchannel("A").histogram()
+        self.assertTrue(any(alpha_histogram[alpha] for alpha in range(1, 255)))
+
+    def test_non_rgba_and_short_paths_fall_back_without_error(self):
+        rgb_image = Image.new("RGB", (24, 24), (0, 0, 0))
+        _draw_antialiased_line(
+            ImageDraw.Draw(rgb_image),
+            [(2.0, 20.0), (21.0, 3.0)],
+            fill=(91, 238, 177, 255),
+            width=2,
+        )
+        self.assertIsNotNone(rgb_image.getbbox())
+
+        rgba_image = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
+        rgba_draw = ImageDraw.Draw(rgba_image)
+        for points in ([], [(5.0, 5.0)]):
+            with self.subTest(points=points):
+                _draw_antialiased_line(
+                    rgba_draw,
+                    points,
+                    fill=(91, 238, 177, 255),
+                    width=2,
+                )
+
+
+class SmoothPathTests(unittest.TestCase):
+    def test_keeps_endpoints_and_every_original_point(self):
+        points = [(0.0, 2.0), (1.0, 7.0), (2.0, 3.0), (3.0, 9.0)]
+        smoothed = _monotone_smooth_path(points, subdivisions=5)
+        self.assertEqual(len(smoothed), 16)
+        self.assertEqual(smoothed[0], points[0])
+        self.assertEqual(smoothed[-1], points[-1])
+        self.assertEqual(smoothed[::5], points)
+
+    def test_each_interval_stays_within_its_endpoint_values(self):
+        points = [(0.0, 0.0), (1.0, 10.0), (2.0, 1.0), (4.0, 8.0)]
+        subdivisions = 6
+        smoothed = _monotone_smooth_path(points, subdivisions=subdivisions)
+        for index, (start, end) in enumerate(zip(points, points[1:])):
+            interval = smoothed[index * subdivisions : (index + 1) * subdivisions + 1]
+            lower = min(start[1], end[1])
+            upper = max(start[1], end[1])
+            self.assertTrue(all(lower <= y <= upper for _, y in interval))
+
+    def test_flat_interval_does_not_drift(self):
+        points = [(0.0, 1.0), (1.0, 4.0), (2.0, 4.0), (3.0, 2.0)]
+        subdivisions = 5
+        smoothed = _monotone_smooth_path(points, subdivisions=subdivisions)
+        flat_interval = smoothed[subdivisions : subdivisions * 2 + 1]
+        self.assertTrue(all(y == 4.0 for _, y in flat_interval))
+
+    def test_short_or_invalid_x_input_returns_original_polyline(self):
+        for points in ([], [(0.0, 1.0)], [(0.0, 1.0), (1.0, 2.0)]):
+            with self.subTest(points=points):
+                self.assertEqual(_monotone_smooth_path(points), points)
+        duplicate_x = [(0.0, 1.0), (1.0, 3.0), (1.0, 2.0)]
+        self.assertEqual(_monotone_smooth_path(duplicate_x), duplicate_x)
 
 
 class NormalizeTests(unittest.TestCase):
@@ -235,6 +311,96 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(labels[0][0], 0)
         self.assertEqual(labels[-1][0], len(timestamps) - 1)
         self.assertTrue(all("-" in label for _, label in labels))
+
+
+class RoundedBlurTests(unittest.TestCase):
+    def test_blur_changes_only_pixels_inside_rounded_mask(self):
+        image = Image.new("RGBA", (24, 20), (0, 0, 0, 255))
+        pixels = image.load()
+        for y in range(image.height):
+            for x in range(image.width):
+                value = 240 if (x + y) % 2 else 20
+                pixels[x, y] = (value, 255 - value, value // 2, 255)
+        before = image.copy()
+        bounds = (4, 3, 19, 16)
+        radius = 5
+
+        _apply_rounded_blur(
+            image,
+            bounds,
+            radius=radius,
+            blur_radius=2.0,
+        )
+
+        mask = Image.new("L", (bounds[2] - bounds[0] + 1, bounds[3] - bounds[1] + 1), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, mask.width - 1, mask.height - 1),
+            radius=radius,
+            fill=255,
+        )
+        changed_inside = False
+        for y in range(image.height):
+            for x in range(image.width):
+                inside_bounds = bounds[0] <= x <= bounds[2] and bounds[1] <= y <= bounds[3]
+                inside_mask = inside_bounds and mask.getpixel((x - bounds[0], y - bounds[1])) != 0
+                if inside_mask:
+                    changed_inside |= image.getpixel((x, y)) != before.getpixel((x, y))
+                else:
+                    self.assertEqual(image.getpixel((x, y)), before.getpixel((x, y)))
+        self.assertTrue(changed_inside)
+
+
+class CanvasPreparationTests(unittest.TestCase):
+    def setUp(self):
+        self.background = Image.new("RGB", (8, 6), (100, 150, 200))
+        self.size = (8, 6)
+
+    def test_default_overlay_alpha_remains_105(self):
+        default_canvas = _prepare_canvas(self.background, self.size)
+        explicit_canvas = _prepare_canvas(
+            self.background,
+            self.size,
+            dark_overlay_alpha=105,
+        )
+        self.assertEqual(default_canvas.tobytes(), explicit_canvas.tobytes())
+
+    def test_optional_overlay_alpha_changes_only_darkening_strength(self):
+        default_pixel = _prepare_canvas(self.background, self.size).getpixel((0, 0))
+        lighter_pixel = _prepare_canvas(
+            self.background,
+            self.size,
+            dark_overlay_alpha=40,
+        ).getpixel((0, 0))
+        self.assertEqual(lighter_pixel[3], 255)
+        self.assertGreater(sum(lighter_pixel[:3]), sum(default_pixel[:3]))
+
+    def test_overlay_alpha_is_clamped_and_invalid_value_uses_default(self):
+        zero_canvas = _prepare_canvas(
+            self.background,
+            self.size,
+            dark_overlay_alpha=0,
+        )
+        negative_canvas = _prepare_canvas(
+            self.background,
+            self.size,
+            dark_overlay_alpha=-20,
+        )
+        oversized_canvas = _prepare_canvas(
+            self.background,
+            self.size,
+            dark_overlay_alpha=999,
+        )
+        invalid_canvas = _prepare_canvas(
+            self.background,
+            self.size,
+            dark_overlay_alpha=None,
+        )
+        default_canvas = _prepare_canvas(self.background, self.size)
+
+        self.assertEqual(zero_canvas.tobytes(), negative_canvas.tobytes())
+        self.assertEqual(zero_canvas.getpixel((0, 0)), (100, 150, 200, 255))
+        self.assertEqual(oversized_canvas.getpixel((0, 0)), (3, 8, 18, 255))
+        self.assertEqual(invalid_canvas.tobytes(), default_canvas.tobytes())
 
 
 class RenderTests(unittest.TestCase):
