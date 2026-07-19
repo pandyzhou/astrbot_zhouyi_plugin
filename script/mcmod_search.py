@@ -513,6 +513,30 @@ def _normalize_recipe_source(href: str, source_url: str) -> str | None:
     return f"https://www.mcmod.cn{parsed.path}"
 
 
+def _normalize_recipe_icon_url(src: Any, source_url: str) -> str | None:
+    if not isinstance(src, str) or not src.strip():
+        return None
+    try:
+        parsed = urlparse(urljoin(source_url, src.strip()))
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.hostname != "i.mcmod.cn" or port is not None:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if parsed.params or parsed.query or parsed.fragment:
+        return None
+    if not parsed.path.startswith("/item/icon/"):
+        return None
+    return f"https://i.mcmod.cn{parsed.path}"
+
+
 def _parse_recipe_entry(node: Tag, source_url: str) -> dict | None:
     anchor = node.select_one("a[href]")
     if anchor is None:
@@ -544,6 +568,20 @@ def _recipe_variant_names(gui: Tag, source_url: str) -> dict[str, list[str]]:
     return variants
 
 
+def _recipe_icons(gui: Tag, source_url: str) -> dict[str, str]:
+    icons: dict[str, str] = {}
+    for node in gui.select(".item-table-hover"):
+        anchor = node.select_one("a[href]")
+        image = node.select_one("img[src]")
+        if anchor is None or image is None:
+            continue
+        source = _normalize_recipe_source(str(anchor.get("href", "")), source_url)
+        icon_url = _normalize_recipe_icon_url(image.get("src"), source_url)
+        if source is not None and icon_url is not None:
+            icons.setdefault(source, icon_url)
+    return icons
+
+
 def _longest_common_suffix(names: list[str]) -> str:
     if len(names) < 2:
         return ""
@@ -567,6 +605,39 @@ def _friendly_recipe_name(
     if len(common_suffix) >= 2:
         return f"任意{common_suffix}"
     return name
+
+
+def _extract_recipe_grid_slots(
+    gui: Tag,
+    source_url: str,
+    material_labels: dict[str, str],
+    material_icons: dict[str, str],
+) -> list[list[dict | None]] | None:
+    table_block = gui.select_one(".TableBlock")
+    if table_block is None or "bg/1.gif" not in str(table_block.get("style", "")):
+        return None
+
+    grid: list[list[dict | None]] = [[None for _ in range(3)] for _ in range(3)]
+    found = False
+    for node in table_block.select(".item-table-hover[style]"):
+        position = _RECIPE_POSITION_PATTERN.search(str(node.get("style", "")))
+        anchor = node.select_one("a[href]")
+        if position is None or anchor is None:
+            continue
+        row = _RECIPE_GRID_Y.get(int(position.group(1)))
+        column = _RECIPE_GRID_X.get(int(position.group(2)))
+        source = _normalize_recipe_source(str(anchor.get("href", "")), source_url)
+        if row is None or column is None or source not in material_labels:
+            continue
+        if grid[row][column] is not None:
+            continue
+        grid[row][column] = {
+            "name": material_labels[source],
+            "source": source,
+            "icon_url": material_icons.get(source),
+        }
+        found = True
+    return grid if found else None
 
 
 def _extract_recipe_grid(
@@ -633,33 +704,113 @@ def _extract_item_recipes(soup: BeautifulSoup, source_url: str) -> list[dict]:
             continue
 
         variants = _recipe_variant_names(gui_cell, source_url)
+        icons = _recipe_icons(gui_cell, source_url)
         for material in materials:
             material["name"] = _friendly_recipe_name(
                 material["name"], material["source"], variants
             )
+            material["icon_url"] = icons.get(material["source"])
+        output["icon_url"] = icons.get(output["source"])
         material_labels = {
             material["source"]: material["name"] for material in materials
         }
         grid = _extract_recipe_grid(gui_cell, source_url, material_labels)
+        grid_slots = _extract_recipe_grid_slots(
+            gui_cell,
+            source_url,
+            material_labels,
+            icons,
+        )
 
         conditions: list[str] = []
+        required_mods: list[str] = []
+        availability = "active"
         remarks = row.select_one("td.item-table-remarks")
         if remarks is not None:
+            if remarks.select_one(".alert-table-endver") is not None:
+                availability = "removed"
+            addon_notice = remarks.select_one(".alert-table-forother")
+            if addon_notice is not None:
+                for link in addon_notice.select("a[href]"):
+                    mod_name = _clean_text(link.get_text(" ", strip=True))
+                    if mod_name and mod_name not in required_mods:
+                        required_mods.append(mod_name)
             for node in remarks.select(".alert, .remark"):
                 condition = _clean_text(node.get_text(" ", strip=True))
                 if condition and condition not in conditions:
                     conditions.append(condition)
+                if "被移除" in condition:
+                    availability = "removed"
 
         recipes.append(
             {
                 "method": method or None,
                 "materials": materials,
                 "grid": grid,
+                "grid_slots": grid_slots,
                 "output": output,
                 "conditions": conditions,
+                "availability": availability,
+                "required_mods": required_mods,
             }
         )
     return recipes
+
+
+def _question_mentions_mod(question: str, mod_name: str) -> bool:
+    if not mod_name:
+        return False
+    if re.fullmatch(r"[A-Za-z0-9_.+ -]+", mod_name):
+        return bool(
+            re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(mod_name)}(?![A-Za-z0-9_])",
+                question,
+                re.IGNORECASE,
+            )
+        )
+    return mod_name in question
+
+
+def _has_reliable_crafting_grid(recipe: Any) -> bool:
+    if not isinstance(recipe, dict) or recipe.get("availability") == "removed":
+        return False
+    method = recipe.get("method")
+    if not isinstance(method, str) or "工作台" not in method:
+        return False
+    output = recipe.get("output")
+    if not isinstance(output, dict) or not output.get("name"):
+        return False
+    grid_slots = recipe.get("grid_slots")
+    if not isinstance(grid_slots, list) or len(grid_slots) != 3:
+        return False
+    if any(not isinstance(row, list) or len(row) != 3 for row in grid_slots):
+        return False
+    return any(isinstance(slot, dict) and slot.get("name") for row in grid_slots for slot in row)
+
+
+def select_recipe_for_image(recipes: Any, question: str) -> dict | None:
+    """选择适合生成图片的当前工作台配方，不猜测缺失布局。"""
+    if not isinstance(recipes, list) or not isinstance(question, str):
+        return None
+
+    candidates: list[tuple[int, int, dict]] = []
+    for index, recipe in enumerate(recipes):
+        if not _has_reliable_crafting_grid(recipe):
+            continue
+        required_mods = recipe.get("required_mods")
+        if not isinstance(required_mods, list):
+            required_mods = []
+        required_mods = [name for name in required_mods if isinstance(name, str) and name]
+        mentioned = any(_question_mentions_mod(question, name) for name in required_mods)
+        if required_mods and not mentioned:
+            continue
+        priority = 0 if mentioned else 1
+        candidates.append((priority, index, recipe))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2]
 
 
 def parse_item_detail_html(
@@ -723,6 +874,11 @@ def parse_item_detail_html(
         introduction = introduction[: max_intro_length - 1].rstrip() + "…"
 
     recipes = _extract_item_recipes(soup, source_url)
+    detail_icon_url = _extract_icon_url(soup, source_url)
+    for recipe in recipes:
+        output = recipe.get("output")
+        if isinstance(output, dict) and not output.get("icon_url"):
+            output["icon_url"] = detail_icon_url
     if not title or (not introduction and not recipes):
         return "parse_error", None
 
@@ -733,7 +889,7 @@ def parse_item_detail_html(
         "attributes": attributes,
         "introduction": introduction,
         "recipes": recipes,
-        "icon_url": _extract_icon_url(soup, source_url),
+        "icon_url": detail_icon_url,
         "source_url": source_url,
     }
     return "success", detail

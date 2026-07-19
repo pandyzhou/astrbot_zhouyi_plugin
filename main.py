@@ -18,7 +18,9 @@ from .script.mcmod_search import (
     format_mcmod_qq_plain_text,
     get_mcmod_item_detail,
     search_mcmod,
+    select_recipe_for_image,
 )
+from .script.mcmod_recipe_image import render_recipe_image_base64
 from .script.bar_chart import (
     ServerTrendInput,
     generate_bar_chart_image,
@@ -64,6 +66,7 @@ _migrate_memory_config()
 _GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _MEMORY_DISABLED_MESSAGE = "长期记忆功能未启用，请在插件配置中开启 memory.enabled。"
 _MEMORY_UNAVAILABLE_MESSAGE = "长期记忆后端启动失败，请检查插件日志。"
+MCMOD_RECIPE_IMAGE_EXTRA_KEY = "mcmod_recipe_image_payload"
 _MCMOD_CRAFTING_QUERY_RE = re.compile(
     r"(?:怎么|如何|怎样).{0,8}(?:制作|合成|做)|(?:制作|合成)(?:方法|方式|配方)?|配方"
 )
@@ -117,6 +120,31 @@ def _mcmod_tool_was_used(event: AstrMessageEvent | None) -> bool:
         return False
 
 
+def _set_mcmod_recipe_payload(
+    event: AstrMessageEvent | None,
+    payload: dict[str, Any] | None,
+) -> None:
+    set_extra = getattr(event, "set_extra", None)
+    if not callable(set_extra):
+        return
+    try:
+        set_extra(MCMOD_RECIPE_IMAGE_EXTRA_KEY, payload)
+    except Exception:
+        logger.debug("无法保存 MC百科配方图片载荷", exc_info=True)
+
+
+def _get_mcmod_recipe_payload(event: AstrMessageEvent | None) -> dict[str, Any] | None:
+    get_extra = getattr(event, "get_extra", None)
+    if not callable(get_extra):
+        return None
+    try:
+        payload = get_extra(MCMOD_RECIPE_IMAGE_EXTRA_KEY, None)
+    except Exception:
+        logger.debug("无法读取 MC百科配方图片载荷", exc_info=True)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _format_mcmod_reply_for_event(
     event: AstrMessageEvent | None,
     text: str,
@@ -161,7 +189,7 @@ mchelp
     "astrbot_zhouyi_plugin",
     "薄暝",
     "查询 Minecraft 服务器与在线趋势，提供 MC百科 LLM 搜索和 长期记忆 Memory。",
-    "0.3.1",
+    "0.3.2",
 )
 class MyPlugin(Star):
     """Minecraft 管理与 长期记忆 Memory插件。"""
@@ -237,6 +265,23 @@ class MyPlugin(Star):
         for component in chain:
             if isinstance(component, Comp.Plain) and component.text:
                 component.text = _format_mcmod_reply_for_event(event, component.text)
+
+        payload = _get_mcmod_recipe_payload(event)
+        if payload is None:
+            return
+        source_url = payload.get("source_url")
+        if not isinstance(source_url, str) or not source_url:
+            return
+        try:
+            image_base64 = await render_recipe_image_base64(payload)
+            if not image_base64:
+                return
+            image_component = Comp.Image.fromBase64(image_base64)
+            source_component = Comp.Plain(f"来源：{source_url}")
+        except Exception as exc:
+            logger.warning("MC百科配方图片生成失败，保留纯文本：%s", type(exc).__name__)
+            return
+        result.chain = [image_component, source_component]
 
     @filter.after_message_sent()
     async def handle_after_message_sent(
@@ -480,8 +525,24 @@ class MyPlugin(Star):
                 "content_is_untrusted": True,
             }
         result.setdefault("reply_instruction", QQ_PLAIN_TEXT_REPLY_INSTRUCTION)
+        _set_mcmod_recipe_payload(event, None)
         if _is_mcmod_crafting_only_question(event):
             result["answer_scope"] = _MCMOD_CRAFTING_ONLY_SCOPE
+            detail = result.get("detail")
+            recipes = detail.get("recipes") if isinstance(detail, dict) else None
+            selected_recipe = select_recipe_for_image(
+                recipes,
+                getattr(event, "message_str", ""),
+            )
+            if selected_recipe is not None:
+                _set_mcmod_recipe_payload(
+                    event,
+                    {
+                        "title": detail.get("title") or selected_recipe["output"].get("name"),
+                        "source_url": result.get("source_url") or url,
+                        "recipe": selected_recipe,
+                    },
+                )
         return json.dumps(result, ensure_ascii=False)
 
     @filter.on_plugin_loaded()

@@ -4,6 +4,6 @@ desc: 周易自用 Minecraft 管理、MC百科 LLM 搜索与长期记忆 Memory 
 support_platforms:
   - aiocqhttp
   - telegram
-version: v0.3.1 # 插件版本号。格式：v1.1.1 或者 v1.1
+version: v0.3.2 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: pandyzhou # 作者
 repo: https://github.com/pandyzhou/astrbot_zhouyi_plugin # 插件的仓库地址

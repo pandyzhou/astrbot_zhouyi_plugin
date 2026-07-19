@@ -71,7 +71,7 @@ class MainMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         register_call = register_calls[0]
         self.assertEqual(register_call.args[0].value, "astrbot_zhouyi_plugin")
         self.assertIn("长期记忆", register_call.args[2].value)
-        self.assertEqual(register_call.args[3].value, "0.3.1")
+        self.assertEqual(register_call.args[3].value, "0.3.2")
 
         migration_call = next(
             node

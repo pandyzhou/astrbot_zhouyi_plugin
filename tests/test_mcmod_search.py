@@ -82,18 +82,18 @@ RECIPE_DETAIL_HTML = """
     <td class="text item-table-gui">
       <div class="TableBlock" style="background-image:url(//i.mcmod.cn/gui/bg/1.gif);">
         <div class="common-oredict-loop">
-          <div class="item-table-hover" style="margin:34px 0 0 46px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板"/></a></div>
-          <div class="item-table-hover" style="margin:34px 0 0 46px;"><a href="/oredict/minecraft:planks-1.html"><img alt="云杉木板"/></a></div>
+          <div class="item-table-hover" style="margin:34px 0 0 46px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板" src="//i.mcmod.cn/item/icon/32x32/0/40.png"/></a></div>
+          <div class="item-table-hover" style="margin:34px 0 0 46px;"><a href="/oredict/minecraft:planks-1.html"><img alt="云杉木板" src="//i.mcmod.cn/item/icon/32x32/1/10967.png"/></a></div>
         </div>
-        <div class="item-table-hover" style="margin:34px 0 0 82px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板"/></a></div>
-        <div class="item-table-hover" style="margin:34px 0 0 118px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板"/></a></div>
-        <div class="item-table-hover" style="margin:70px 0 0 46px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板"/></a></div>
-        <div class="item-table-hover" style="margin:70px 0 0 82px;"><a href="/item/196521.html"><img alt="传动杆"/></a></div>
-        <div class="item-table-hover" style="margin:70px 0 0 118px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板"/></a></div>
-        <div class="item-table-hover" style="margin:106px 0 0 46px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板"/></a></div>
-        <div class="item-table-hover" style="margin:106px 0 0 82px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板"/></a></div>
-        <div class="item-table-hover" style="margin:106px 0 0 118px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板"/></a></div>
-        <div class="item-table-hover" style="margin:70px 0 0 234px;"><a href="/item/196531.html"><img alt="水车"/></a></div>
+        <div class="item-table-hover" style="margin:34px 0 0 82px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板" src="//i.mcmod.cn/item/icon/32x32/0/40.png"/></a></div>
+        <div class="item-table-hover" style="margin:34px 0 0 118px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板" src="//i.mcmod.cn/item/icon/32x32/0/40.png"/></a></div>
+        <div class="item-table-hover" style="margin:70px 0 0 46px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板" src="//i.mcmod.cn/item/icon/32x32/0/40.png"/></a></div>
+        <div class="item-table-hover" style="margin:70px 0 0 82px;"><a href="/item/196521.html"><img alt="传动杆" src="//i.mcmod.cn/item/icon/32x32/19/196521.png"/></a></div>
+        <div class="item-table-hover" style="margin:70px 0 0 118px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板" src="//i.mcmod.cn/item/icon/32x32/0/40.png"/></a></div>
+        <div class="item-table-hover" style="margin:106px 0 0 46px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板" src="//i.mcmod.cn/item/icon/32x32/0/40.png"/></a></div>
+        <div class="item-table-hover" style="margin:106px 0 0 82px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板" src="//i.mcmod.cn/item/icon/32x32/0/40.png"/></a></div>
+        <div class="item-table-hover" style="margin:106px 0 0 118px;"><a href="/oredict/minecraft:planks-1.html"><img alt="橡木木板" src="//i.mcmod.cn/item/icon/32x32/0/40.png"/></a></div>
+        <div class="item-table-hover" style="margin:70px 0 0 234px;"><a href="/item/196531.html"><img alt="水车" src="//i.mcmod.cn/item/icon/32x32/19/196531.png"/></a></div>
       </div>
     </td>
     <td class="text item-table-remarks"><span class="alert alert-table-startver">需要 v0.5.1 或更高版本</span></td>
@@ -480,36 +480,152 @@ class ArgumentAndParsingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(status, "success")
+        self.assertEqual(len(detail["recipes"]), 1)
+        recipe = detail["recipes"][0]
+        self.assertEqual(recipe["method"], "工作台")
         self.assertEqual(
-            detail["recipes"],
+            recipe["materials"],
             [
                 {
-                    "method": "工作台",
-                    "materials": [
-                        {
-                            "name": "任意木板",
-                            "count": 8,
-                            "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html",
-                        },
-                        {
-                            "name": "传动杆",
-                            "count": 1,
-                            "source": "https://www.mcmod.cn/item/196521.html",
-                        },
-                    ],
-                    "grid": [
-                        ["任意木板", "任意木板", "任意木板"],
-                        ["任意木板", "传动杆", "任意木板"],
-                        ["任意木板", "任意木板", "任意木板"],
-                    ],
-                    "output": {
-                        "name": "水车",
-                        "count": 1,
-                        "source": "https://www.mcmod.cn/item/196531.html",
-                    },
-                    "conditions": ["需要 v0.5.1 或更高版本"],
-                }
+                    "name": "任意木板",
+                    "count": 8,
+                    "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html",
+                    "icon_url": "https://i.mcmod.cn/item/icon/32x32/0/40.png",
+                },
+                {
+                    "name": "传动杆",
+                    "count": 1,
+                    "source": "https://www.mcmod.cn/item/196521.html",
+                    "icon_url": "https://i.mcmod.cn/item/icon/32x32/19/196521.png",
+                },
             ],
+        )
+        self.assertEqual(
+            recipe["grid"],
+            [
+                ["任意木板", "任意木板", "任意木板"],
+                ["任意木板", "传动杆", "任意木板"],
+                ["任意木板", "任意木板", "任意木板"],
+            ],
+        )
+        self.assertEqual(
+            recipe["grid_slots"][1][1],
+            {
+                "name": "传动杆",
+                "source": "https://www.mcmod.cn/item/196521.html",
+                "icon_url": "https://i.mcmod.cn/item/icon/32x32/19/196521.png",
+            },
+        )
+        self.assertEqual(recipe["grid_slots"][0][0]["name"], "任意木板")
+        self.assertEqual(
+            recipe["grid_slots"][0][0]["icon_url"],
+            "https://i.mcmod.cn/item/icon/32x32/0/40.png",
+        )
+        self.assertEqual(
+            recipe["output"],
+            {
+                "name": "水车",
+                "count": 1,
+                "source": "https://www.mcmod.cn/item/196531.html",
+                "icon_url": "https://i.mcmod.cn/item/icon/32x32/19/196531.png",
+            },
+        )
+        self.assertEqual(recipe["conditions"], ["需要 v0.5.1 或更高版本"])
+        self.assertEqual(recipe["availability"], "active")
+        self.assertEqual(recipe["required_mods"], [])
+
+    def test_recipe_parser_marks_removed_and_required_mods(self):
+        removed_html = RECIPE_DETAIL_HTML.replace(
+            '<span class="alert alert-table-startver">需要 v0.5.1 或更高版本</span>',
+            '<span class="alert alert-table-endver">在 v0.5.1 中被移除</span>',
+        )
+        status, detail = mcmod_search.parse_item_detail_html(
+            removed_html,
+            "https://www.mcmod.cn/item/196531.html",
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(detail["recipes"][0]["availability"], "removed")
+
+        addon_html = RECIPE_DETAIL_HTML.replace(
+            '<span class="alert alert-table-startver">需要 v0.5.1 或更高版本</span>',
+            '<span class="alert alert-table-forother">需要安装 '
+            '<a href="//www.mcmod.cn/class/5941.html">CreatePlus</a>, '
+            '<a href="//www.mcmod.cn/class/558.html">科技复兴</a> 模组</span>',
+        )
+        status, detail = mcmod_search.parse_item_detail_html(
+            addon_html,
+            "https://www.mcmod.cn/item/196531.html",
+        )
+        self.assertEqual(status, "success")
+        self.assertEqual(detail["recipes"][0]["availability"], "active")
+        self.assertEqual(detail["recipes"][0]["required_mods"], ["CreatePlus", "科技复兴"])
+
+    def test_recipe_selection_excludes_removed_and_unasked_addons(self):
+        base = {
+            "method": "工作台",
+            "grid_slots": [[{"name": "材料"} for _ in range(3)] for _ in range(3)],
+            "availability": "active",
+            "required_mods": [],
+            "output": {"name": "水车"},
+        }
+        removed = base | {"availability": "removed", "marker": "removed"}
+        addon = base | {"required_mods": ["CreatePlus", "科技复兴"], "marker": "addon"}
+        current = base | {"marker": "current"}
+
+        self.assertIs(
+            mcmod_search.select_recipe_for_image(
+                [removed, current, addon],
+                "机械动力水车怎么制作",
+            ),
+            current,
+        )
+        self.assertIs(
+            mcmod_search.select_recipe_for_image(
+                [removed, current, addon],
+                "CreatePlus 的水车怎么制作",
+            ),
+            addon,
+        )
+        self.assertIs(
+            mcmod_search.select_recipe_for_image(
+                [addon],
+                "Create 水车怎么制作",
+            ),
+            None,
+        )
+        self.assertIs(
+            mcmod_search.select_recipe_for_image([removed], "旧版水车怎么制作"),
+            None,
+        )
+
+    def test_recipe_selection_rejects_unreliable_layouts(self):
+        self.assertIsNone(
+            mcmod_search.select_recipe_for_image(
+                [
+                    {
+                        "method": "工作台",
+                        "grid_slots": [[{}]],
+                        "availability": "active",
+                        "required_mods": [],
+                        "output": {"name": "测试"},
+                    }
+                ],
+                "测试怎么合成",
+            )
+        )
+        self.assertIsNone(
+            mcmod_search.select_recipe_for_image(
+                [
+                    {
+                        "method": "熔炉",
+                        "grid_slots": [[{"name": "材料"} for _ in range(3)] for _ in range(3)],
+                        "availability": "active",
+                        "required_mods": [],
+                        "output": {"name": "测试"},
+                    }
+                ],
+                "测试怎么合成",
+            )
         )
 
     def test_parse_item_detail_accepts_recipe_even_when_introduction_is_missing(self):
@@ -1097,6 +1213,196 @@ class PluginToolContractTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.handler(self.plugin, None, "机械动力")
             await self.detail_handler(self.plugin, None, DETAIL_URL)
+
+    async def test_crafting_detail_atomically_replaces_final_chain_with_recipe_image(self):
+        plugin = object.__new__(MyPlugin)
+        event = FakeEvent("机械动力水车怎么制作")
+        recipe = {
+            "method": "工作台",
+            "materials": [
+                {"name": "任意木板", "count": 8, "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html"},
+                {"name": "传动杆", "count": 1, "source": "https://www.mcmod.cn/item/196521.html"},
+            ],
+            "grid": [
+                ["任意木板", "任意木板", "任意木板"],
+                ["任意木板", "传动杆", "任意木板"],
+                ["任意木板", "任意木板", "任意木板"],
+            ],
+            "grid_slots": [
+                [
+                    {"name": "任意木板", "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html", "icon_url": "https://i.mcmod.cn/item/icon/16x16/1.png"},
+                    {"name": "任意木板", "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html", "icon_url": "https://i.mcmod.cn/item/icon/16x16/1.png"},
+                    {"name": "任意木板", "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html", "icon_url": "https://i.mcmod.cn/item/icon/16x16/1.png"},
+                ],
+                [
+                    {"name": "任意木板", "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html", "icon_url": "https://i.mcmod.cn/item/icon/16x16/1.png"},
+                    {"name": "传动杆", "source": "https://www.mcmod.cn/item/196521.html", "icon_url": "https://i.mcmod.cn/item/icon/16x16/2.png"},
+                    {"name": "任意木板", "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html", "icon_url": "https://i.mcmod.cn/item/icon/16x16/1.png"},
+                ],
+                [
+                    {"name": "任意木板", "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html", "icon_url": "https://i.mcmod.cn/item/icon/16x16/1.png"},
+                    {"name": "任意木板", "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html", "icon_url": "https://i.mcmod.cn/item/icon/16x16/1.png"},
+                    {"name": "任意木板", "source": "https://www.mcmod.cn/oredict/minecraft:planks-1.html", "icon_url": "https://i.mcmod.cn/item/icon/16x16/1.png"},
+                ],
+            ],
+            "output": {
+                "name": "水车",
+                "count": 1,
+                "source": "https://www.mcmod.cn/item/196531.html",
+                "icon_url": "https://i.mcmod.cn/item/icon/16x16/3.png",
+            },
+            "conditions": ["需要 v0.5.1 或更高版本"],
+            "availability": "active",
+            "required_mods": [],
+        }
+        detail_result = {
+            "status": "success",
+            "source_url": "https://www.mcmod.cn/item/196531.html",
+            "detail": {"title": "水车", "recipes": [recipe]},
+        }
+        with patch.object(main, "get_mcmod_item_detail", AsyncMock(return_value=detail_result)):
+            await self.detail_handler(
+                plugin,
+                event,
+                "https://www.mcmod.cn/item/196531.html",
+            )
+
+        original = main.Comp.Plain("原始纯文本配方")
+        event.result = SimpleNamespace(chain=[original])
+        image_component = object()
+        decorating_handler = getattr(
+            MyPlugin.handle_mcmod_reply_decorating,
+            "__wrapped__",
+            MyPlugin.handle_mcmod_reply_decorating,
+        )
+        with (
+            patch.object(
+                main,
+                "render_recipe_image_base64",
+                AsyncMock(return_value="png-base64"),
+                create=True,
+            ),
+            patch.object(
+                main.Comp.Image,
+                "fromBase64",
+                return_value=image_component,
+            ),
+        ):
+            await decorating_handler(plugin, event)
+
+        self.assertEqual(len(event.result.chain), 2)
+        self.assertIs(event.result.chain[0], image_component)
+        self.assertIsInstance(event.result.chain[1], main.Comp.Plain)
+        self.assertEqual(
+            event.result.chain[1].text,
+            "来源：https://www.mcmod.cn/item/196531.html",
+        )
+        self.assertNotIn(original, event.result.chain)
+
+    async def test_recipe_image_failure_preserves_existing_plain_chain(self):
+        plugin = object.__new__(MyPlugin)
+        event = FakeEvent("水车怎么制作")
+        event.set_extra(mcmod_search.MCMOD_QQ_PLAIN_TEXT_EXTRA_KEY, True)
+        event.set_extra(
+            main.MCMOD_RECIPE_IMAGE_EXTRA_KEY,
+            {
+                "title": "水车",
+                "source_url": "https://www.mcmod.cn/item/196531.html",
+                "recipe": {
+                    "method": "工作台",
+                    "grid_slots": [[{"name": "木板"} for _ in range(3)] for _ in range(3)],
+                    "output": {"name": "水车", "count": 1},
+                    "availability": "active",
+                },
+            },
+        )
+        original = main.Comp.Plain("材料：8 个木板、1 个传动杆。")
+        event.result = SimpleNamespace(chain=[original])
+        decorating_handler = getattr(
+            MyPlugin.handle_mcmod_reply_decorating,
+            "__wrapped__",
+            MyPlugin.handle_mcmod_reply_decorating,
+        )
+
+        with patch.object(
+            main,
+            "render_recipe_image_base64",
+            AsyncMock(side_effect=RuntimeError("render boom")),
+        ):
+            await decorating_handler(plugin, event)
+
+        self.assertEqual(event.result.chain, [original])
+        self.assertEqual(original.text, "材料：8 个木板、1 个传动杆。")
+
+    async def test_image_component_failure_preserves_existing_plain_chain(self):
+        plugin = object.__new__(MyPlugin)
+        event = FakeEvent("水车怎么合成")
+        event.set_extra(mcmod_search.MCMOD_QQ_PLAIN_TEXT_EXTRA_KEY, True)
+        event.set_extra(
+            main.MCMOD_RECIPE_IMAGE_EXTRA_KEY,
+            {
+                "title": "水车",
+                "source_url": "https://www.mcmod.cn/item/196531.html",
+                "recipe": {
+                    "method": "工作台",
+                    "grid_slots": [[{"name": "木板"} for _ in range(3)] for _ in range(3)],
+                    "output": {"name": "水车", "count": 1},
+                    "availability": "active",
+                },
+            },
+        )
+        original = main.Comp.Plain("原始配方")
+        event.result = SimpleNamespace(chain=[original])
+        decorating_handler = getattr(
+            MyPlugin.handle_mcmod_reply_decorating,
+            "__wrapped__",
+            MyPlugin.handle_mcmod_reply_decorating,
+        )
+
+        with (
+            patch.object(
+                main,
+                "render_recipe_image_base64",
+                AsyncMock(return_value="png-base64"),
+            ),
+            patch.object(
+                main.Comp.Image,
+                "fromBase64",
+                side_effect=ValueError("component boom"),
+            ),
+        ):
+            await decorating_handler(plugin, event)
+
+        self.assertEqual(event.result.chain, [original])
+
+    async def test_non_crafting_mixed_and_search_only_events_have_no_recipe_payload(self):
+        plugin = object.__new__(MyPlugin)
+        detail_result = {
+            "status": "success",
+            "source_url": "https://www.mcmod.cn/item/196531.html",
+            "detail": {
+                "title": "水车",
+                "recipes": [
+                    {
+                        "method": "工作台",
+                        "grid_slots": [[{"name": "木板"} for _ in range(3)] for _ in range(3)],
+                        "output": {"name": "水车", "count": 1},
+                        "availability": "active",
+                        "required_mods": [],
+                    }
+                ],
+            },
+        }
+        with patch.object(main, "get_mcmod_item_detail", AsyncMock(return_value=detail_result)):
+            for question in ("水车是什么", "水车怎么制作和怎么用"):
+                event = FakeEvent(question)
+                await self.detail_handler(plugin, event, "https://www.mcmod.cn/item/196531.html")
+                self.assertIsNone(event.get_extra(main.MCMOD_RECIPE_IMAGE_EXTRA_KEY))
+
+        search_event = FakeEvent("水车怎么制作")
+        with patch.object(main, "search_mcmod", AsyncMock(return_value={})):
+            await self.handler(plugin, search_event, "水车", "item")
+        self.assertIsNone(search_event.get_extra(main.MCMOD_RECIPE_IMAGE_EXTRA_KEY))
 
     async def test_decorating_hook_filters_final_crafting_message_chain(self):
         plugin = object.__new__(MyPlugin)
